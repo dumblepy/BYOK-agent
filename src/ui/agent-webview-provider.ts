@@ -3,6 +3,7 @@ import { randomBytes } from "node:crypto";
 import * as vscode from "vscode";
 
 import { ExtensionWebviewProtocolSession } from "./extension-webview-protocol";
+import { createExtensionToUiMessage, type UiToExtensionMessage } from "./webview-protocol";
 
 const WEBVIEW_ROOT = ["out", "webview"] as const;
 
@@ -46,8 +47,48 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     };
     webviewView.webview.html = this.getHtml(webviewView.webview, webviewRoot);
 
-    const protocolSession = new ExtensionWebviewProtocolSession(webviewView.webview);
+    const protocolSession = new ExtensionWebviewProtocolSession(webviewView.webview, {
+      onMessage: async (message) => {
+        await this.handleUiMessage(message, protocolSession);
+      },
+    });
     webviewView.onDidDispose?.(() => protocolSession.dispose());
+  }
+
+  private async handleUiMessage(
+    message: UiToExtensionMessage,
+    protocolSession: ExtensionWebviewProtocolSession,
+  ): Promise<void> {
+    if (message.type !== "send-message") {
+      // Agent execution and cancellation are connected by the Agent Runtime task.
+      return;
+    }
+
+    const text = message.payload.text.replace(/\r\n?/g, "\n");
+    if (text.trim().length === 0) {
+      await protocolSession.sendToUi(
+        createExtensionToUiMessage(
+          "error",
+          {
+            code: "PROVIDER_BAD_REQUEST",
+            message: "メッセージを入力してください。",
+            retryable: true,
+          },
+          { correlationId: message.messageId },
+        ),
+      );
+      return;
+    }
+
+    await protocolSession.sendThreadEvent(
+      message.payload.threadId,
+      {
+        kind: "user-message",
+        messageId: message.messageId,
+        text,
+      },
+      message.messageId,
+    );
   }
 
   private getHtml(webview: vscode.Webview, webviewRoot: vscode.Uri): string {

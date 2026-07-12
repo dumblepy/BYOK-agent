@@ -12,8 +12,11 @@ const vscodeMock = vi.hoisted(() => ({
 vi.mock("vscode", () => vscodeMock);
 
 import { AgentWebviewProvider } from "../../src/ui/agent-webview-provider";
+import { createUiToExtensionMessage } from "../../src/ui/webview-protocol";
 
 function createWebviewView() {
+  let listener: ((message: unknown) => void) | undefined;
+  const sent: unknown[] = [];
   const webview = {
     cspSource: "vscode-webview://test",
     asWebviewUri: vi.fn((uri: { path: string }) => ({
@@ -21,11 +24,27 @@ function createWebviewView() {
     })),
     options: undefined,
     html: "",
+    postMessage: vi.fn((message: unknown) => {
+      sent.push(message);
+      return Promise.resolve(true);
+    }),
+    onDidReceiveMessage: vi.fn((nextListener: (message: unknown) => void) => {
+      listener = nextListener;
+      return { dispose: vi.fn() };
+    }),
   };
 
   return {
     webview,
+    sent,
+    emit(message: unknown) {
+      listener?.(message);
+    },
   };
+}
+
+async function flush(): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 describe("AgentWebviewProvider", () => {
@@ -88,5 +107,38 @@ describe("AgentWebviewProvider", () => {
     expect(firstNonce).toMatch(/^[0-9a-f]{32}$/);
     expect(secondNonce).toMatch(/^[0-9a-f]{32}$/);
     expect(firstNonce).not.toBe(secondNonce);
+  });
+
+  it("routes a validated user message back as a correlated thread event", async () => {
+    const provider = new AgentWebviewProvider({
+      extensionUri: {
+        path: "/extension",
+      },
+    } as never);
+    const view = createWebviewView();
+    provider.resolveWebviewView(view as never);
+
+    const message = createUiToExtensionMessage("send-message", {
+      threadId: "thread-1",
+      text: "複数行\nの依頼",
+    });
+    view.emit(message);
+    await flush();
+
+    expect(view.sent).toContainEqual(
+      expect.objectContaining({
+        type: "thread-event",
+        correlationId: message.messageId,
+        payload: {
+          threadId: "thread-1",
+          sequence: 1,
+          event: {
+            kind: "user-message",
+            messageId: message.messageId,
+            text: "複数行\nの依頼",
+          },
+        },
+      }),
+    );
   });
 });

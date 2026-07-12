@@ -58,13 +58,14 @@ export class WebviewProtocolClient {
     type: TType,
     payload: UiToExtensionPayload<TType>,
     correlationId?: string,
-  ): void {
+  ): string {
     if (this.disposed) {
       throw new Error("Cannot send a message after the Webview protocol client was disposed");
     }
 
     const message = createUiToExtensionMessage(type, payload, { correlationId });
     this.api.postMessage(message);
+    return message.messageId;
   }
 
   public dispose(): void {

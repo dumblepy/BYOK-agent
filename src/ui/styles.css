@@ -91,16 +91,25 @@ h2 {
   font-size: 18px;
 }
 
-.composer-label {
+.composer {
   display: flex;
   flex-direction: column;
   gap: 6px;
+  padding: 10px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 6px;
+}
+
+.composer-label {
   font-size: 12px;
   font-weight: 600;
 }
 
-textarea {
+.composer-input {
   width: 100%;
+  min-height: 88px;
+  max-height: 260px;
   resize: vertical;
   padding: 9px;
   color: var(--vscode-input-foreground);
@@ -114,6 +123,25 @@ textarea:focus {
   outline-offset: -1px;
 }
 
+.composer-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.composer-count {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.composer-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 button {
   width: 100%;
   padding: 7px 12px;
@@ -123,6 +151,38 @@ button {
   border-radius: 4px;
   cursor: not-allowed;
   opacity: 0.65;
+}
+
+.composer-button {
+  width: auto;
+  min-width: 72px;
+  cursor: pointer;
+  opacity: 1;
+}
+
+.composer-button:disabled {
+  cursor: not-allowed;
+  opacity: 0.65;
+}
+
+.composer-stop-button {
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
+}
+
+.composer-status,
+.composer-error {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.composer-status {
+  color: var(--vscode-descriptionForeground);
+}
+
+.composer-error {
+  color: var(--vscode-errorForeground);
 }
 
 .hint {

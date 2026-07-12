@@ -1,67 +1,86 @@
 ---
-description: 6-ui-webviewのcontent-security-policyを実装するブランチでスレッド表示コンポーネントを実装するときに読み込む
+description: 6-ui-webviewのcontent-security-policyを実装するブランチでメッセージ入力Composerを実装するときに読み込む
 alwaysApply: false
 ---
-# スレッド表示コンポーネント
+# メッセージ入力Composer
 
-このブランチでは、Webview上でユーザーとエージェントの複数メッセージを時系列表示する`ThreadView`を実装する。対象は表示モデル、ストリーミング差分のReducer、安全なMarkdown・コードブロック描画、テーマ対応、表示コンポーネントのテストである。実装はこのルールと`documents/design.md` §14.2.1の設計に従う。
+このブランチでは、既存のPreact Webview UIに、複数行のユーザーメッセージを入力し、検証済みの通信メッセージとしてExtension Hostへ送信できるComposerを実装する。対象は入力欄、下書き復元、送信・停止操作、入力中／送信中／実行中／停止中／失敗状態、キーボード操作、状態表示、関連テストである。実装は`documents/design.md` §14.2.2の設計と既存の§14.3、§14.4の通信・状態契約に従う。
 
 ## 実装方針
 
-- Extension Hostを会話の正本とし、`ThreadView`は検証済みの表示モデルだけを描画する。コンポーネントからWebview API、Provider、Agent Runtime、Storageを直接呼び出さない。
-- 表示モデルは安定したメッセージ`id`、`user`/`assistant`の`role`、本文、`streaming`/`complete`/`failed`の状態を持つ。受信時刻だけで配列を並び替えず、Hostの順序を維持する。
-- ストリーミング中の差分は同一`messageId`へReducerで累積する。`done`後の差分、未知のID、欠番・古いsequenceは推測で補完せず、正本スナップショットの再取得へつなげる。
-- Markdownは文字列を`innerHTML`へ渡さず、安全なASTまたは同等の中間表現から描画する。raw HTML、`javascript:`/`data:`/`command:` URI、外部スクリプト、未検証のCSSクラスを許可しない。
-- コードブロックは空白と改行を保持した`pre/code`相当で表示する。言語指定は検査済みの表示用値に限定し、外部シンタックスハイライトは導入しない。
-- 新着差分への自動スクロールはユーザーが末尾付近を見ている場合だけ行う。上へスクロール中の閲覧位置を奪わず、新着状態を示す。
-- UI色はVS Code標準テーマトークン、アイコンはCodiconを使用する。独自画像・ブランドアセット・製品固有の外観は使用しない。
-- 本タスクではComposer、Tool Activity、ChangeSet、Provider、AgentLoop、会話永続化、通信プロトコル全体の再設計は実装しない。必要なストリーミング型契約は設計書に沿った最小変更に限定する。
+- Webviewは入力と操作の投影だけを担当し、会話の正本、Agent Runtime、Provider、Storage、権限判定はExtension Host側に置く。
+- Composerは`WebviewProtocolClient`を介して既存の`send-message`と`cancel-run`を使う。コンポーネントからWebview API、`postMessage`、`unknown`値を直接扱わない。
+- 下書きは既存の`AgentWebviewStateV1`の`composerDraft`だけに保存する。APIキー、Thread、Run、送信履歴、ファイル内容、内部エラーをWebview状態へ保存しない。
+- 入力はCRLF／CRをLFへ正規化し、100,000文字上限と空白のみ判定をUI・Hostの両方で行う。送信時に本文の前後の空白や改行を勝手に削除しない。
+- `inputting`は送信可能な下書きがある状態、`submitting`は送信後のHost通知待ち、`running`と`stopping`はHostの検証済み状態通知に基づく状態とする。UIがAgent実行を推測してはならない。
+- MVPは同時送信を許可せず、送信要求の重複を防ぐ。停止は有効な`runId`に対する`cancel-run`を一度だけ送り、Webview破棄だけではキャンセルしない。
+- Enterは送信、Shift+EnterとAlt+Enterは改行、Ctrl+Enter／Cmd+Enterは送信とする。IME変換中は送信せず、Ctrl/Cmd+Shift+Enterなど未定義の組み合わせは通常の改行動作へ委譲する。
+- 送信ボタンと停止ボタンはVS Code標準テーマトークンとCodiconまたは明確なテキストを使い、`aria-label`、`aria-describedby`、`aria-live`、フォーカス表示を提供する。独自画像や製品固有の外観は使わない。
+- Webview通信の受信値は既存のZodスキーマで検証してから状態更新へ渡す。ユーザー本文をHTML、CSS、URL、スクリプト、ログ、例外文へ反射しない。
 
 ## 実装対象
 
-- `src/ui/webview/components/ThreadView.tsx`
-- `src/ui/webview/thread-view-model.ts`
-- `src/ui/webview/markdown/MarkdownRenderer.tsx`
-- `src/ui/styles.css`（既存Webviewスタイルへ統合）
-- Reducer、Markdown安全性、コンポーネント表示のテスト
+- `src/ui/webview/components/Composer.tsx`
+- `src/ui/webview/composer-state.ts`
+- `src/ui/main.tsx`
+- `src/ui/styles.css`
+- 必要最小限の`src/ui/extension-webview-protocol.ts`およびUIサービス境界のHost側ルーティング
+- `tests/unit/`の入力正規化、キー操作、状態遷移、下書き復元、通信呼び出しテスト
+
+## 状態と操作契約
+
+| 状態 | 条件 | UI操作 |
+|---|---|---|
+| `idle` | 下書きが空で実行なし | 入力可、送信不可、停止非表示 |
+| `inputting` | 下書きに非空白文字あり | 入力可、送信可、停止非表示 |
+| `submitting` | `send-message`送信済み | 入力・送信不可、受付状態表示 |
+| `running` | Hostが実行中と通知 | 入力・送信不可、停止可 |
+| `stopping` | `cancel-run`送信済み | 入力・送信・停止不可、停止中表示 |
+| `error` | 操作失敗または実行失敗 | 再試行可、実行中なら停止可 |
+
+- `send-message`のEnvelope `messageId`を重複排除キーとして扱い、Enterとボタンは同じ送信処理を使う。
+- `cancel-run`は現在の`activeRunId`に対してのみ発行し、停止完了または終了エラーまで`stopping`を維持する。
+- 送信失敗時は、ユーザーが新しい入力を開始していない場合に限り、保留本文を下書きへ復元する。
+- Host側はThread、client session、Run、権限を再確認し、Composerは受付成功を推測せず相関した状態通知またはエラーで更新する。
 
 ## 進捗
 
-- [x] `AGENTS.md`、`project.mdc`、`branch.mdc`、旧ブランチルール、既存のUI・通信設計を確認する
-- [x] `documents/design.md` §14.2.1へThreadViewの実装方針と詳細設計を記録する
-- [x] このブランチの対象範囲、対象外、完了条件、検証方針を定義する
-- [x] 表示モデルとストリーミングReducerを実装する
-- [x] Markdownとコードブロックの安全な描画を実装する
-- [x] 複数メッセージ、ストリーミング、空状態、失敗状態をThreadViewへ接続する
-- [x] VS Codeテーマ対応とスクロール・アクセシビリティを実装する
-- [x] 単体テストとコンポーネントテストを追加する
-- [x] 型チェック、Lint、フォーマット、テスト、Webviewセキュリティ検査を実行する
+- [x] `AGENTS.md`、`project.mdc`、`branch.mdc`、現在のブランチルール、UI・通信・状態設計を確認する
+- [x] `documents/design.md` §14.2.2へComposerの実装方針と詳細設計を記録する
+- [x] Enter、修飾キー、入力値上限、送信・停止状態、下書き保存の契約を定義する
+- [x] Composerの状態ロジックと入力正規化を実装する
+- [x] Composerコンポーネントと既存Appへ接続する
+- [x] `send-message`／`cancel-run`とHost側ルーティングを接続する
+- [x] テーマ、アクセシビリティ、入力中・送信中・実行中・停止中・失敗表示を実装する
+- [x] 単体、コンポーネント、通信、Extension Integrationテストを追加する
+- [ ] 実際のAgent RuntimeとComposerの実行状態を接続する（別Issue）
+- [ ] 型チェック、Lint、フォーマット、テスト、Webviewセキュリティ検査を実行する
 
 ## 完了条件
 
-1. ユーザー発言とエージェント発言を含む複数メッセージの会話をHostの順序どおり表示できる。
-2. Markdownの見出し・段落・リスト・インラインコード・コードフェンスを表示できる。
-3. 複数のストリーミング差分を同一エージェントメッセージへ順序どおり反映し、完了状態を表示できる。
-4. スナップショット適用、未知のメッセージID、欠番、完了後の差分を安全に処理できる。
-5. raw HTMLと危険なURIを実行せず、Markdown解析失敗時は安全なプレーンテキストへフォールバックできる。
-6. Light、Dark、High Contrastで視認性を維持し、スクロール中のユーザー位置を不必要に変更しない。
-7. Reducer、Markdown変換、コンポーネントの正常系・異常系テストが成功する。
+1. 空白だけの入力は送信されず、複数行本文を保持したユーザーメッセージがUIからHostへ一度だけ送信される。
+2. 送信ボタン、Enter、Shift+Enter、Ctrl/Cmd+Enter、Alt+Enter、IME変換中の挙動が設計どおりに動く。
+3. `idle`、`inputting`、`submitting`、`running`、`stopping`、`error`を状態とラベルで識別できる。
+4. 実行中は有効なRunだけを停止でき、二重停止や古いRunへの停止要求を発行しない。
+5. Webview再生成時に有効な未送信下書きだけが復元され、秘密情報やThread／Run情報が保存されない。
+6. 受信検証、サイズ制限、重複排除、相関IDを経由した安全な通信がテストされる。
+7. Light、Dark、High Contrastで操作対象、フォーカス、無効状態、エラーを識別できる。
 
 ## 対象外
 
-- ThreadView以外のComposer、モデル選択、権限選択、Tool Activity、ChangeSet UI
-- Provider Adapter、Agent Runtime、AgentLoop、Storage、会話タイトル生成
-- Webview CSP、nonce、`localResourceRoots`、通信トランスポートの新規実装
-- APIキー、Authorizationヘッダー、環境変数、非公開推論内容、不要なファイル内容の表示
+- ThreadView、Markdown、Tool Activity、ChangeSet、Approvalの再設計
+- ファイル・選択範囲・診断・画像添付、`/`コマンド、`@`検索
+- Provider Adapter、Agent Runtime、AgentLoop、会話永続化、会話タイトル生成
+- モデル選択、権限選択、CSP、nonce、`localResourceRoots`の新規設計
+- APIキー、Authorizationヘッダー、環境変数、ファイル内容、非公開推論内容のWebview表示
 - `git add`、`git commit`、既存の未コミット変更の整理・上書き
 
 ## 検証方針
 
-- Reducerの単体テストで、メッセージ追加、user/assistantの区別、差分累積、`done`、失敗、重複、未知ID、完了後差分、sequence欠番を検証する。
-- Markdown変換の単体テストで、通常のMarkdown、コードフェンス、言語指定なし、raw HTML、`javascript:`/`data:`/`command:` URI、壊れた入力、本文上限を検証する。
-- コンポーネントテストで、3件以上の会話、ストリーミング中の再描画、空状態、失敗状態、長いコード行、テーマトークン、アクセシブルなラベルを検証する。
-- スクロールのテストで、末尾付近の自動追従と、上方閲覧中の位置保持・新着表示を検証する。
-- Extension Integration Testでは、`thread-snapshot`と`thread-event`から表示モデルへ変換され、再同期後に表示が正本と一致することを確認する。未検証の受信値をDOMへ渡さない。
+- 純粋ロジックで、改行正規化、空白判定、上限境界、各Enter操作、IME、状態遷移、二重送信抑止を検証する。
+- コンポーネントテストで、複数行入力、送信・停止ボタン、入力中・送信中・実行中・停止中・失敗状態、アクセシブルなラベルを検証する。
+- Webview状態テストで、初期化時一度だけの復元、入力ごとの最小状態保存、不正状態の破棄を検証する。
+- 通信テストで、`send-message`／`cancel-run`のEnvelope、相関ID、Host受信検証、重複メッセージの無視を検証する。
 - 実装後に`pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、`pnpm check:webview-security`を実行する。実APIテストは明示的な環境変数がある場合だけ許可する。
 
 ## 参考資料
@@ -69,23 +88,24 @@ alwaysApply: false
 - `AGENTS.md`
 - `.cursor/rules/project.mdc`
 - `.cursor/rules/branch.mdc`
-- `documents/design.md` §3、§14.2、§14.2.1、§14.3、§16、§19
-- `documents/issues.md`のMilestone 1「スレッド表示コンポーネント」
+- `documents/design.md` §14.1、§14.2、§14.2.2、§14.3、§14.4、§16、§19
+- `documents/issues.md`のMilestone 1「メッセージ入力Composer」
 - `src/ui/main.tsx`
-- `src/ui/styles.css`
 - `src/ui/webview-protocol.ts`
 - `src/ui/webview-protocol-client.ts`
+- `src/ui/extension-webview-protocol.ts`
+- `src/ui/webview-state.ts`
+- `src/ui/styles.css`
 
 ## 調査結果・設計まとめ
 
-- 既存UIはPreactで構成され、現在の`main.tsx`はComposerと初期画面のみを表示しているため、ThreadViewは既存Appへ段階的に接続する独立コンポーネントとして設計する。
-- 既存の通信境界はZod検証、`thread-snapshot`、`thread-event`、sequence管理を持つ。ThreadViewはその検証済み結果を受け取り、通信処理を重複実装しない。
-- 既存の`ThreadEvent`はユーザー本文とエージェント本文の最小表現を持つが、ストリーミング差分を安全に同一メッセージへ適用するには、安定したメッセージIDと差分・終端情報が必要である。この契約拡張は通信境界の最小変更として扱い、表示コンポーネントに未検証イベントを渡さない。
-- プロジェクトルールの`SYW-UI-001`、`SYW-UI-002`、`SYW-UI-003`、`SYW-SEC-001`、`SYW-SEC-004`を、テーマ・ブランド・受信検証・Markdown安全性・ログ境界の判断基準とする。
-- ストリーミング中は本文を毎回Markdownとして再解析する単純な方式をMVPとし、メッセージ単位の安定キーと末尾追従ルールでちらつきと閲覧位置の破壊を抑える。仮想スクロールや高度な差分描画は後続課題とする。
-- `src/ui/webview/thread-view-model.ts`へスナップショット正規化、メッセージ順序維持、ストリーミング差分累積、欠番・未知ID・完了後差分の再同期フラグを実装した。
-- `src/ui/webview/markdown/MarkdownRenderer.tsx`はPreactノードのみを生成し、raw HTMLを実行せず、`https`/`http`/`mailto`以外のリンクをリンク化しない。コードフェンスは検査済み言語クラスとプレーンテキストで表示する。
-- `src/ui/webview/components/ThreadView.tsx`を既存の`main.tsx`へ接続し、複数メッセージ、空状態、復元中、失敗、ストリーミング中の表示と、末尾付近だけの自動スクロールを実装した。
-- 既存通信スキーマへ`assistant-text-delta`、任意の`messageId`、`streaming`を後方互換で追加し、`thread-event`のsequenceは既存のWebviewProtocolClientで検証した。
-- `preact-render-to-string`によるSSRテストを追加し、複数メッセージ、Markdown、コードブロック、ストリーミング中、失敗状態、アクセシブルなラベルを検証した。
-- `pnpm check`（typecheck、lint、format、テスト44件、Webviewセキュリティ検査）が成功した。
+- 既存の`main.tsx`には下書き復元済みのtextareaと無効化された送信ボタンがあるため、Composerはこの責務を独立コンポーネントへ切り出し、既存の`WebviewProtocolClient`へ接続する。
+- `webview-protocol.ts`には`send-message`、`cancel-run`、`run-state`、`error`の判別共用体とZod検証が既にある。新規の搬送路や手書きの受信型は追加せず、必要な不足だけを最小変更する。
+- `extension-webview-protocol.ts`は現在`ui-ready`とスナップショットを処理し、一般操作のHandlerは未接続である。Composerの完了条件には、既存の検証境界を保ったHost側ルーティングの接続を含めるが、Agent実行の実装は別Issueとする。
+- `webview-state.ts`は`composerDraft`を上限付きで保存できる。Composerの状態追加では既存の`version: 1`契約を維持し、実行状態や秘密情報を拡張しない。
+- `ThreadView`は会話表示のみを担当するため、ComposerからThreadViewのReducerやメッセージ正本へ直接依存しない。送信後の表示はHostからのスナップショット／イベントで更新する。
+- `SYW-ARCH-001`、`SYW-ARCH-002`、`SYW-UI-001`、`SYW-UI-003`、`SYW-SEC-001`、`SYW-SEC-004`を、Host境界、Webview安全性、テーマ、通信検証、ログの判断基準とする。
+- Composer状態ロジック、複数行入力、Enter操作、下書き同期、アクセシブルな送信・停止表示を実装した。
+- `WebviewProtocolClient`は送信した`messageId`を返し、Host側は検証済み`send-message`を相関付き`thread-event(user-message)`としてWebviewへ返す。Agent Runtime接続前のMVP受付経路として実装している。
+- Extension Hostのキャンセル処理はAgent Runtimeの接続点を残した検証済みルーティングまでとし、実際のAgent実行・停止完了イベントは別Issueとする。
+- Composer状態、描画、通信、Hostルーティングのテストを追加し、型チェック、Lint、フォーマット、全テスト、Webviewセキュリティ検査が成功している。

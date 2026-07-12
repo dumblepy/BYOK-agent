@@ -5,6 +5,7 @@ import {
   parseExtensionToUiMessage,
   parseUiToExtensionMessage,
   type ExtensionToUiMessage,
+  type ThreadEvent,
   type UiToExtensionMessage,
 } from "./webview-protocol";
 
@@ -23,6 +24,7 @@ const MAX_SEEN_MESSAGE_IDS = 2_048;
 export class ExtensionWebviewProtocolSession {
   private readonly messageSubscription: { dispose(): void } | undefined;
   private readonly seenMessageIds = new Set<string>();
+  private readonly threadSequences = new Map<string, number>();
   private activeClientInstanceId: string | undefined;
   private disposed = false;
 
@@ -50,6 +52,22 @@ export class ExtensionWebviewProtocolSession {
     }
   }
 
+  public async sendThreadEvent(
+    threadId: string,
+    event: ThreadEvent,
+    correlationId?: string,
+  ): Promise<void> {
+    const sequence = (this.threadSequences.get(threadId) ?? 0) + 1;
+    this.threadSequences.set(threadId, sequence);
+    await this.sendToUi(
+      createExtensionToUiMessage(
+        "thread-event",
+        { threadId, sequence, event },
+        correlationId ? { correlationId } : undefined,
+      ),
+    );
+  }
+
   public dispose(): void {
     if (this.disposed) {
       return;
@@ -58,6 +76,7 @@ export class ExtensionWebviewProtocolSession {
     this.disposed = true;
     this.messageSubscription?.dispose();
     this.seenMessageIds.clear();
+    this.threadSequences.clear();
     this.activeClientInstanceId = undefined;
   }
 
@@ -145,6 +164,8 @@ export class ExtensionWebviewProtocolSession {
   }
 
   private async sendThreadSnapshot(threadId: string, correlationId: string): Promise<void> {
+    const currentSequence = this.threadSequences.get(threadId) ?? 0;
+    this.threadSequences.set(threadId, Math.max(currentSequence, 0));
     await this.sendToUi(
       createExtensionToUiMessage(
         "thread-snapshot",

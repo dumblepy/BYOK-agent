@@ -38,7 +38,7 @@ describe("WebviewProtocolClient", () => {
     const client = new WebviewProtocolClient(api, messageWindow);
 
     client.start();
-    client.send("send-message", { threadId: "thread-1", text: "hello" });
+    const messageId = client.send("send-message", { threadId: "thread-1", text: "hello" });
 
     expect(api.postMessage).toHaveBeenCalledTimes(2);
     expect((api.postMessage as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]).toMatchObject({
@@ -48,6 +48,7 @@ describe("WebviewProtocolClient", () => {
     expect((api.postMessage as ReturnType<typeof vi.fn>).mock.calls[1]?.[0]).toMatchObject({
       type: "send-message",
       payload: { threadId: "thread-1", text: "hello" },
+      messageId,
     });
     client.dispose();
   });

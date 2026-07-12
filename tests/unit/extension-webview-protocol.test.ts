@@ -100,4 +100,48 @@ describe("ExtensionWebviewProtocolSession", () => {
     expect(onMessage).toHaveBeenNthCalledWith(2, secondMessage);
     session.dispose();
   });
+
+  it("can publish a correlated user-message event after Host routing", async () => {
+    const webview = new FakeWebview();
+    const session = new ExtensionWebviewProtocolSession(webview, {
+      onMessage: async (message) => {
+        if (message.type !== "send-message") {
+          return;
+        }
+
+        await session.sendThreadEvent(
+          message.payload.threadId,
+          {
+            kind: "user-message",
+            messageId: message.messageId,
+            text: message.payload.text,
+          },
+          message.messageId,
+        );
+      },
+    });
+    const message = createUiToExtensionMessage("send-message", {
+      threadId: "thread-1",
+      text: "複数行\nの依頼",
+    });
+
+    webview.emit(message);
+    await flush();
+
+    expect(webview.sent).toHaveLength(1);
+    expect(webview.sent[0]).toMatchObject({
+      type: "thread-event",
+      correlationId: message.messageId,
+      payload: {
+        threadId: "thread-1",
+        sequence: 1,
+        event: {
+          kind: "user-message",
+          messageId: message.messageId,
+          text: "複数行\nの依頼",
+        },
+      },
+    });
+    session.dispose();
+  });
 });

@@ -1,7 +1,15 @@
 import { render } from "preact";
-import { useEffect, useMemo, useReducer, useRef, useState } from "preact/hooks";
+import { useEffect, useMemo, useReducer, useRef } from "preact/hooks";
 
 import "./styles.css";
+import { Composer } from "./webview/components/Composer";
+import {
+  composerReducer,
+  createInitialComposerState,
+  getComposerErrorMessage,
+  isComposerDraftSubmittable,
+  normalizeComposerDraft,
+} from "./webview/composer-state";
 import { ThreadView } from "./webview/components/ThreadView";
 import {
   INITIAL_THREAD_VIEW_STATE,
@@ -10,7 +18,11 @@ import {
 } from "./webview/thread-view-model";
 import { DEFAULT_THREAD_ID } from "./webview-protocol";
 import { WebviewProtocolClient, type WebviewProtocolApi } from "./webview-protocol-client";
-import { createAgentWebviewStateStore, type WebviewStateApi } from "./webview-state";
+import {
+  createAgentWebviewStateStore,
+  MAX_COMPOSER_DRAFT_LENGTH,
+  type WebviewStateApi,
+} from "./webview-state";
 
 declare function acquireVsCodeApi(): WebviewStateApi & WebviewProtocolApi;
 
@@ -18,7 +30,10 @@ const vscodeApi = acquireVsCodeApi();
 const stateStore = createAgentWebviewStateStore(vscodeApi);
 
 function App() {
-  const [composerDraft, setComposerDraft] = useState(stateStore.state.composerDraft);
+  const [composerState, dispatchComposer] = useReducer(
+    composerReducer,
+    createInitialComposerState(stateStore.state.composerDraft),
+  );
   const [threadState, dispatchThread] = useReducer(threadViewReducer, INITIAL_THREAD_VIEW_STATE);
   const snapshotThreadIdRef = useRef(DEFAULT_THREAD_ID);
   const protocolClient = useMemo(
@@ -37,6 +52,34 @@ function App() {
             dispatchThread(
               eventToThreadViewAction(message.payload.sequence, message.payload.event),
             );
+            if (
+              message.payload.event.kind === "user-message" &&
+              message.correlationId !== undefined
+            ) {
+              dispatchComposer({
+                type: "message-accepted",
+                messageId: message.correlationId,
+              });
+            }
+          } else if (message.type === "run-state") {
+            if (message.payload.threadId === snapshotThreadIdRef.current) {
+              dispatchComposer({
+                type: "run-state",
+                runId: message.payload.runId,
+                state: message.payload.state,
+              });
+            }
+          } else if (message.type === "error") {
+            dispatchComposer({
+              type: "error",
+              message: getComposerErrorMessage(message.payload.code),
+              correlationId: message.correlationId,
+            });
+          } else if (message.type === "protocol-error") {
+            dispatchComposer({
+              type: "error",
+              message: "通信に失敗しました。Webviewを再表示して再試行してください。",
+            });
           }
         },
         onSequenceGap: (message) => {
@@ -53,6 +96,10 @@ function App() {
   }, [protocolClient]);
 
   useEffect(() => {
+    stateStore.setComposerDraft(composerState.draft);
+  }, [composerState.draft]);
+
+  useEffect(() => {
     if (!threadState.needsSnapshot || threadState.snapshotRequestPending) {
       return;
     }
@@ -61,10 +108,61 @@ function App() {
     dispatchThread({ type: "snapshot-requested" });
   }, [protocolClient, threadState.needsSnapshot, threadState.snapshotRequestPending]);
 
-  const handleComposerInput = (event: Event): void => {
-    const composerDraft = (event.currentTarget as HTMLTextAreaElement).value;
-    const nextState = stateStore.setComposerDraft(composerDraft);
-    setComposerDraft(nextState.composerDraft);
+  const handleComposerDraftChange = (draft: string): void => {
+    const normalizedDraft = normalizeComposerDraft(draft);
+    if (normalizedDraft.length > MAX_COMPOSER_DRAFT_LENGTH) {
+      dispatchComposer({
+        type: "draft-rejected",
+        message: `入力は${MAX_COMPOSER_DRAFT_LENGTH.toLocaleString()}文字以内にしてください。`,
+      });
+      return;
+    }
+
+    dispatchComposer({ type: "draft-changed", draft: normalizedDraft });
+  };
+
+  const handleComposerSubmit = (): void => {
+    if (
+      composerState.phase === "submitting" ||
+      composerState.phase === "running" ||
+      composerState.phase === "stopping" ||
+      !isComposerDraftSubmittable(composerState.draft)
+    ) {
+      return;
+    }
+
+    try {
+      const messageId = protocolClient.send("send-message", {
+        threadId: snapshotThreadIdRef.current,
+        text: composerState.draft,
+      });
+      dispatchComposer({
+        type: "submit-requested",
+        messageId,
+        text: composerState.draft,
+      });
+    } catch {
+      dispatchComposer({
+        type: "error",
+        message: "メッセージを送信できませんでした。もう一度お試しください。",
+      });
+    }
+  };
+
+  const handleComposerStop = (): void => {
+    if (composerState.phase !== "running" || composerState.activeRunId === undefined) {
+      return;
+    }
+
+    try {
+      protocolClient.send("cancel-run", { runId: composerState.activeRunId });
+      dispatchComposer({ type: "stop-requested" });
+    } catch {
+      dispatchComposer({
+        type: "error",
+        message: "停止要求を送信できませんでした。",
+      });
+    }
   };
 
   return (
@@ -81,19 +179,12 @@ function App() {
 
       <ThreadView messages={threadState.messages} isRestoring={!threadState.isHydrated} />
 
-      <label class="composer-label" htmlFor="prompt">
-        依頼
-        <textarea
-          id="prompt"
-          rows={4}
-          placeholder="何を作りたいですか？"
-          value={composerDraft}
-          onInput={handleComposerInput}
-        />
-      </label>
-      <button type="button" disabled>
-        送信
-      </button>
+      <Composer
+        state={composerState}
+        onDraftChange={handleComposerDraftChange}
+        onSubmit={handleComposerSubmit}
+        onStop={handleComposerStop}
+      />
       <p class="hint">BYOK設定は後続の設定画面で追加できます。</p>
     </main>
   );
