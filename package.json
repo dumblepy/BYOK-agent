@@ -1,0 +1,73 @@
+{
+  "name": "byok-vscode-agent",
+  "displayName": "BYOK VS Code Coding Agent",
+  "description": "A BYOK-only coding agent for Visual Studio Code.",
+  "version": "0.0.1",
+  "publisher": "byok-agent",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dumblepy/BYOK-agent.git"
+  },
+  "engines": {
+    "vscode": "^1.125.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "byokAgent",
+          "title": "BYOK Agent",
+          "icon": "./resources/activity-bar.svg"
+        }
+      ]
+    },
+    "views": {
+      "byokAgent": [
+        {
+          "type": "webview",
+          "id": "byokAgent.view",
+          "name": "Agent"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "pnpm run compile:extension && pnpm run bundle:webview",
+    "compile:extension": "tsc -p tsconfig.json",
+    "bundle:webview": "node scripts/build-webview.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
+    "watch": "tsc -p tsconfig.json --watch",
+    "lint": "eslint .",
+    "format": "prettier --write .vscode package.json tsconfig.json tsconfig.eslint.json eslint.config.mjs vitest.config.ts pnpm-workspace.yaml scripts src tests resources .prettierrc.json",
+    "format:check": "prettier --check .vscode package.json tsconfig.json tsconfig.eslint.json eslint.config.mjs vitest.config.ts pnpm-workspace.yaml scripts src tests resources .prettierrc.json",
+    "test": "vitest run --passWithNoTests",
+    "test:watch": "vitest",
+    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test",
+    "vscode:prepublish": "pnpm compile",
+    "package": "pnpm run compile && vsce package --no-dependencies"
+  },
+  "dependencies": {
+    "preact": "10.29.7"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.1.1",
+    "@types/vscode": "1.125.0",
+    "@vscode/vsce": "3.9.2",
+    "esbuild": "0.28.1",
+    "eslint": "10.7.0",
+    "eslint-config-prettier": "10.1.8",
+    "prettier": "3.9.5",
+    "typescript": "5.9.3",
+    "typescript-eslint": "8.63.0",
+    "vitest": "4.1.10"
+  }
+}

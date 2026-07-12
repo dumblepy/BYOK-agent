@@ -29,6 +29,240 @@ Lint可能化のため、規範ルールは **Rule ID** を持つ。
 
 | ID | LEVEL | CHECK | 対象 | 要件（要約） |
 |---|---|---|---|---|
+| SYW-STRUCT-001 | MUST | config | ディレクトリ構成 | `src/` 配下は design.md §4 の構成に従う（extension/ui/agent/models/providers/context/prompts/tools/changes/permissions/storage/observability） |
+| SYW-STRUCT-002 | MUST NOT | grep | ディレクトリ構成 | 設計書にない最上位ディレクトリを `src/` 直下に新設しない |
+| SYW-ARCH-001 | MUST | manual | アーキテクチャ | APIキー取得・LLM通信・ファイル読み書き・ターミナル実行・Git操作・プロンプト構築・Tool Calling・会話保存・権限判定はすべて Extension Host 側で実行する |
+| SYW-ARCH-002 | MUST NOT | manual | アーキテクチャ | Webview に秘密情報やファイルアクセス権を渡さない |
+| SYW-ARCH-003 | MUST NOT | manual | アーキテクチャ | VS Code Language Model API に中核を依存させない（管理者ポリシー・API変更影響を避け BYOK 通信を直接制御） |
+| SYW-LEGAL-001 | MUST | config | 法務 | Copilot Chat 由来コードを流用した場合は出典コミット・原ファイル・変更内容を `NOTICE.md` にファイル単位で記録する |
+| SYW-LEGAL-002 | MUST NOT | manual | 法務 | GitHub Copilot の名称・ロゴ・アイコン・商標・製品固有エンドポイント・テレメトリ識別子・製品システムプロンプト全文・Codex の CSS/DOM/ブランドアセットを使用しない |
+| SYW-LEGAL-003 | MUST NOT | manual | 法務 | VS Code 本体の内部 API に依存する実装を作らない |
+| SYW-MODEL-001 | MUST | config | モデル設定 | モデル設定は JSON（`model-config.schema.json`）で定義し、優先順位は User Settings > ユーザー共通 > ワークスペース > 組み込みデフォルト |
+| SYW-MODEL-002 | MUST NOT | config | モデル設定 | APIキー本体をJSON設定ファイルに保存しない |
+| SYW-MODEL-003 | MUST | manual | モデル設定 | APIキーは `ExtensionContext.secrets`（SecretStorage）のみに保存する |
+| SYW-MODEL-004 | MUST NOT | config | モデル設定 | ワークスペース設定からAPIキー参照先・任意ヘッダー・外部URLを上書きさせない（悪意あるリポジトリ対策） |
+| SYW-MODEL-005 | MUST | manual | モデル能力 | モデル能力はJSON設定値を優先し、モデル名からの推測は補助的に留める |
+| SYW-PROVIDER-001 | MUST | ast | Provider | すべてのモデルAPIは `ProviderAdapter` 共通インターフェース（`stream`/`countTokens`）を実装し `ProviderEvent` に正規化する |
+| SYW-PROVIDER-002 | MUST NOT | manual | Provider | Provider Adapter にエージェント判断・ツール実行・権限管理・履歴圧縮を入れない |
+| SYW-PROVIDER-003 | MUST | manual | Provider | Provider Adapter はメッセージ変換・ツール定義変換・ストリーム正規化・Tool Call ID 保持・Tool Result 変換・エラー分類・利用量正規化・キャンセル・リトライ可否判定のみ担当する |
+| SYW-PROVIDER-004 | MUST | manual | Provider | 初期対応は OpenAI Responses / OpenAI互換 Chat Completions / Anthropic Messages の3プロトコル。Gemini は第2段階 |
+| SYW-AGENT-001 | MUST | ast | エージェント | `AgentRuntime` は design.md §7.1 の状態機械（idle/preparing-context/.../failed）で管理する |
+| SYW-AGENT-002 | MUST | manual | エージェント | design.md §7.3 の停止条件のいずれかで停止する |
+| SYW-AGENT-003 | MUST NOT | manual | エージェント | ツール上限到達時に自動続行しない（停止・追加許可・読み取り専用継続の選択肢を表示） |
+| SYW-CONTEXT-001 | MUST | manual | コンテキスト | コンテキストは静的／ターン単位／実行中の3分類で管理する |
+| SYW-CONTEXT-002 | MUST | manual | コンテキスト | 採用順は design.md §8.3 の優先順位に従う |
+| SYW-CONTEXT-003 | MUST | manual | コンテキスト | 同一ファイル内容の重複は URI・範囲・内容ハッシュで統合する |
+| SYW-CONTEXT-004 | MUST | manual | コンテキスト | トークン予算は `contextWindow - reservedOutput - toolSchema - safetyMargin` とし、design.md §8.4 の標準配分を基準に再配分する |
+| SYW-CONTEXT-005 | MUST | manual | コンテキスト | `estimatedPromptTokens > usableBudget × 0.85` で履歴コンパクションを実行する |
+| SYW-CONTEXT-006 | MUST | manual | コンテキスト | 直近2〜4ラウンドは原文を残し、それより古い履歴を要約に置換する |
+| SYW-CONTEXT-007 | MUST | manual | コンテキスト | Tool Result は ANSI除去・機密マスク・バイナリ判定・文字数制限・先頭末尾保持・重要行抽出・完全出力のアーティファクト保存・要約と参照ID渡し、の順で処理する |
+| SYW-PROMPT-001 | MUST NOT | manual | プロンプト | システムプロンプトを単一文字列にハードコードしない（`PromptModule` のモジュール構造で構成） |
+| SYW-PROMPT-002 | MUST | manual | プロンプト | 基本プロンプトは design.md §9.2 の責務のみを含める |
+| SYW-PROMPT-003 | MUST | manual | プロンプト | モデルファミリー差は Tool Calling 注意・reasoning 設定・並列Tool Call・システムメッセージ制約・キャッシュ境界・Tool Result 順序制約 に限定する |
+| SYW-PROMPT-004 | MUST | manual | プロンプト | 指示ファイル優先順位は システム安全規則 > 現在の依頼 > モード指示 > ワークスペース指示 > ユーザー共通指示 > 既定プロンプト |
+| SYW-PROMPT-005 | MUST NOT | manual | プロンプト | ワークスペース内指示ファイルでシステム安全規則や権限を上書きさせない |
+| SYW-TOOL-001 | MUST | ast | ツール | ツールは `ToolDefinition`（name/description/inputSchema/category/mutatesWorkspace/requiresTrust/supportsParallel/isAvailable/execute）で定義する |
+| SYW-TOOL-002 | MUST | ast | ツール | モデル生成引数は AJV で JSON Schema 検証する |
+| SYW-TOOL-003 | MUST | manual | ツール | MCP ツールは組み込みツールと別名前空間（`builtin.*` / `mcp.<server>.<tool>`）で管理する |
+| SYW-TOOL-004 | MUST | manual | ツール | MCP ツールにサーバー単位有効化・ツール単位許可・接続先表示・入出力サイズ制限・タイムアウト・ネットワーク確認・Workspace Trust 制限を必須とする |
+| SYW-PERM-001 | MUST | manual | 権限 | Permission Profile は read-only / confirm-writes / workspace-write / autonomous の4種 |
+| SYW-PERM-002 | MUST | manual | 権限 | design.md §11.2 の操作（ワークスペース外書き込み・削除・大量変更・git commit/push・公開・デプロイ・外部URL送信・管理者操作・秘密情報送信・破壊コマンド・設定変更）は常に確認する |
+| SYW-PERM-003 | MUST | manual | 権限 | Workspace Trust を必須考慮し、Restricted Mode では design.md §11.3 の機能を無効化する |
+| SYW-PERM-004 | MUST NOT | config | 権限 | autonomous プロファイルを既定で提供しない（明示的有効化のみ） |
+| SYW-CHANGE-001 | MUST NOT | manual | ファイル編集 | `apply_patch`/`create_file`/`delete_file` で即座にディスクへ反映しない（まず `PendingChangeSet` を作る） |
+| SYW-CHANGE-002 | MUST | manual | ファイル編集 | 適用前に現在の内容と `baseHash` を比較し、不一致は自動上書きせず競合状態にする |
+| SYW-CHANGE-003 | MUST | manual | ファイル編集 | 承認後に `WorkspaceEdit` でまとめて適用する |
+| SYW-CMD-001 | MUST | ast | コマンド | コマンドは `CommandRequest`（command/args/cwd/env/reason/timeoutMs）で構造化し、可能な限りシェル文字列ではなく args 分離する |
+| SYW-CMD-002 | MUST | manual | コマンド | design.md §13 の検査項目（cwd・実行ファイル・シェルメタ文字・リダイレクト・パイプ・sudo・ネットワーク・削除系・Git書き込み・公開・秘密情報混入）を検査する |
+| SYW-UI-001 | MUST | manual | UI | VS Code 標準テーマトークンと Codicon を使用し、独自画像依存を減らす |
+| SYW-UI-002 | MUST NOT | manual | UI | 外観・商標・アイコン・固有文言を Codex 拡張から複製しない |
+| SYW-UI-003 | MUST | ast | UI | Webview 通信メッセージは判別共用体で定義し、Zod または JSON Schema で受信メッセージを検証する |
+| SYW-SEC-001 | MUST | config | セキュリティ | Webview に CSP・スクリプトnonce・`unsafe-eval`/`unsafe-inline` 禁止・`localResourceRoots` 限定・外部スクリプト禁止・HTML サニタイズ・Markdown内HTML無効・Command URI 既定無効・メッセージ検証を実装する |
+| SYW-SEC-002 | MUST | manual | セキュリティ | パスは `Uri` 正規化・`..`脱出拒否・シンボリックリンク解決後のワークスペース内確認・UNC/デバイスパス検査・OS別大小文字処理・ワークスペース外アクセス確認または拒否を行う |
+| SYW-SEC-003 | MUST | config | セキュリティ | ネットワークは HTTPS 既定必須・`localhost` のみHTTP許可可能・URL内認証情報禁止・リダイレクト先再検証・最大レスポンスサイズ・タイムアウト・TLSエラー無視設定不提供・Provider URL 常時表示可能 |
+| SYW-SEC-004 | MUST | manual | セキュリティ | ログは既定で Request ID/Provider/Model/時間/Token Usage/Tool名/成否/エラー分類/コンテキスト項目数のみ記録し、プロンプト全文・Tool Result全文・ファイル内容は記録しない |
+| SYW-STORAGE-001 | MUST | config | 保存 | 会話保存は `globalStorage/threads/<id>/` 配下の meta.json + events.jsonl + summary.json + artifacts/ + changes/ とする（SQLite は使わない） |
+| SYW-STORAGE-002 | MUST | manual | 保存 | events.jsonl は追記専用とし、一定件数ごとにスナップショットを作成する |
+| SYW-STORAGE-003 | MUST NOT | manual | 保存 | APIキー・Authorizationヘッダー・生環境変数・`.env`内容・認証トークン・非公開推論内容・明示除外ファイル内容を保存しない |
+| SYW-TEST-001 | MUST | config | テスト | テストは unit / provider-contract / agent-simulation / extension-integration の4層で構成する |
+| SYW-TEST-002 | MUST | manual | テスト | 実APIテストは明示的な環境変数がある場合だけ実行する |
+| SYW-ERR-001 | MUST | ast | エラー | エラーは design.md §18 の `AgentErrorCode` で分類し、ユーザー向け・モデル向け・ログ向け情報を分離する |
+| SYW-MVP-001 | MUST NOT | manual | MVP | MVPから design.md §21 の除外項目（インライン補完・Inline Chat・クラウドエージェント・GitHub認証・PR作成・複数エージェント並列・自動コミット・Web版VS Code・独自Embedding・音声・Notebook編集・Computer Use）を外す |
 
 ## 1. 目的・スコープ
-このプロジェクトでは{プロジェクトの達成目標を書く}
+
+このプロジェクトでは、**ユーザー自身が用意したAPIキーのみを使用する、独立したVS Codeコーディングエージェント（BYOK専用エージェント）**を開発する。
+
+### 1.1 達成目標
+
+1. 複数プロバイダー・複数モデルをJSONで定義できること
+2. エディタ・ワークスペース・会話履歴・ツール結果を適切にコンテキスト化できること
+3. モデルのネイティブTool Callingを使用してエージェントループを実行できること
+4. ファイル編集・コード検索・診断取得・テスト実行・ターミナル実行をツールとして提供できること
+5. システムプロンプトをモデルファミリーごとに差し替えられること
+6. Codex拡張機能に近い、サイドバー中心のUI・コンテキスト添付・変更差分レビューを提供できること
+7. APIキー・ファイル変更・コマンド実行を安全に管理できること
+
+### 1.2 スコープ（MVP）
+
+- デスクトップ版VS Code / Node Extension Host
+- OpenAI Responses または OpenAI 互換API
+- テキスト入力・単一エージェント
+- 読み取りツール・パッチベース編集・差分レビュー
+- 確認付きコマンド実行
+- JSONモデル設定・SecretStorage・JSONL会話保存
+
+### 1.3 参照ドキュメント
+
+- 詳細設計: `documents/design.md`
+- Issue一覧: `documents/issues.md`
+- ブランチルール: `.cursor/rules/branch.mdc` および `.cursor/rules/branch/*.mdc`
+
+## 2. 用語・識別子
+
+| 用語 | 意味 |
+|---|---|
+| BYOK | Bring Your Own Key。ユーザー自身のAPIキーのみを使用する方式 |
+| Extension Host | VS Code の拡張機能ホストプロセス。秘密情報・ファイルアクセス・LLM通信をここで処理 |
+| Webview | UI表示のみを担当するサンドボックス |
+| Provider Adapter | モデルAPIを内部共通形式に変換する層 |
+| AgentLoop | Tool Calling を反復するエージェントループ |
+| ChangeSet | モデルが生成した変更を保留し、ユーザー承認後に適用する仕組み |
+| Workspace Trust | VS Code の信頼ワークスペース機能 |
+
+- 設定識別子プレフィックス: `byokAgent.*`
+- モデル設定ファイル名: `models.json`（ユーザー共通）、`.vscode/byok-agent.models.json`（ワークスペース）
+- スキーマ: `model-config.schema.json`
+- Rule ID プレフィックス: `SYW-<DOMAIN>-<NNN>`
+
+## 3. ディレクトリ構成
+
+`src/` 配下は design.md §4 の構成に従う。
+
+```text
+src/
+  extension/    ui/         agent/       models/      providers/
+  context/      prompts/    tools/       changes/     permissions/
+  storage/      observability/
+resources/      prompts/    model-config.schema.json    default-models.json
+tests/          unit/       provider-contract/    agent-simulation/    extension-integration/
+```
+
+- `SYW-STRUCT-001` [MUST][config]: 上記構成に従う
+- `SYW-STRUCT-002` [MUST NOT][grep]: 設計書にない最上位ディレクトリを `src/` 直下に新設しない
+
+## 4. アーキテクチャ原則
+
+- `SYW-ARCH-001` [MUST][manual]: 秘密情報・LLM通信・ファイル・ターミナル・Git・プロンプト・Tool Calling・会話保存・権限判定は Extension Host 側で実行
+- `SYW-ARCH-002` [MUST NOT][manual]: Webview に秘密情報・ファイルアクセス権を渡さない
+- `SYW-ARCH-003` [MUST NOT][manual]: VS Code Language Model API に中核を依存させない
+
+## 5. Copilotコード利用方針
+
+Copilot Chat（MIT）は**直接フォークではなく縮小再実装**とする。責務分割・状態遷移・プロンプト構成・コンテキスト圧縮・ツール検証方式を参考にし、独立した小規模実装として書き直す。
+
+- `SYW-LEGAL-001` [MUST][config]: 流用時は `NOTICE.md` に出典コミット・原ファイル・変更内容を記録
+- `SYW-LEGAL-002` [MUST NOT][manual]: Copilot 名称・ロゴ・商標・製品固有エンドポイント・テレメトリ・製品プロンプト全文・Codex CSS/DOM/ブランドアセットを使用しない
+- `SYW-LEGAL-003` [MUST NOT][manual]: VS Code 本体内部 API に依存する実装を作らない
+
+## 6. モデル設定
+
+- `SYW-MODEL-001` [MUST][config]: JSON定義・優先順位（User Settings > ユーザー共通 > ワークスペース > デフォルト）
+- `SYW-MODEL-002` [MUST NOT][config]: APIキーをJSONに保存しない
+- `SYW-MODEL-003` [MUST][manual]: APIキーは SecretStorage のみ
+- `SYW-MODEL-004` [MUST NOT][config]: ワークスペース設定からAPIキー参照先・ヘッダー・外部URLを上書きさせない
+- `SYW-MODEL-005` [MUST][manual]: 能力はJSON設定値優先、モデル名推測は補助
+
+## 7. Provider Adapter
+
+- `SYW-PROVIDER-001` [MUST][ast]: `ProviderAdapter` 共通インターフェースと `ProviderEvent` 正規化
+- `SYW-PROVIDER-002` [MUST NOT][manual]: エージェント判断・ツール実行・権限・履歴圧縮を入れない
+- `SYW-PROVIDER-003` [MUST][manual]: 変換・正規化・ID保持・エラー分類・利用量・キャンセル・リトライ可否のみ担当
+- `SYW-PROVIDER-004` [MUST][manual]: 初期対応は OpenAI Responses / OpenAI互換 / Anthropic。Gemini は第2段階
+
+## 8. エージェントループ
+
+- `SYW-AGENT-001` [MUST][ast]: design.md §7.1 の状態機械で管理
+- `SYW-AGENT-002` [MUST][manual]: design.md §7.3 の停止条件で停止
+- `SYW-AGENT-003` [MUST NOT][manual]: ツール上限到達時に自動続行しない
+
+## 9. コンテキスト管理
+
+- `SYW-CONTEXT-001` [MUST][manual]: 静的／ターン単位／実行中の3分類
+- `SYW-CONTEXT-002` [MUST][manual]: design.md §8.3 の優先順位
+- `SYW-CONTEXT-003` [MUST][manual]: 重複は URI・範囲・ハッシュで統合
+- `SYW-CONTEXT-004` [MUST][manual]: トークン予算 = contextWindow - reserved - toolSchema - safetyMargin
+- `SYW-CONTEXT-005` [MUST][manual]: `> usableBudget × 0.85` でコンパクション
+- `SYW-CONTEXT-006` [MUST][manual]: 直近2〜4ラウンドは原文保持
+- `SYW-CONTEXT-007` [MUST][manual]: Tool Result の圧縮順序（§8.6）
+
+## 10. システムプロンプト
+
+- `SYW-PROMPT-001` [MUST NOT][manual]: 単一文字列ハードコード禁止・モジュール構造
+- `SYW-PROMPT-002` [MUST][manual]: 基本プロンプトは §9.2 の責務のみ
+- `SYW-PROMPT-003` [MUST][manual]: ファミリー差は Tool Calling・reasoning・並列・システムメッセージ・キャッシュ境界・順序制約に限定
+- `SYW-PROMPT-004` [MUST][manual]: 指示優先順位（§9.4）
+- `SYW-PROMPT-005` [MUST NOT][manual]: ワークスペース指示で安全規則・権限を上書きさせない
+
+## 11. ツールシステム
+
+- `SYW-TOOL-001` [MUST][ast]: `ToolDefinition` で定義
+- `SYW-TOOL-002` [MUST][ast]: AJV で入力検証
+- `SYW-TOOL-003` [MUST][manual]: MCP は別名前空間（`builtin.*` / `mcp.<server>.<tool>`）
+- `SYW-TOOL-004` [MUST][manual]: MCP ツールの必須制御項目
+
+## 12. 権限・セキュリティ
+
+- `SYW-PERM-001` [MUST][manual]: 4種の Permission Profile
+- `SYW-PERM-002` [MUST][manual]: §11.2 の操作は常に確認
+- `SYW-PERM-003` [MUST][manual]: Workspace Trust 必須考慮・Restricted Mode 無効化
+- `SYW-PERM-004` [MUST NOT][config]: autonomous は既定で提供しない
+- `SYW-SEC-001` [MUST][config]: Webview CSP・nonce・unsafe禁止・localResourceRoots限定
+- `SYW-SEC-002` [MUST][manual]: パス脱出・シンボリックリンク・ワークスペース外アクセス防止
+- `SYW-SEC-003` [MUST][config]: ネットワーク HTTPS既定・TLS無視設定不提供
+- `SYW-SEC-004` [MUST][manual]: ログはメタデータ中心・内容を記録しない
+
+## 13. ファイル編集・ChangeSet
+
+- `SYW-CHANGE-001` [MUST NOT][manual]: 直接ディスク書き換え禁止・`PendingChangeSet` を作る
+- `SYW-CHANGE-002` [MUST][manual]: 適用前に `baseHash` 比較・不一致は競合状態
+- `SYW-CHANGE-003` [MUST][manual]: 承認後に `WorkspaceEdit` でまとめて適用
+
+## 14. コマンド実行
+
+- `SYW-CMD-001` [MUST][ast]: `CommandRequest` で構造化・args 分離
+- `SYW-CMD-002` [MUST][manual]: §13 の検査項目を検査
+
+## 15. UI設計
+
+- `SYW-UI-001` [MUST][manual]: VS Code テーマトークン・Codicon 使用
+- `SYW-UI-002` [MUST NOT][manual]: Codex の外観・商標・アイコン・固有文言を複製しない
+- `SYW-UI-003` [MUST][ast]: Webview 通信は判別共用体・Zod/JSON Schema 検証
+
+## 16. 会話・イベント保存
+
+- `SYW-STORAGE-001` [MUST][config]: `globalStorage/threads/<id>/` の JSONL 構成
+- `SYW-STORAGE-002` [MUST][manual]: events.jsonl は追記専用・スナップショット作成
+- `SYW-STORAGE-003` [MUST NOT][manual]: 秘密情報・非公開推論・明示除外内容を保存しない
+
+## 17. エラー分類
+
+- `SYW-ERR-001` [MUST][ast]: `AgentErrorCode` で分類・ユーザー/モデル/ログ向け情報を分離
+
+## 18. テスト設計
+
+- `SYW-TEST-001` [MUST][config]: 4層（unit / provider-contract / agent-simulation / extension-integration）
+- `SYW-TEST-002` [MUST][manual]: 実APIテストは明示的環境変数時のみ
+
+## 19. 実装フェーズ・MVP
+
+実装は design.md §20 の Phase 1〜6 に従う。MVP スコープは §21 に従う。
+
+- `SYW-MVP-001` [MUST NOT][manual]: MVP から §21 の除外項目を外す
+
+## 20. 開発運用ルール
+
+- `git add` / `git commit` のコマンド操作は禁止（AGENTS.md 準拠）
+- 常に日本語で回答する
+- 設計書（`documents/design.md`）と矛盾する実装は行わない。矛盾発見時は設計書を正とし、必要なら設計書を更新する
+- 新規依存ライブラリ追加時は design.md の方針（AJV・Zod・VS Code 標準API優先）に従う

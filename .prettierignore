@@ -1,0 +1,13 @@
+.git/
+node_modules/
+.pnpm-store/
+out/
+coverage/
+.vscode-test/
+pnpm-lock.yaml
+AGENTS.md
+documents/
+.cursor/
+docker/
+makefile
+compose.yaml

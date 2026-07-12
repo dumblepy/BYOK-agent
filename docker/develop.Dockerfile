@@ -27,7 +27,7 @@ ENV PATH $PATH:/root/.node/bin
 RUN curl -fsSL https://get.pnpm.io/install.sh | bash -s -- -y
 ENV PATH $PATH:/root/.local/share/pnpm/bin
 
-RUN pnpm install -g codex
+RUN pnpm install -g @openai/codex
 
 RUN git config --global --add safe.directory /application
 WORKDIR /application
