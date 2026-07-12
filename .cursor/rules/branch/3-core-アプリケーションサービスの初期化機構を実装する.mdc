@@ -1,0 +1,238 @@
+---
+description: 3-core-アプリケーションサービスの初期化機構を実装するブランチでの開発時に読み込む
+alwaysApply: false
+---
+# アプリケーションサービスの初期化機構
+
+このブランチでは、VS Code拡張機能のactivationをComposition Rootに集約し、Provider、Storage、Agent、UIの各サービスを明示的な依存関係のもとで一元的に生成・起動・解放できるアプリケーションサービス基盤を整備する。対象はサービスのライフサイクル管理と初期化経路の整理に限り、Provider通信、会話保存、Agent Loop、UI通信などの機能本体は実装しない。
+
+## 実装方針
+
+- Extension Host側にComposition Rootを置き、`activate`から個別サービスのconstructorを直接呼び出さない。サービス生成は`createApplicationServices`などの単一ファクトリに集約する。
+- 依存性注入は汎用DIコンテナや自動スキャンに頼らず、ファクトリの引数とサービスコンテキストで明示する。依存関係がソースコードから追跡でき、初期化順序をレビューできる構造にする。
+- `ExtensionContext`はComposition Rootで受け取り、必要な機能だけを各サービスへ渡す。Webview、Provider、Agentに不要な秘密情報や広すぎるコンテキストを渡さない。
+- サービスは生成（constructor/factory）、初期化（`initialize`または`start`）、解放（`dispose`）の責務を分離する。constructorでネットワーク通信、ファイル書き込み、重い処理を開始しない。
+- 初期化順序は依存グラフのトポロジカル順序に従う。ProviderとStorageを先に初期化し、両者に依存するAgentを次に初期化し、Agentを利用するUIを最後に初期化する。
+- 初期化途中で失敗した場合は、すでに初期化済みのサービスだけを初期化順序の逆順で解放してから元のエラーを再送出する。部分的に起動した拡張機能を残さない。
+- `deactivate`はComposition Rootが保持するアプリケーションライフサイクルを通じて解放する。サービス自身がグローバルなsingletonを生成したり、他サービスを勝手に解放したりしない。
+- 解放処理はidempotentにする。`deactivate`の複数回呼び出し、初期化失敗後の後処理、VS Code側のDisposable解放が重なっても二重解放や例外の連鎖を起こさない。
+- 解放時はUIの登録・購読を最初に解除し、Agentの実行を停止し、Providerの通信・AbortControllerを停止し、最後にStorageの保留処理を完了させる。依存されるサービスを利用者より先に解放しない。
+- VS Codeの`Disposable`は各サービスが所有する`DisposableStore`などに登録し、サービスの`dispose`で明示的に解放する。個別サービスの登録を`activate`へ散在させない。
+- `context.subscriptions`に登録する場合も、登録責務はComposition Rootまたは該当サービスの一箇所に限定する。手動の`deactivate`とVS Codeの自動解放が重なっても安全なDisposableだけを登録する。
+- サービス初期化のログはサービス名、開始・完了・失敗、所要時間、エラー分類などのメタデータに限定し、APIキー、Authorizationヘッダー、プロンプト、Tool Result、ファイル内容を記録しない。
+- 実API、実ファイル保存、実際のAgent Loop、Webviewとの通信プロトコルをこのブランチの完了条件に含めない。必要な依存はfake/stubで検証する。
+
+## 依存関係と責務
+
+サービスの依存関係は次の一方向グラフとする。
+
+```text
+ExtensionContext
+      │
+  ┌───┴────┐
+  ▼        ▼
+Provider  Storage
+  └───┬────┘
+      ▼
+    Agent
+      │
+      ▼
+      UI
+```
+
+### ProviderService
+
+- Provider設定・Adapterの解決とライフサイクルを担当する。
+- APIキーは`ExtensionContext.secrets`など許可されたSecretStorage経路からのみ取得し、他サービスやUIへ平文で渡さない。
+- Agentの判断、Tool実行、権限判定、履歴圧縮、会話保存を担当しない。
+- 初期化時にProvider接続を必須化する場合は、設定検証までに留め、実APIリクエストは行わない。接続確認が必要な機能は後続ブランチで実装する。
+- Agentが利用するProviderの公開インターフェースを依存契約として提供する。
+
+### StorageService
+
+- `globalStorage`配下の保存先、Thread/Event/Artifactのストア依存、必要なディレクトリ準備を担当する。
+- 保存形式はプロジェクト設計書および`SYW-STORAGE-001`に従い、SQLiteを導入しない。
+- 初期化時に保存先の検証・準備を行う。APIキー、Authorizationヘッダー、生環境変数、`.env`内容、非公開推論内容を保存しない。
+- `dispose`時は保留中の書き込み、ファイルハンドル、購読を安全に終了する。ただし、AgentやUIの後処理が完了する前にStorageを解放しない。
+
+### AgentService
+
+- ProviderServiceとStorageServiceをコンストラクターまたは明示的な依存コンテキストから受け取り、独自に生成しない。
+- Agent Runtime、キャンセル、実行中runの追跡など、Agent層のライフサイクル境界を担当する。
+- Agent状態機械やTool Callingの本実装は後続ブランチに委ねる。今回必要なのは、依存サービスを受け取り、起動・停止できる境界である。
+- `dispose`時は新規runの受付を停止し、実行中runへキャンセルを伝播し、終了を待機してから内部購読を解放する。
+
+### UIService
+
+- AgentServiceと必要最小限のStorageServiceを受け取り、Webview View ProviderやVS Code登録を一元管理する。
+- Webviewには秘密情報、ファイルアクセス権、Provider Adapter、Storage実装を渡さない。UIはExtension Hostとのメッセージ境界を介してAgent機能を利用する。
+- 今回は既存UI登録のライフサイクルをサービス化する範囲に留め、メッセージプロトコル、会話画面、Composer、差分表示を拡張しない。
+- `dispose`時はWebview Provider、イベント購読、コマンド、タイマーなどUIが登録したリソースをすべて解放する。
+
+## 設計
+
+### 1. 配置
+
+既存の`src/`直下の責務別構成を維持し、新しい最上位ディレクトリは作成しない。ファイル名は既存の命名規則に合わせてよいが、責務は次のいずれかに限定する。
+
+```text
+src/
+  extension/
+    activate.ts                    # VS Code境界。Composition Rootの呼び出しだけ
+    application-services.ts        # サービス集合、依存グラフ、初期化・解放
+    service-lifecycle.ts           # 共通ライフサイクル型または解放補助
+  providers/
+    provider-service.ts            # Providerの生成・初期化・解放境界
+  storage/
+    storage-service.ts             # Storageの生成・初期化・解放境界
+  agent/
+    agent-service.ts               # Agentの生成・停止・解放境界
+  ui/
+    ui-service.ts                  # UI登録・購読・解放境界
+```
+
+既存の`src/extension/extension.ts`がエントリポイントの場合は、`package.json`の`main`と整合する範囲で段階的に委譲する。エントリポイントを複数作ってactivation経路を分散させない。
+
+### 2. サービス契約
+
+共通契約は、同期・非同期の解放を扱える最小限の形にする。VS Codeの`Disposable`だけに依存して非同期の停止処理を捨てない。
+
+```ts
+interface ApplicationService {
+  initialize(): void | Promise<void>;
+  dispose(): void | Promise<void>;
+}
+
+interface ApplicationServices {
+  provider: ProviderService;
+  storage: StorageService;
+  agent: AgentService;
+  ui: UIService;
+  dispose(): Promise<void>;
+}
+```
+
+- `initialize`と`dispose`の多重呼び出しは安全に扱うか、Composition Rootだけが一度ずつ呼び出す不変条件をテストで保証する。
+- `dispose`は成功したサービスだけを対象にし、未初期化サービスへ破棄処理を強制しない。ただし、生成後に保持した外部リソースがある場合は、初期化失敗時にも安全に解放できるようにする。
+- 複数の解放処理が失敗した場合は全サービスの解放を試み、最初のエラーまたは集約エラーを呼び出し元へ返す。後続の解放をエラーでスキップしない。
+- 依存サービスを公開する場合は読み取り専用の参照にし、UIなど上位サービスがProviderやStorageを再生成できないようにする。
+
+### 3. Composition Root
+
+`createApplicationServices(context)`は次の処理だけを担う。
+
+1. ExtensionContextから各サービスに必要な狭い依存を作る。
+2. ProviderServiceとStorageServiceを生成する。
+3. ProviderServiceとStorageServiceを初期化する。
+4. 両者を渡してAgentServiceを生成・初期化する。
+5. AgentServiceと必要な参照を渡してUIServiceを生成・初期化する。
+6. 生成・初期化済みのサービス集合を返す。
+
+生成順と初期化順を別々に隠蔽しない。設計上の依存グラフと実際の呼び出し順が一致することをコードレビューとテストで確認する。
+
+`activate(context)`は次の責務に限定する。
+
+- `createApplicationServices(context)`を一度呼び出す。
+- 作成したサービス集合を`deactivate`から参照可能な一箇所へ保持する。
+- activation失敗時はComposition Rootのロールバック結果をVS Codeへ返し、無効なサービス集合を保持しない。
+
+`deactivate()`は次の責務に限定する。
+
+- 保持しているサービス集合があれば、UI→Agent→Provider/Storageの順で一度だけ解放する。
+- 解放完了後に参照を破棄する。
+- 未初期化または既に解放済みの場合は正常終了する。
+
+### 4. 失敗時の状態遷移
+
+```text
+created
+  └─ initialize Provider/Storage
+       ├─ 失敗 → 生成済みリソースを逆順dispose → activation失敗
+       └─ 成功 → initialize Agent
+                    ├─ 失敗 → Provider/Storageを逆順dispose → activation失敗
+                    └─ 成功 → initialize UI
+                                 ├─ 失敗 → Agent/Provider/Storageを逆順dispose
+                                 └─ 成功 → active
+
+active ── deactivate ──▶ UI dispose ─▶ Agent dispose ─▶ Provider/Storage dispose ─▶ disposed
+```
+
+ProviderとStorageは相互依存させない。将来、Providerの利用量保存やStorageの暗号化などが必要になった場合も、直接参照を追加せず、Agentまたは専用の境界インターフェースで循環依存を避ける。
+
+### 5. テスト設計
+
+実API、実際のSecretStorage、実ファイルの永続化、Extension Development Hostの手動起動を必須にしない。fakeサービスと記録用Disposableを使って、ライフサイクル契約を検証する。
+
+- `tests/unit/`
+  - サービス生成が一元化され、各サービスが一度だけ生成・初期化されること
+  - Provider/Storage→Agent→UIの依存関係と初期化順が期待どおりであること
+  - UI→Agent→Provider/Storageの逆順で解放されること
+  - `deactivate`の再呼び出しが安全であること
+  - AgentまたはUIの初期化失敗時に、すでに初期化済みのサービスが逆順でロールバックされること
+  - 解放エラーがあっても残りのサービスの解放を継続すること
+- `tests/extension-integration/`
+  - `activate`がApplicationServicesだけを通じて登録を完了すること
+  - `deactivate`後にUI登録、イベント購読、Agent runが残らないこと
+  - `package.json`の`main`から解決されるエントリポイントと実装されたactivation経路が一致すること
+
+## 進捗
+
+- [x] 既存の`activate`/`deactivate`とUI登録のリソース所有箇所を調査する
+- [x] Provider、Storage、Agent、UIのサービス境界と狭い依存インターフェースを確定する
+- [x] `ApplicationServices`とComposition Rootの初期化順・依存グラフを実装する
+- [x] activation失敗時の逆順ロールバックを実装する
+- [x] UI、Agent、Provider、Storageのdispose責務を実装する
+- [x] `deactivate`から一元的に解放し、多重呼び出しを安全にする
+- [x] 初期化順、依存関係、ロールバック、逆順解放、解放エラー継続の単体テストを追加する
+- [x] Extension Host境界の統合テストを追加する
+- [x] 型チェック、Lint、フォーマット検査、テスト、コンパイルを実行する
+- [x] 実装範囲をサービスライフサイクルに限定し、Provider通信、Storage機能、Agent Loop、UI通信を先行実装していないことをレビューする
+
+## 完了条件
+
+以下をすべて満たした時点で完了とする。
+
+1. `activate`からProvider、Storage、Agent、UIを個別に生成せず、単一のComposition Rootを通じて一元的に初期化できる。
+2. ProviderとStorage、Agent、UIの依存関係が型または明示的な生成順から追跡でき、循環依存がない。
+3. 初期化順がProvider/Storage→Agent→UIであり、初期化途中の失敗時は生成済みサービスが逆順で解放される。
+4. `deactivate`でUI→Agent→Provider/Storageの順にリソースが解放され、再呼び出しでも例外や二重解放が発生しない。
+5. UI登録、購読、タイマー、Agent run、Provider通信、Storageの保留処理について、該当するリソース所有者が明示されている。
+6. 初期化・解放の成功、失敗、ロールバック、キャンセル、再入をテストで再現できる。
+7. 型チェック、Lint、フォーマット検査、テスト、コンパイルが成功する。
+8. 既存のプロジェクト構成・セキュリティ規則・保存規則・Provider/Agent/UIの責務分離に違反しない。
+
+## 対象外
+
+- Provider Adapterの実装、API通信、リトライ、ストリーミング、実API接続
+- Model Catalog、モデル設定Schema、SecretStorageの機能拡張
+- Thread Store、Event Store、Artifact保存などStorage本体の実装
+- Agent State Machine、Agent Loop、Tool Calling、Context収集、Prompt構築
+- Webview通信プロトコル、Composer、会話UI、テーマ対応、差分UI
+- Tool、Permission、ChangeSet、MCP、テレメトリの実装
+- 汎用DIコンテナの導入、サービスロケータ、暗黙のsingleton、循環依存の追加
+- `git add`、`git commit`、既存の作業ツリー変更の整理・上書き
+
+## 参考資料
+
+- `AGENTS.md`
+- `.cursor/rules/project.mdc`
+- `.cursor/rules/branch.mdc`
+- `.cursor/rules/branch/1-core-vs-code拡張プロジェクトの初期構成を作成する.mdc`
+- `documents/issues.md` の「Milestone 0: アプリケーションサービスの初期化機構を実装する」
+- `documents/design.md` の「全体アーキテクチャ」「ディレクトリ構成」「主要インターフェース」「テスト設計」
+- `package.json` のExtension HostエントリポイントとContribution Points
+- `src/extension/extension.ts`、`src/ui/agent-webview-provider.ts` の既存activation/UI登録実装
+
+## 調査結果・設計まとめ
+
+- Issue一覧では本タスクをMilestone 0のCore項目として、activation時のサービス生成整理、依存関係の明示、deactivate時の解放、Provider・Storage・Agent・UIの一元初期化を完了条件としている。
+- プロジェクト設計書の全体アーキテクチャでは、Extension Host側にSessionControllerとAgentRuntimeを置き、ProviderRouter、会話保存、UIを分離する構成が示されている。本ブランチではその統合責務を`ApplicationServices`に集約し、既存のSessionController想定と矛盾しないようAgentServiceの内部実装へ委譲できる境界を採用する。
+- 現在のExtension Hostエントリポイントは`src/extension/extension.ts`で、`activate`内で`AgentWebviewProvider`を生成し、Webview View Providerの登録Disposableを`context.subscriptions`へ追加している。今回の設計ではこの登録責務をUIServiceへ移し、activationからサービス生成を分離する。
+- 現在の作業ツリーには`makefile`の既存変更があるため、本ブランチルールの作成・後続実装ではそれを上書き、整理、ステージングしない。`git add`および`git commit`は実行しない。
+- 既存のUI登録を`context.subscriptions`からUIService所有のDisposableStoreへ移し、`deactivate`が非同期のAgent停止とStorage後処理を待機できる構成にした。UI登録はComposition Rootから注入されたVS Code登録関数を通じて行う。
+- `ApplicationServices`はProviderとStorageを生成してから両者を初期化し、その後にAgent、UIを依存順で生成・初期化する。生成済みサービスは初期化の成否にかかわらずロールバック対象として記録する。
+- `tsconfig.eslint.json`は基底設定の`tests`除外を継承していたため、テストをLint対象として解析できるよう`exclude`を`node_modules`と`out`に限定した。
+- VS Code Extension Hostの`deactivate`は非同期処理を返せるため、Agentのキャンセル完了やStorageの保留処理を捨てずに待機できる設計とする。ただし、VS Code Disposableの同期契約と混同せず、非同期解放が必要な境界はアプリケーションサービスの`dispose`で扱う。
+- 初期化と解放は同じサービス集合に対するライフサイクル操作だが、依存グラフは一方向に保つ。ProviderとStorageは独立、Agentは両者へ依存、UIはAgentへ依存するため、初期化は依存順、解放は逆依存順になる。
+- 初期化失敗時に「生成済みだが未初期化」のリソースが残る可能性があるため、生成と初期化を別段階にする場合も、ファクトリは所有権を記録し、ロールバック対象を明確にする。解放エラーで後続の解放を止めないことを契約とする。
+- このファイルはブランチルールと設計書であり、サービス実装そのものではない。進捗チェックボックスは実装・検証の実施後に更新し、未実施の項目を完了扱いにしない。

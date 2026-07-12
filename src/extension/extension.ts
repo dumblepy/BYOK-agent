@@ -1,30 +1,48 @@
-import * as vscode from "vscode";
-
 import type { ExtensionContext } from "vscode";
 
-import { AgentWebviewProvider } from "../ui/agent-webview-provider";
+import { createApplicationServices, type ApplicationServices } from "./application-services";
 
-const AGENT_VIEW_ID = "byokAgent.view";
+let applicationServices: ApplicationServices | undefined;
+let activationPromise: Promise<void> | undefined;
 
 /**
  * VS Code Extension Host entry point.
  *
  * Register the Activity Bar view and its Webview provider.
  */
-export function activate(context: ExtensionContext): void {
-  const provider = new AgentWebviewProvider(context);
-  context.subscriptions.push(
-    vscode.window.registerWebviewViewProvider(AGENT_VIEW_ID, provider, {
-      webviewOptions: {
-        retainContextWhenHidden: false,
-      },
-    }),
-  );
+export function activate(context: ExtensionContext): Promise<void> {
+  if (applicationServices) {
+    return Promise.resolve();
+  }
+
+  if (activationPromise) {
+    return activationPromise;
+  }
+
+  activationPromise = createApplicationServices(context).then((services) => {
+    applicationServices = services;
+  });
+
+  return activationPromise.finally(() => {
+    if (!applicationServices) {
+      activationPromise = undefined;
+    }
+  });
 }
 
 /**
  * Extension Host teardown hook reserved for future service cleanup.
  */
-export function deactivate(): void {
-  // The initial extension does not retain resources.
+export async function deactivate(): Promise<void> {
+  if (activationPromise && !applicationServices) {
+    await activationPromise.catch(() => undefined);
+  }
+
+  const services = applicationServices;
+  applicationServices = undefined;
+  activationPromise = undefined;
+
+  if (services) {
+    await services.dispose();
+  }
 }
