@@ -75,13 +75,24 @@ const threadEventSchema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("user-message"),
+      messageId: identifierSchema.optional(),
       text: textSchema,
     })
     .strict(),
   z
     .object({
       kind: z.literal("assistant-text"),
+      messageId: identifierSchema.optional(),
       text: textSchema,
+      streaming: z.boolean().optional(),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("assistant-text-delta"),
+      messageId: identifierSchema,
+      delta: textSchema,
+      done: z.boolean(),
     })
     .strict(),
   z

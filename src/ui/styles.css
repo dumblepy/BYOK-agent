@@ -128,3 +128,152 @@ button {
 .hint {
   font-size: 11px;
 }
+
+.thread-view {
+  position: relative;
+  min-height: 0;
+  flex: 1 1 auto;
+}
+
+.thread-message-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-height: 52vh;
+  overflow-y: auto;
+  padding: 2px 2px 8px;
+  scroll-behavior: smooth;
+}
+
+.thread-empty-state {
+  padding: 24px 12px;
+  color: var(--vscode-descriptionForeground);
+  text-align: center;
+  line-height: 1.5;
+}
+
+.thread-message {
+  padding: 10px 12px;
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 6px;
+  overflow-wrap: anywhere;
+}
+
+.thread-message-user {
+  background: var(--vscode-textBlockQuote-background);
+}
+
+.thread-message-assistant {
+  background: var(--vscode-editorWidget-background);
+}
+
+.thread-message-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 7px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.thread-message-status {
+  color: var(--vscode-progressBar-background);
+  font-weight: 400;
+}
+
+.thread-markdown {
+  line-height: 1.55;
+}
+
+.thread-markdown > :first-child {
+  margin-top: 0;
+}
+
+.thread-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.thread-markdown p,
+.thread-markdown ul,
+.thread-markdown ol,
+.thread-markdown pre {
+  margin: 8px 0;
+}
+
+.thread-markdown h1,
+.thread-markdown h2,
+.thread-markdown h3,
+.thread-markdown h4,
+.thread-markdown h5,
+.thread-markdown h6 {
+  margin: 12px 0 6px;
+  font-weight: 600;
+}
+
+.thread-markdown h1 {
+  font-size: 1.35em;
+}
+
+.thread-markdown h2 {
+  font-size: 1.2em;
+}
+
+.thread-markdown h3,
+.thread-markdown h4,
+.thread-markdown h5,
+.thread-markdown h6 {
+  font-size: 1.05em;
+}
+
+.thread-markdown-paragraph {
+  white-space: pre-wrap;
+}
+
+.thread-markdown code {
+  padding: 1px 4px;
+  color: var(--vscode-textPreformat-foreground);
+  background: var(--vscode-textCodeBlock-background);
+  border-radius: 3px;
+  font-family: var(--vscode-editor-font-family);
+  font-size: 0.95em;
+}
+
+.thread-code-block {
+  max-width: 100%;
+  padding: 10px;
+  overflow-x: auto;
+  color: var(--vscode-textPreformat-foreground);
+  background: var(--vscode-textCodeBlock-background);
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 4px;
+}
+
+.thread-code-block code {
+  display: block;
+  padding: 0;
+  white-space: pre;
+  background: transparent;
+}
+
+.thread-markdown a {
+  color: var(--vscode-textLink-foreground);
+}
+
+.thread-message-error {
+  margin: 8px 0 0;
+  color: var(--vscode-errorForeground);
+  font-size: 12px;
+}
+
+.thread-new-content {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  width: auto;
+  padding: 4px 8px;
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
+  cursor: pointer;
+  opacity: 1;
+}

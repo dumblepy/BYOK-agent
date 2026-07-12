@@ -1,7 +1,14 @@
 import { render } from "preact";
-import { useState } from "preact/hooks";
+import { useEffect, useMemo, useReducer, useRef, useState } from "preact/hooks";
 
 import "./styles.css";
+import { ThreadView } from "./webview/components/ThreadView";
+import {
+  INITIAL_THREAD_VIEW_STATE,
+  eventToThreadViewAction,
+  threadViewReducer,
+} from "./webview/thread-view-model";
+import { DEFAULT_THREAD_ID } from "./webview-protocol";
 import { WebviewProtocolClient, type WebviewProtocolApi } from "./webview-protocol-client";
 import { createAgentWebviewStateStore, type WebviewStateApi } from "./webview-state";
 
@@ -9,15 +16,50 @@ declare function acquireVsCodeApi(): WebviewStateApi & WebviewProtocolApi;
 
 const vscodeApi = acquireVsCodeApi();
 const stateStore = createAgentWebviewStateStore(vscodeApi);
-const protocolClient = new WebviewProtocolClient(vscodeApi, window, {
-  onSequenceGap: (message) => {
-    protocolClient.send("request-thread-snapshot", { threadId: message.payload.threadId });
-  },
-});
-protocolClient.start();
 
 function App() {
   const [composerDraft, setComposerDraft] = useState(stateStore.state.composerDraft);
+  const [threadState, dispatchThread] = useReducer(threadViewReducer, INITIAL_THREAD_VIEW_STATE);
+  const snapshotThreadIdRef = useRef(DEFAULT_THREAD_ID);
+  const protocolClient = useMemo(
+    () =>
+      new WebviewProtocolClient(vscodeApi, window, {
+        onMessage: (message) => {
+          if (message.type === "thread-snapshot") {
+            snapshotThreadIdRef.current = message.payload.threadId;
+            dispatchThread({
+              type: "replace-snapshot",
+              revision: message.payload.revision,
+              events: message.payload.events,
+            });
+          } else if (message.type === "thread-event") {
+            snapshotThreadIdRef.current = message.payload.threadId;
+            dispatchThread(
+              eventToThreadViewAction(message.payload.sequence, message.payload.event),
+            );
+          }
+        },
+        onSequenceGap: (message) => {
+          snapshotThreadIdRef.current = message.payload.threadId;
+          dispatchThread({ type: "request-snapshot" });
+        },
+      }),
+    [],
+  );
+
+  useEffect(() => {
+    protocolClient.start();
+    return () => protocolClient.dispose();
+  }, [protocolClient]);
+
+  useEffect(() => {
+    if (!threadState.needsSnapshot || threadState.snapshotRequestPending) {
+      return;
+    }
+
+    protocolClient.send("request-thread-snapshot", { threadId: snapshotThreadIdRef.current });
+    dispatchThread({ type: "snapshot-requested" });
+  }, [protocolClient, threadState.needsSnapshot, threadState.snapshotRequestPending]);
 
   const handleComposerInput = (event: Event): void => {
     const composerDraft = (event.currentTarget as HTMLTextAreaElement).value;
@@ -37,13 +79,7 @@ function App() {
         </span>
       </header>
 
-      <section class="welcome-card" aria-labelledby="welcome-title">
-        <div class="welcome-mark" aria-hidden="true">
-          ✦
-        </div>
-        <h2 id="welcome-title">開発を始めましょう</h2>
-        <p>ファイル、選択範囲、目的を入力すると、ここからエージェントと作業を始められます。</p>
-      </section>
+      <ThreadView messages={threadState.messages} isRestoring={!threadState.isHydrated} />
 
       <label class="composer-label" htmlFor="prompt">
         依頼

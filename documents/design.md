@@ -1282,6 +1282,128 @@ interface ToolActivityView {
 
 引数全文や巨大なTool Resultを初期表示しない。折りたたみ表示とする。
 
+### 14.2.1 スレッド表示コンポーネント詳細設計
+
+`ThreadView`は、Extension Hostが保持する会話のうち、ユーザー発言とエージェント発言を時系列に表示するWebview専用の投影コンポーネントとする。会話の正本、Agent実行、Provider通信、保存、権限判定は担当しない。`ThreadView`へは検証済みの表示モデルだけを渡し、Webview APIや生の通信メッセージをコンポーネント内部から直接参照しない。
+
+#### 責務と境界
+
+担当する責務は次のとおりとする。
+
+* 複数メッセージを入力順に表示する
+* `user`と`assistant`を視覚・アクセシビリティ上区別する
+* Markdownを安全な表示ノードへ変換し、コードブロックを専用レイアウトで表示する
+* ストリーミング中のテキスト差分を同一メッセージへ反映する
+* 新しい内容が増えたときのスクロール位置を、ユーザーの閲覧を妨げない範囲で更新する
+* 空状態、ストリーミング状態、完了状態、失敗状態を表示する
+
+次の責務は持たせない。
+
+* Extension Hostへの直接`postMessage`
+* Providerイベントの解釈、Agent状態機械、会話永続化
+* Markdown内HTMLの実行、任意URIの実行、外部スクリプトの読み込み
+* Tool Activity、ChangeSet、Approval、Composerの操作本体（それぞれ別コンポーネントの責務）
+
+#### 表示モデル
+
+通信イベントをそのままJSXへ渡さず、UI専用の正規化モデルへ変換する。`id`はストリーム中も変化しないメッセージ単位の識別子であり、時刻だけで並び替えない。配列順はHostから受け取ったスナップショットおよびイベントの順序を正本とする。
+
+```ts
+type ThreadMessageRole = "user" | "assistant";
+type ThreadMessagePhase = "streaming" | "complete" | "failed";
+
+interface ThreadMessageViewModel {
+  id: string;
+  role: ThreadMessageRole;
+  text: string;
+  phase: ThreadMessagePhase;
+  createdAt: number;
+  errorMessage?: string;
+}
+
+interface ThreadViewProps {
+  messages: readonly ThreadMessageViewModel[];
+  isRestoring?: boolean;
+}
+```
+
+ユーザー発言は受信した本文を一つの`complete`メッセージとして追加する。エージェント発言は開始時に空文字または初回差分で一つだけ作成し、後続差分を同じ`id`へ連結する。`failed`へ遷移したメッセージは本文を保持したまま、エラー表示を付加する。表示モデルの文字列上限は通信スキーマの上限を超えないよう、Host側とWebview側の両方で検査する。
+
+#### ストリーミング更新とReducer
+
+Extension HostからWebviewへ渡すストリーミングイベントは、安定した`messageId`、単調増加する`sequence`、本文差分`delta`、終端フラグ`done`を持つ正規化イベントとする。スナップショットには差分適用済みの全文を含め、再接続時に同じ表示結果を再構成できるようにする。
+
+```ts
+type ThreadViewEvent =
+  | {
+      kind: "message-added";
+      message: ThreadMessageViewModel;
+    }
+  | {
+      kind: "assistant-text-delta";
+      messageId: string;
+      delta: string;
+      done: boolean;
+      sequence: number;
+    }
+  | {
+      kind: "message-failed";
+      messageId: string;
+      errorMessage: string;
+      sequence: number;
+    };
+```
+
+Reducerの規則は次のとおりとする。
+
+1. スナップショット受信時は表示モデルを置き換え、保持中のストリーム差分を再適用しない。
+2. `message-added`は未知の`id`だけを追加し、同じ`id`の再送は無視する。
+3. `assistant-text-delta`は存在する`assistant`メッセージにだけ適用し、`delta`を既存本文の末尾へ一度だけ追加する。
+4. `done: true`で`phase`を`complete`へ変更する。完了後の差分やroleが異なる差分は適用せず、スナップショット再取得を要求する。
+5. `message-failed`は対象本文を維持して`failed`へ変更し、ユーザー向けの安全なエラー文だけを表示する。
+6. 欠番、古い`sequence`、未知のメッセージIDはReducerで黙って補完せず、通信クライアントへ正本再同期を通知する。
+
+これにより、1ターン中のエージェント本文だけが更新され、過去のメッセージのDOMキーやスクロール位置が不必要に変化しない。差分を受信するたびに全文を再構成するため、UIは常に現在の本文をMarkdownとして描画できる。MVPでは仮想スクロールを導入せず、メッセージ数・本文長の上限は通信およびStorageの上限に従う。
+
+#### Markdownとコードブロック
+
+Markdownは文字列を直接`innerHTML`へ渡さず、Markdown ASTまたは同等の安全な中間表現からPreactノードへ変換する。次の設定を必須とする。
+
+* raw HTMLノードを無効化または破棄する
+* `javascript:`、`data:`、`command:`などの実行可能なURIをリンクにしない
+* URLは表示テキストとリンク先を検証し、許可しないURIはプレーンテキストで表示する
+* ユーザー入力、モデル出力、Tool ResultをHTML属性、CSS、スクリプトとして解釈しない
+* Markdownの解析失敗時は本文をエスケープ済みプレーンテキストとして表示する
+
+コードフェンスは`<pre><code>`相当の専用ノードとして描画し、言語指定は表示用のクラス名へ検査済みの値だけを渡す。未指定または未知の言語はプレーンコードとして表示し、初期実装では動的な外部シンタックスハイライトを読み込まない。コード本文は空白と改行を保持し、横方向のオーバーフローを許容する。コピー操作は別Issueとし、本タスクの完了条件に含めない。
+
+#### レイアウト、スクロール、アクセシビリティ
+
+メッセージ一覧は`role="log"`相当の読み上げ領域とし、各メッセージを`article`として、roleと連番または時刻をアクセシブルなラベルに含める。ストリーミング中のエージェントメッセージだけに`aria-busy="true"`を設定し、全文の再読み上げを避ける。色だけでuser/assistantや状態を区別しない。
+
+末尾から一定距離以内を閲覧している場合だけ新しい差分で末尾へ追従する。ユーザーが上へスクロールしている場合は位置を保持し、新着状態を表示する。初回スナップショットの復元中はローディング表示を出し、空のスレッドはComposerとは独立した空状態を表示する。テーマカラーはVS Code標準トークンを使い、固定色や独自画像に依存しない。
+
+#### 実装単位
+
+実装時は次の単位へ分割する。
+
+* `src/ui/webview/components/ThreadView.tsx`: メッセージ一覧、空状態、ストリーミング表示、スクロール境界
+* `src/ui/webview/thread-view-model.ts`: 表示モデル、イベント型、Reducer、スナップショット再同期判断
+* `src/ui/webview/markdown/MarkdownRenderer.tsx`: 安全なMarkdownノードとコードブロックの描画
+* `src/ui/styles.css`: VS Codeテーマトークンに基づくメッセージ・コードブロック・状態表示（既存Webviewスタイルへ統合）
+
+`ThreadView`は`thread-view-model.ts`のReducer結果だけを受け取り、通信クライアント・Extension Host・Storageをimportしない。既存のWebviewプロトコルを拡張する場合も、差分イベントの検証は通信境界で完了させ、コンポーネントへ`unknown`を渡さない。
+
+#### 完了条件
+
+1. ユーザー発言とエージェント発言を含む3件以上のメッセージを、受信順のまま表示できる。
+2. 見出し、段落、箇条書き、インラインコード、コードフェンスを安全に表示できる。
+3. エージェント本文の複数の差分を同じメッセージへ順序どおりに反映し、終端後に`complete`表示へ遷移できる。
+4. スナップショット再同期後も、ストリーミング中・完了済みを含む表示結果が正本と一致する。
+5. raw HTML、危険なURI、過大な本文、未知のイベントを実行せず、安全なフォールバックまたは再同期へ移行できる。
+6. Light、Dark、High Contrastテーマで本文とコードブロックの視認性を維持できる。
+7. ユニットテストでReducerとMarkdown変換を、コンポーネントテストで複数メッセージ・ストリーミング・空状態を検証できる。
+
 ## 14.3 Webview通信
 
 Extension HostとWebviewの通信は、VS Code Webview APIの`postMessage`を搬送路とし、その上に本拡張専用のバージョン付きメッセージプロトコルを定義する。WebviewはUI状態の投影とユーザー操作を担当し、会話・Agent実行・権限・変更の正本はExtension Hostが保持する。

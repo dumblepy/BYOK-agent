@@ -1,102 +1,91 @@
 ---
-description: 6-ui-webviewのcontent-security-policyを実装するブランチでExtension HostとWebviewの通信プロトコルを設計するときに読み込む
+description: 6-ui-webviewのcontent-security-policyを実装するブランチでスレッド表示コンポーネントを実装するときに読み込む
 alwaysApply: false
 ---
-# Extension HostとWebviewの通信プロトコル
+# スレッド表示コンポーネント
 
-このブランチでは、Agent SidebarのWebviewとExtension Hostの間で型安全に双方向メッセージを送受信できるプロトコルを定義する。対象はメッセージの型、共通エンベロープ、プロトコルバージョン、Zodによる受信検証、相関・順序制御、再接続時のスナップショット同期であり、実装は次の作業で行う。
+このブランチでは、Webview上でユーザーとエージェントの複数メッセージを時系列表示する`ThreadView`を実装する。対象は表示モデル、ストリーミング差分のReducer、安全なMarkdown・コードブロック描画、テーマ対応、表示コンポーネントのテストである。実装はこのルールと`documents/design.md` §14.2.1の設計に従う。
 
 ## 実装方針
 
-- メッセージは`protocolVersion`、`messageId`、`type`、`sentAt`、任意の`correlationId`、`payload`を持つ共通エンベロープに統一する。MVPのバージョンは`"1.0"`とする。
-- UI→ExtensionとExtension→UIを別々の判別共用体として定義し、`type`ごとのpayload型を固定する。未知の`type`を黙って無視して操作を続行しない。
-- Zodスキーマを型と実行時検証の単一の正本とし、`z.infer`からTypeScript型を導出する。手書き型と検証ロジックの二重管理を作らない。
-- Extension Hostの`onDidReceiveMessage`とWebviewの受信処理の双方で、`unknown`を検証してからDispatcherまたはReducerへ渡す。検証前の値をDOM、ログ、権限判定、ファイル操作に渡さない。
-- Extension Hostを会話・Agent実行・権限・ChangeSetの正本とする。WebviewはUI投影として扱い、再生成時は`ui-ready`を送り、スナップショットから再同期する。
-- `messageId`で重複を排除し、`correlationId`で要求と応答・イベントを関連付ける。`thread-event`と`run-state`には単調増加する`sequence`を持たせ、欠番時はスナップショットを再取得する。
-- 操作要求を受けたExtension Hostは、IDの存在だけで許可せず、現在の状態・権限・Workspace Trust・ChangeSetの`baseHash`を再確認する。
-- APIキー、Authorizationヘッダー、生の環境変数、不要なファイル内容、非公開推論内容をメッセージに含めない。表示用データも最小限のSummary型に限定する。
-- 実装対象はプロトコル定義・検証・送受信アダプター・状態同期・テストまでとし、Provider、AgentLoop、会話永続化、UIデザイン変更はこのブランチで実装しない。
+- Extension Hostを会話の正本とし、`ThreadView`は検証済みの表示モデルだけを描画する。コンポーネントからWebview API、Provider、Agent Runtime、Storageを直接呼び出さない。
+- 表示モデルは安定したメッセージ`id`、`user`/`assistant`の`role`、本文、`streaming`/`complete`/`failed`の状態を持つ。受信時刻だけで配列を並び替えず、Hostの順序を維持する。
+- ストリーミング中の差分は同一`messageId`へReducerで累積する。`done`後の差分、未知のID、欠番・古いsequenceは推測で補完せず、正本スナップショットの再取得へつなげる。
+- Markdownは文字列を`innerHTML`へ渡さず、安全なASTまたは同等の中間表現から描画する。raw HTML、`javascript:`/`data:`/`command:` URI、外部スクリプト、未検証のCSSクラスを許可しない。
+- コードブロックは空白と改行を保持した`pre/code`相当で表示する。言語指定は検査済みの表示用値に限定し、外部シンタックスハイライトは導入しない。
+- 新着差分への自動スクロールはユーザーが末尾付近を見ている場合だけ行う。上へスクロール中の閲覧位置を奪わず、新着状態を示す。
+- UI色はVS Code標準テーマトークン、アイコンはCodiconを使用する。独自画像・ブランドアセット・製品固有の外観は使用しない。
+- 本タスクではComposer、Tool Activity、ChangeSet、Provider、AgentLoop、会話永続化、通信プロトコル全体の再設計は実装しない。必要なストリーミング型契約は設計書に沿った最小変更に限定する。
 
-## メッセージ設計
+## 実装対象
 
-詳細な型定義とライフサイクルは`documents/design.md` §14.3に記載する。実装時の主要メッセージは次のとおり。
-
-```text
-Webview                         Extension Host
-   │                                  │
-   ├─ ui-ready ──────────────────────▶│ 検証・セッション確立
-   │◀──────────────────── host-ready ─┤
-   │◀────────────── thread-snapshot ──┤ 正本から初期状態を同期
-   ├─ send-message ──────────────────▶│ 状態・権限を再評価して実行
-   │◀─────────────── thread-event ────┤
-   │◀────────────────── run-state ─────┤
-   ├─ approve/reject-tool ───────────▶│ 承認状態を再確認
-   │◀──────── approval-requested ──────┤
-```
+- `src/ui/webview/components/ThreadView.tsx`
+- `src/ui/webview/thread-view-model.ts`
+- `src/ui/webview/markdown/MarkdownRenderer.tsx`
+- `src/ui/styles.css`（既存Webviewスタイルへ統合）
+- Reducer、Markdown安全性、コンポーネント表示のテスト
 
 ## 進捗
 
-- [x] `project.mdc`、`branch.mdc`、既存のブランチルール、既存の`documents/design.md` §14.3を確認する
-- [x] 双方向メッセージ、共通エンベロープ、バージョン、相関・順序制御の設計を`documents/design.md`へ記録する
-- [x] このブランチの対象範囲、対象外、実装方針、完了条件、検証方針を定義する
-- [x] メッセージ型とZodスキーマを実装する
-- [x] Extension HostとWebview双方の受信境界に検証を接続する
-- [x] `ui-ready`、スナップショット同期、イベントの重複排除・欠番検出を実装する
-- [x] 異常系・セキュリティ境界・型検査のテストを追加する
-- [x] 型チェック、Lint、フォーマット、単体テスト、Extension Integration Testを実行する
+- [x] `AGENTS.md`、`project.mdc`、`branch.mdc`、旧ブランチルール、既存のUI・通信設計を確認する
+- [x] `documents/design.md` §14.2.1へThreadViewの実装方針と詳細設計を記録する
+- [x] このブランチの対象範囲、対象外、完了条件、検証方針を定義する
+- [x] 表示モデルとストリーミングReducerを実装する
+- [x] Markdownとコードブロックの安全な描画を実装する
+- [x] 複数メッセージ、ストリーミング、空状態、失敗状態をThreadViewへ接続する
+- [x] VS Codeテーマ対応とスクロール・アクセシビリティを実装する
+- [x] 単体テストとコンポーネントテストを追加する
+- [x] 型チェック、Lint、フォーマット、テスト、Webviewセキュリティ検査を実行する
 
 ## 完了条件
 
-1. UI→Extension、Extension→UIの全メッセージが共通エンベロープと判別共用体で型定義されている。
-2. `protocolVersion: "1.0"`、`messageId`、必要な`correlationId`、イベントの`sequence`が送受信される。
-3. 両方向の受信境界でZod検証を通過したメッセージだけが内部処理へ到達する。
-4. 未知のtype、異なるメジャーバージョン、必須フィールド欠損、誤った型、過大ペイロードを拒否できる。
-5. Webview再生成後に`ui-ready`からスナップショットを取得し、Extension Hostの正本と再同期できる。
-6. 重複イベント、欠番イベント、破棄済みWebview、無効な操作IDを安全に処理できる。
-7. メッセージを通じて秘密情報や不要なワークスペース情報がWebviewへ渡らない。
-8. 実装後の自動テストとExtension Development Hostで、初期化・送信・キャンセル・承認・再同期を確認できる。
+1. ユーザー発言とエージェント発言を含む複数メッセージの会話をHostの順序どおり表示できる。
+2. Markdownの見出し・段落・リスト・インラインコード・コードフェンスを表示できる。
+3. 複数のストリーミング差分を同一エージェントメッセージへ順序どおり反映し、完了状態を表示できる。
+4. スナップショット適用、未知のメッセージID、欠番、完了後の差分を安全に処理できる。
+5. raw HTMLと危険なURIを実行せず、Markdown解析失敗時は安全なプレーンテキストへフォールバックできる。
+6. Light、Dark、High Contrastで視認性を維持し、スクロール中のユーザー位置を不必要に変更しない。
+7. Reducer、Markdown変換、コンポーネントの正常系・異常系テストが成功する。
 
 ## 対象外
 
-- メッセージプロトコルの実装コード
-- Composerの送信処理、AgentLoop、Provider通信
-- 会話・イベントの永続化
-- ChangeSetや権限サービス本体
-- WebviewのCSP、nonce、`localResourceRoots`の変更
-- UIレイアウト、テーマ、Markdownレンダリング
+- ThreadView以外のComposer、モデル選択、権限選択、Tool Activity、ChangeSet UI
+- Provider Adapter、Agent Runtime、AgentLoop、Storage、会話タイトル生成
+- Webview CSP、nonce、`localResourceRoots`、通信トランスポートの新規実装
+- APIキー、Authorizationヘッダー、環境変数、非公開推論内容、不要なファイル内容の表示
 - `git add`、`git commit`、既存の未コミット変更の整理・上書き
 
 ## 検証方針
 
-- スキーマ単体テストで、全メッセージの正常系、未知のtype、バージョン不一致、欠損、誤型、文字列長超過、配列上限超過、ペイロードサイズ超過を検証する。
-- Dispatcher/Reducerのテストで、検証前の値が内部処理へ届かないこと、無効な操作ID・古い`sequence`・重複`messageId`が無害に処理されることを検証する。
-- ライフサイクルテストで、`ui-ready`から`host-ready`とスナップショットを受け、Webview再生成後に正本へ再同期できることを検証する。
-- 相関テストで、要求の`messageId`と応答・エラーの`correlationId`が一致し、複数要求を取り違えないことを検証する。
-- Extension Integration TestでVS Code Webview APIの送受信アダプターを接続し、秘密情報・不要なファイル内容がpayloadに入らないことを確認する。
-- 実装後に`pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、Extension Integration Testを実行する。実APIテストは明示的な環境変数がある場合だけ許可する。
+- Reducerの単体テストで、メッセージ追加、user/assistantの区別、差分累積、`done`、失敗、重複、未知ID、完了後差分、sequence欠番を検証する。
+- Markdown変換の単体テストで、通常のMarkdown、コードフェンス、言語指定なし、raw HTML、`javascript:`/`data:`/`command:` URI、壊れた入力、本文上限を検証する。
+- コンポーネントテストで、3件以上の会話、ストリーミング中の再描画、空状態、失敗状態、長いコード行、テーマトークン、アクセシブルなラベルを検証する。
+- スクロールのテストで、末尾付近の自動追従と、上方閲覧中の位置保持・新着表示を検証する。
+- Extension Integration Testでは、`thread-snapshot`と`thread-event`から表示モデルへ変換され、再同期後に表示が正本と一致することを確認する。未検証の受信値をDOMへ渡さない。
+- 実装後に`pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、`pnpm check:webview-security`を実行する。実APIテストは明示的な環境変数がある場合だけ許可する。
 
 ## 参考資料
 
 - `AGENTS.md`
 - `.cursor/rules/project.mdc`
 - `.cursor/rules/branch.mdc`
-- `.cursor/rules/branch/5-ui-agent-sidebarのwebview-view-providerを実装する.mdc`
-- `documents/design.md`の「14.3 Webview通信」「17. 主要インターフェース」「19. テスト設計」
-- `documents/issues.md`のUI基盤・Webview関連Issue
-- `src/ui/agent-webview-provider.ts`
-- `src/ui/`配下のWebviewエントリーポイント
+- `documents/design.md` §3、§14.2、§14.2.1、§14.3、§16、§19
+- `documents/issues.md`のMilestone 1「スレッド表示コンポーネント」
+- `src/ui/main.tsx`
+- `src/ui/styles.css`
+- `src/ui/webview-protocol.ts`
+- `src/ui/webview-protocol-client.ts`
 
 ## 調査結果・設計まとめ
 
-- 既存のUI設計はメッセージを判別共用体で定義し、受信検証を必須としているため、今回の設計で共通エンベロープ・双方向の型・検証境界を具体化する。
-- VS Code Webview APIは`unknown`を型安全な内部値として保証しないため、Host/Webview双方の受信入口を信頼境界として扱う。
-- UIは再生成され得る一時的な投影であり、会話・Agent実行・権限・ChangeSetの正本をHostに置く既存アーキテクチャと、`ui-ready`／スナップショット同期が整合する。
-- 既存のCSPと`localResourceRoots`は通信payloadの安全性を代替しない。CSPは資産実行境界、Zod検証はメッセージデータ境界として責務を分離する。
-- `src/ui/webview-protocol.ts`を共有の正本とし、共通エンベロープ、UI→Host／Host→UIの判別共用体、Zodスキーマ、生成・受信検証関数を集約した。
-- `src/ui/extension-webview-protocol.ts`でHost側の受信検証、`ui-ready`応答、初期スナップショット、重複排除、無効メッセージへのprotocol-errorを実装した。
-- `src/ui/webview-protocol-client.ts`でWebview側の受信検証、重複排除、sequence欠番検出、スナップショット再取得要求を実装し、`main.tsx`の初期化時に`ui-ready`を送るよう接続した。
-- Webview再読込時に`crypto.randomUUID`が利用できない実行環境でもUI初期化を止めないよう、`createMessageId`は`randomUUID`、`getRandomValues`、非機密のUUID形式フォールバックの順で生成する。
-- Extension HostのTypeScript出力は実行時にZodを解決できない配布環境があるため、`scripts/build-extension.mjs`でExtension Hostのエントリーポイントをesbuildバンドルし、`vscode`以外のランタイム依存を成果物へ内包する。
-- Zodがバンドルへ含める固定のJSON SchemaメタデータとURL検証テンプレートは通信先ではないため、`scripts/check-webview-security.mjs`で限定的に許可した。CSPの`connect-src 'none'`は維持している。
-- `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`（32件）、`pnpm check:webview-security`は成功した。Extension Development Hostの実操作確認は、この環境にVS Code実行バイナリがないため未実施である。
+- 既存UIはPreactで構成され、現在の`main.tsx`はComposerと初期画面のみを表示しているため、ThreadViewは既存Appへ段階的に接続する独立コンポーネントとして設計する。
+- 既存の通信境界はZod検証、`thread-snapshot`、`thread-event`、sequence管理を持つ。ThreadViewはその検証済み結果を受け取り、通信処理を重複実装しない。
+- 既存の`ThreadEvent`はユーザー本文とエージェント本文の最小表現を持つが、ストリーミング差分を安全に同一メッセージへ適用するには、安定したメッセージIDと差分・終端情報が必要である。この契約拡張は通信境界の最小変更として扱い、表示コンポーネントに未検証イベントを渡さない。
+- プロジェクトルールの`SYW-UI-001`、`SYW-UI-002`、`SYW-UI-003`、`SYW-SEC-001`、`SYW-SEC-004`を、テーマ・ブランド・受信検証・Markdown安全性・ログ境界の判断基準とする。
+- ストリーミング中は本文を毎回Markdownとして再解析する単純な方式をMVPとし、メッセージ単位の安定キーと末尾追従ルールでちらつきと閲覧位置の破壊を抑える。仮想スクロールや高度な差分描画は後続課題とする。
+- `src/ui/webview/thread-view-model.ts`へスナップショット正規化、メッセージ順序維持、ストリーミング差分累積、欠番・未知ID・完了後差分の再同期フラグを実装した。
+- `src/ui/webview/markdown/MarkdownRenderer.tsx`はPreactノードのみを生成し、raw HTMLを実行せず、`https`/`http`/`mailto`以外のリンクをリンク化しない。コードフェンスは検査済み言語クラスとプレーンテキストで表示する。
+- `src/ui/webview/components/ThreadView.tsx`を既存の`main.tsx`へ接続し、複数メッセージ、空状態、復元中、失敗、ストリーミング中の表示と、末尾付近だけの自動スクロールを実装した。
+- 既存通信スキーマへ`assistant-text-delta`、任意の`messageId`、`streaming`を後方互換で追加し、`thread-event`のsequenceは既存のWebviewProtocolClientで検証した。
+- `preact-render-to-string`によるSSRテストを追加し、複数メッセージ、Markdown、コードブロック、ストリーミング中、失敗状態、アクセシブルなラベルを検証した。
+- `pnpm check`（typecheck、lint、format、テスト44件、Webviewセキュリティ検査）が成功した。

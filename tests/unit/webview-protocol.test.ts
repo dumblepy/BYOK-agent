@@ -83,4 +83,19 @@ describe("Webview protocol schemas", () => {
       }),
     ).toBeUndefined();
   });
+
+  it("parses a validated assistant streaming delta", () => {
+    const message = createExtensionToUiMessage("thread-event", {
+      threadId: "thread-1",
+      sequence: 2,
+      event: {
+        kind: "assistant-text-delta",
+        messageId: "assistant-1",
+        delta: "続き",
+        done: true,
+      },
+    });
+
+    expect(parseExtensionToUiMessage(message)).toEqual(message);
+  });
 });
