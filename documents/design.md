@@ -1300,6 +1300,68 @@ type UiToExtensionMessage =
 
 受信内容はZodまたはJSON Schemaで必ず検証する。
 
+## 14.4 Webview状態の保持と再表示
+
+WebviewのDOM保持とUI状態の保持は別の責務として扱う。メモリ使用量を抑えるため、`WebviewViewProvider`の登録では`retainContextWhenHidden: false`を基本とし、Webviewが非表示になってDOMが破棄されても、必要な一時状態をVS Code Webview APIで復元できるようにする。
+
+### 14.4.1 状態の責務境界
+
+Webview状態は、Webviewが再表示または再生成されたときに画面を元の操作位置へ戻すための一時的なUI状態だけを保持する。会話、スレッド、Agent実行、モデル設定、権限設定などの正本はExtension Host側に置く。
+
+初期バージョンで保存する状態はComposerの未送信テキストだけとする。
+
+```ts
+interface AgentWebviewStateV1 {
+  version: 1;
+  composerDraft: string;
+}
+```
+
+次の情報はWebview状態へ保存してはならない。
+
+* APIキー、Authorizationヘッダー、認証トークン
+* 生の環境変数、`.env`内容
+* ファイル内容、選択範囲、Tool Result
+* プロンプト、非公開推論内容
+* 会話やスレッドの正本
+
+会話やスレッドをVS Code再起動後も復元する要件は、`globalStorage/threads/<id>/`配下のStorage設計で扱い、Webview状態復元と混同しない。
+
+### 14.4.2 復元ライフサイクル
+
+Webviewアプリの初期化時に`acquireVsCodeApi()`を一度だけ呼び出し、取得したAPIから`getState()`を呼び出す。戻り値は外部から渡された不確かな値として検証し、`version: 1`かつ`composerDraft`が文字列の状態だけを採用する。それ以外は空の初期状態へフォールバックする。
+
+```text
+WebviewViewProvider.resolveWebviewView
+  └─ HTML/CSP/アセットを設定
+       └─ Webview Appを起動
+            ├─ acquireVsCodeApi()（一度だけ）
+            ├─ getState() → 検証 → Composer初期値
+            └─ Composer変更 → setState(検証済みの状態)
+
+Webview非表示・再生成
+  └─ retained stateをgetState()から取得して画面を再構築
+```
+
+状態の保存は`beforeunload`や表示イベントに依存せず、Composerの値が変化した時点で行う。`getState()`はレンダーごとに呼び出さず、初期化時の一回だけ呼び出す。状態形式を変更する場合は`version`を更新し、移行できない値は破棄して初期状態から開始する。未知のフィールドは無視する。
+
+この仕組みの保証範囲は、同一拡張機能セッション中のWebview非表示・Webview再生成からの復元である。VS Code再起動後や拡張機能再起動後の永続復元はStorageServiceの責務とする。
+
+### 14.4.3 セキュリティと容量
+
+Webview状態はJSONにシリアライズできる最小のデータだけに限定し、秘密情報やワークスペース内容を渡さない。状態の読み込み時は型とバージョンを検証し、不正値をUIへ直接展開しない。状態復元の追加によって、CSP、スクリプトnonce、`localResourceRoots`限定、外部スクリプト禁止の要件を緩和してはならない。
+
+### 14.4.4 検証項目
+
+次をテストおよびExtension Development Hostで確認する。
+
+1. 状態なしの初回表示では空のComposerが表示される。
+2. 入力中のComposerを非表示にして再表示すると、入力内容が復元される。
+3. Webviewが再生成されても、保存済みの有効な状態から初期化される。
+4. `null`、欠損フィールド、誤った型、未知のバージョンでは空の初期状態へフォールバックする。
+5. `setState()`へ秘密情報、ファイル内容、会話の正本が渡されない。
+6. `retainContextWhenHidden: false`と既存のWebviewセキュリティ設定が維持される。
+
 ---
 
 ## 15. 会話・イベント保存
@@ -1594,6 +1656,7 @@ const scenario = [
 ### 19.4 Extension Integration Test
 
 * Webview起動
+* Webview非表示・再表示時のComposer状態復元
 * メッセージ送受信
 * モデル選択
 * SecretStorage
@@ -1626,6 +1689,7 @@ const scenario = [
 
 * Extension activation
 * Sidebar Webview
+* Webview再表示時の一時UI状態復元
 * Model JSON
 * SecretStorage
 * OpenAI互換Provider

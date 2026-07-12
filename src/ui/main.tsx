@@ -1,8 +1,22 @@
 import { render } from "preact";
+import { useState } from "preact/hooks";
 
 import "./styles.css";
+import { createAgentWebviewStateStore, type WebviewStateApi } from "./webview-state";
+
+declare function acquireVsCodeApi(): WebviewStateApi;
+
+const stateStore = createAgentWebviewStateStore(acquireVsCodeApi());
 
 function App() {
+  const [composerDraft, setComposerDraft] = useState(stateStore.state.composerDraft);
+
+  const handleComposerInput = (event: Event): void => {
+    const composerDraft = (event.currentTarget as HTMLTextAreaElement).value;
+    const nextState = stateStore.setComposerDraft(composerDraft);
+    setComposerDraft(nextState.composerDraft);
+  };
+
   return (
     <main class="agent-shell">
       <header class="agent-header">
@@ -25,7 +39,13 @@ function App() {
 
       <label class="composer-label" htmlFor="prompt">
         依頼
-        <textarea id="prompt" rows={4} placeholder="何を作りたいですか？" />
+        <textarea
+          id="prompt"
+          rows={4}
+          placeholder="何を作りたいですか？"
+          value={composerDraft}
+          onInput={handleComposerInput}
+        />
       </label>
       <button type="button" disabled>
         送信
