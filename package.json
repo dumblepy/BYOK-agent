@@ -40,9 +40,9 @@
     }
   },
   "scripts": {
-    "compile": "pnpm run compile:extension && pnpm run bundle:webview",
-    "compile:extension": "tsc -p tsconfig.extension.json",
-    "bundle:webview": "node scripts/build-webview.mjs",
+    "_compile": "pnpm run _compile:extension && pnpm run _bundle:webview",
+    "_compile:extension": "tsc -p tsconfig.extension.json",
+    "_bundle:webview": "node scripts/build-webview.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
     "watch": "tsc -p tsconfig.json --watch",
     "lint": "eslint .",
@@ -51,8 +51,8 @@
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
     "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test",
-    "vscode:prepublish": "pnpm compile",
-    "package": "pnpm run compile && vsce package --no-dependencies"
+    "vscode:prepublish": "pnpm _compile",
+    "build": "pnpm run _compile && vsce package --no-dependencies"
   },
   "dependencies": {
     "preact": "10.29.7"

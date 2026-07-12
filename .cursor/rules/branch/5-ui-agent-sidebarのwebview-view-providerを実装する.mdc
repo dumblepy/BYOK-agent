@@ -1,0 +1,116 @@
+---
+description: 5-ui-agent-sidebarのwebview-view-providerを実装するブランチでWebview再表示時の状態復元を実装するときに読み込む
+alwaysApply: false
+---
+# Webview再表示時の状態復元
+
+このブランチでは、Agent SidebarのWebviewを非表示にした後、またはWebviewが再生成された後に、ユーザーが入力中だったUI状態を復元できる設計を定める。今回の対象はWebviewの表示状態だけとし、Extension Hostとの通信、会話保存、Agent実行、Provider、Composerの送信処理には進まない。
+
+## 実装方針
+
+- `retainContextWhenHidden`は`false`のまま維持する。DOMを保持してメモリを消費するのではなく、VS Code Webview APIの`getState`/`setState`で必要な状態だけを復元する。
+- Webview側で`acquireVsCodeApi()`を一度だけ呼び出し、取得したAPIをモジュール内に閉じ込める。APIオブジェクトをDOM、Extension Host、グローバルなメッセージへ公開しない。
+- `getState()`の戻り値は外部入力と同じく`unknown`として扱い、バージョンと各フィールドを検証してからUIの初期状態へ変換する。不正値、未知バージョン、欠損状態は安全な初期状態へフォールバックする。
+- 状態はJSONにシリアライズできるUI状態だけに限定する。初期対象はComposerの未送信テキストとし、将来追加する場合もスクロール位置や折りたたみ状態などの一時的な表示状態に限る。
+- APIキー、Authorizationヘッダー、ファイル内容、Tool Result、プロンプト、非公開推論、会話の正本はWebview状態へ保存しない。会話やスレッドの永続化はExtension Host側のStorageServiceで別途扱う。
+- ユーザー操作で状態が変わった時点で`setState()`を呼び出す。`beforeunload`や表示イベントだけに依存しない。復元処理はWebviewの初期化時に一度だけ行い、レンダーごとに`getState()`を呼び出さない。
+- 状態形式にはスキーマバージョンを持たせ、将来の変更では移行処理または初期状態へのフォールバックを明示する。今回の初期バージョンは`1`とする。
+- WebviewのHTML、CSP、nonce、`localResourceRoots`、外部リソース禁止の既存方針を変更しない。状態復元のために新しい権限、ファイルアクセス、ネットワークアクセスを追加しない。
+
+## 状態モデル
+
+Webview状態とアプリケーションの正本を分離する。
+
+```text
+WebviewState
+  ├─ version: 1
+  └─ composerDraft: string
+
+Extension Host / StorageService
+  └─ 会話、スレッド、Agent実行、設定、秘密情報の正本
+```
+
+Webview状態の概念モデルは次のとおりとする。
+
+```ts
+interface AgentWebviewStateV1 {
+  version: 1;
+  composerDraft: string;
+}
+```
+
+保存前に文字列以外の値を除外し、読み込み時にも同じ契約を検証する。未知のフィールドは無視し、未知のバージョンは破棄して初期状態から開始する。保存対象を増やす場合は、このブランチルールと`documents/design.md`を先に更新する。
+
+## ライフサイクル
+
+```text
+resolveWebviewView
+  └─ HTML/CSP/アセットを設定
+       └─ Webview Appを起動
+            ├─ acquireVsCodeApi()（一度だけ）
+            ├─ getState() → 検証 → 初期UIへ反映
+            └─ UI変更 → setState(検証済みの状態)
+
+非表示・Webview再生成
+  └─ VS Codeが保持した状態をgetState()から再取得
+```
+
+`retainContextWhenHidden: false`によってWebviewのDOMが破棄されても、保存済みのComposer入力が初期表示へ戻ることを完了条件とする。VS Code再起動後や拡張機能再起動後の会話復元は、この状態復元の完了条件に含めず、StorageServiceを使う後続課題で扱う。
+
+## テスト方針
+
+- 状態なしの場合に初期状態が使われることを確認する。
+- 有効な`AgentWebviewStateV1`が`getState()`から返された場合、Composerへ復元されることを確認する。
+- Composer入力の変更後に、最新の状態が`setState()`へ渡されることを確認する。
+- `null`、プリミティブ、欠損フィールド、誤ったバージョン、巨大または不正な値が初期状態へフォールバックすることを確認する。
+- APIキー、ファイル内容、Authorization情報などが保存状態に含まれないことを確認する。
+- UI登録時に`retainContextWhenHidden: false`が維持されることを確認する。
+- 型チェック、Lint、フォーマット検査、既存テスト、コンパイルを実行する。VS Code Extension Development Hostで、入力→サイドバー非表示→再表示の手動確認も完了条件に含める。
+
+## 完了条件
+
+1. `AgentWebviewStateV1`の形式、検証、初期値、将来のバージョン方針が設計書に記載されている。
+2. Webviewの再表示または再生成後に、未送信のComposer入力が復元される。
+3. 不正または未知の状態を読み込んでも例外や任意コード実行が発生せず、初期状態へフォールバックする。
+4. 秘密情報、ファイル内容、会話の正本がWebview状態へ保存されない。
+5. `retainContextWhenHidden: false`、CSP、nonce、`localResourceRoots`の既存セキュリティ方針が維持される。
+6. 状態復元の単体・統合テストと静的検査が成功する。
+
+## 対象外
+
+- Extension HostとWebview間のメッセージプロトコル
+- Composerの送信、停止、ストリーミング
+- Thread/Event/Artifactの永続化とVS Code再起動後の会話復元
+- Provider、AgentLoop、Tool、権限、ChangeSet
+- WebviewのHTML、CSS、CSPの全面的な再設計
+- `git add`、`git commit`、既存変更の整理・上書き
+
+## 参考資料
+
+- `AGENTS.md`
+- `.cursor/rules/project.mdc`
+- `.cursor/rules/branch.mdc`
+- `documents/issues.md`の「Milestone 1: UI基盤 / Agent SidebarのWebview View Providerを実装する」
+- `documents/design.md`の「14. UI設計」「15. 会話・イベント保存」「16. セキュリティ設計」
+- `src/ui/agent-webview-provider.ts`
+- `src/ui/ui-service.ts`
+
+## 進捗
+
+- [x] 現行の`WebviewViewProvider`、CSP、`localResourceRoots`、`retainContextWhenHidden`の実装状況を調査する
+- [x] Webview一時状態とExtension Host側の永続状態の責務境界を定義する
+- [x] 状態形式、検証、ライフサイクル、セキュリティ、テスト方針を設計書へ追記する
+- [x] このブランチの対象範囲と完了条件を定義する
+- [x] `getState`/`setState`による状態復元を実装する
+- [x] 状態検証と復元のテストを追加する
+- [ ] Extension Development Hostで再表示時の復元を確認する
+
+## 調査結果・設計まとめ
+
+- `src/ui/agent-webview-provider.ts`は`WebviewViewProvider`を実装し、CSP nonce付きで`main.js`と`main.css`を読み込んでいる。
+- `src/ui/ui-service.ts`は`retainContextWhenHidden: false`を維持している。Webview側で`getState`/`setState`を使うことで、DOMを保持せずComposer入力を復元する。
+- Webviewの一時状態をExtension Hostの秘密情報・ファイルアクセス・会話保存から分離し、最小のJSON状態として扱う方針とする。
+- `src/ui/webview-state.ts`に状態バージョン、初期状態、入力検証、状態ストアを実装し、未知の状態・不正な型・上限超過の入力は初期状態へフォールバックする。
+- `src/ui/main.tsx`はWebview APIを一度だけ取得し、初期化時にComposer入力を復元し、入力変更ごとに許可リスト済み状態を`setState`へ保存する。
+- `tests/unit/webview-state.test.ts`で有効状態の復元、無効状態のフォールバック、変更保存、秘密情報を含めないことを検証している。
+- `pnpm typecheck`、`pnpm lint`、`pnpm test`は成功している。Extension Development Hostでの入力→非表示→再表示の手動確認は未実施である。
