@@ -1,4 +1,3 @@
-import { useEffect, useRef } from "preact/hooks";
 import type { JSX } from "preact";
 
 import { MarkdownRenderer } from "../markdown/MarkdownRenderer";

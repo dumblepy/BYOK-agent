@@ -208,6 +208,14 @@ describe("AgentWebviewProvider", () => {
       threadId: "default",
       text: "選択モデルで実行してください",
       modelId: "coding-primary",
+      permissionContext: {
+        threadId: "default",
+        requestedProfile: "confirm-writes",
+        effectiveProfile: "confirm-writes",
+        workspaceTrust: "trusted",
+        restrictions: [],
+        threadRevision: 2,
+      },
     });
 
     const staleSelection = createUiToExtensionMessage("select-model", {
@@ -258,6 +266,81 @@ describe("AgentWebviewProvider", () => {
         type: "error",
         correlationId: selection.messageId,
         payload: expect.objectContaining({ code: "MODEL_SELECTION_BUSY" }),
+      }),
+    );
+  });
+
+  it("confirms, persists, and applies a permission profile from the Host", async () => {
+    const store = new FileThreadModelStore();
+    const prepareAgentRunRequest = vi.fn((request) => request);
+    const provider = new AgentWebviewProvider({ extensionUri: { path: "/extension" } } as never, {
+      modelCatalog: new StaticModelCatalog(),
+      threadModelStore: store,
+      isWorkspaceTrusted: () => false,
+      prepareAgentRunRequest,
+    });
+    const view = createWebviewView();
+    provider.resolveWebviewView(view as never);
+    const ready = createUiToExtensionMessage("ui-ready", {
+      clientInstanceId: "00000000-0000-4000-8000-000000000003",
+      supportedProtocolVersions: ["1.0"],
+    });
+    view.emit(ready);
+    await flush();
+
+    const initialPermission = view.sent.findLast(
+      (message) => (message as { type?: string }).type === "permission-updated",
+    ) as {
+      payload: {
+        summary: { threadRevision: number; requestedProfile: string; restrictions: string[] };
+      };
+    };
+    expect(initialPermission.payload.summary).toMatchObject({
+      threadRevision: 1,
+      requestedProfile: "confirm-writes",
+      workspaceTrust: "restricted",
+    });
+
+    const selection = createUiToExtensionMessage("set-permission", {
+      threadId: "default",
+      profile: "workspace-write",
+      expectedThreadRevision: initialPermission.payload.summary.threadRevision,
+    });
+    view.emit(selection);
+    await flush();
+
+    const updatedPermission = view.sent.findLast(
+      (message) => (message as { type?: string }).type === "permission-updated",
+    ) as { payload: { summary: { threadRevision: number; requestedProfile: string } } };
+    expect(updatedPermission.payload.summary).toMatchObject({
+      threadRevision: 2,
+      requestedProfile: "workspace-write",
+    });
+    expect(await store.getThreadPermissionState("default")).toMatchObject({
+      permissionProfile: "workspace-write",
+      revision: 2,
+    });
+
+    const message = createUiToExtensionMessage("send-message", {
+      threadId: "default",
+      text: "権限を反映してください",
+    });
+    view.emit(message);
+    await flush();
+    expect(prepareAgentRunRequest).toHaveBeenCalledWith(
+      expect.objectContaining({
+        permissionContext: expect.objectContaining({
+          requestedProfile: "workspace-write",
+          effectiveProfile: "workspace-write",
+          workspaceTrust: "restricted",
+          restrictions: [
+            "commands-disabled",
+            "automatic-writes-disabled",
+            "workspace-provider-disabled",
+            "workspace-mcp-disabled",
+          ],
+          threadRevision: 2,
+        }),
       }),
     );
   });

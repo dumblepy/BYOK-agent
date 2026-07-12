@@ -2,9 +2,20 @@ import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
+import {
+  isUserSelectablePermissionProfile,
+  type UserSelectablePermissionProfile,
+} from "../permissions/permission-profile";
+
 export interface ThreadModelState {
   readonly threadId: string;
   readonly modelId?: string;
+  readonly revision: number;
+}
+
+export interface ThreadPermissionState {
+  readonly threadId: string;
+  readonly permissionProfile: UserSelectablePermissionProfile;
   readonly revision: number;
 }
 
@@ -15,6 +26,12 @@ export interface ThreadModelStore {
     expectedRevision: number,
     modelId: string,
   ): Promise<ThreadModelState>;
+  getThreadPermissionState(threadId: string): Promise<ThreadPermissionState>;
+  updateThreadPermission(
+    threadId: string,
+    expectedRevision: number,
+    permissionProfile: UserSelectablePermissionProfile,
+  ): Promise<ThreadPermissionState>;
 }
 
 export class ThreadModelRevisionConflictError extends Error {
@@ -26,6 +43,24 @@ export class ThreadModelRevisionConflictError extends Error {
     super("The thread model revision is stale");
     this.name = "ThreadModelRevisionConflictError";
   }
+}
+
+export class ThreadPermissionRevisionConflictError extends Error {
+  public constructor(
+    public readonly threadId: string,
+    public readonly expectedRevision: number,
+    public readonly actualRevision: number,
+  ) {
+    super("The thread permission revision is stale");
+    this.name = "ThreadPermissionRevisionConflictError";
+  }
+}
+
+interface ThreadMetadataState {
+  readonly threadId: string;
+  readonly modelId?: string;
+  readonly permissionProfile: UserSelectablePermissionProfile;
+  readonly revision: number;
 }
 
 interface PersistedThreadMetadata {
@@ -43,14 +78,88 @@ export interface ThreadModelStoreFileSystem {
   readonly rootPath?: string;
 }
 
-/** JSON meta.json backed storage for the thread's selected model. */
+/** JSON meta.json backed storage for thread model and permission selections. */
 export class FileThreadModelStore implements ThreadModelStore {
-  private readonly memory = new Map<string, ThreadModelState>();
+  private readonly memory = new Map<string, ThreadMetadataState>();
   private readonly locks = new Map<string, Promise<void>>();
 
   public constructor(private readonly fileSystem: ThreadModelStoreFileSystem = {}) {}
 
   public async getThreadModelState(threadId: string): Promise<ThreadModelState> {
+    const state = await this.getThreadMetadataState(threadId);
+    return {
+      threadId: state.threadId,
+      ...(state.modelId ? { modelId: state.modelId } : {}),
+      revision: state.revision,
+    };
+  }
+
+  public updateThreadModel(
+    threadId: string,
+    expectedRevision: number,
+    modelId: string,
+  ): Promise<ThreadModelState> {
+    return this.withThreadLock(threadId, async () => {
+      const current = await this.getThreadMetadataState(threadId);
+      if (current.revision !== expectedRevision) {
+        throw new ThreadModelRevisionConflictError(threadId, expectedRevision, current.revision);
+      }
+
+      const next: ThreadMetadataState = {
+        ...current,
+        modelId,
+        revision: current.revision + 1,
+      };
+      await this.persist(next);
+      this.memory.set(threadId, next);
+      return {
+        threadId,
+        modelId,
+        revision: next.revision,
+      };
+    });
+  }
+
+  public async getThreadPermissionState(threadId: string): Promise<ThreadPermissionState> {
+    const state = await this.getThreadMetadataState(threadId);
+    return {
+      threadId: state.threadId,
+      permissionProfile: state.permissionProfile,
+      revision: state.revision,
+    };
+  }
+
+  public updateThreadPermission(
+    threadId: string,
+    expectedRevision: number,
+    permissionProfile: UserSelectablePermissionProfile,
+  ): Promise<ThreadPermissionState> {
+    return this.withThreadLock(threadId, async () => {
+      const current = await this.getThreadMetadataState(threadId);
+      if (current.revision !== expectedRevision) {
+        throw new ThreadPermissionRevisionConflictError(
+          threadId,
+          expectedRevision,
+          current.revision,
+        );
+      }
+
+      const next: ThreadMetadataState = {
+        ...current,
+        permissionProfile,
+        revision: current.revision + 1,
+      };
+      await this.persist(next);
+      this.memory.set(threadId, next);
+      return {
+        threadId,
+        permissionProfile,
+        revision: next.revision,
+      };
+    });
+  }
+
+  private async getThreadMetadataState(threadId: string): Promise<ThreadMetadataState> {
     const cached = this.memory.get(threadId);
     if (cached) {
       return cached;
@@ -74,49 +183,24 @@ export class FileThreadModelStore implements ThreadModelStore {
     }
   }
 
-  public updateThreadModel(
-    threadId: string,
-    expectedRevision: number,
-    modelId: string,
-  ): Promise<ThreadModelState> {
-    return this.withThreadLock(threadId, async () => {
-      const current = await this.getThreadModelState(threadId);
-      if (current.revision !== expectedRevision) {
-        throw new ThreadModelRevisionConflictError(threadId, expectedRevision, current.revision);
-      }
-
-      const next: ThreadModelState = {
-        threadId,
-        modelId,
-        revision: current.revision + 1,
-      };
-      await this.persist(threadId, next);
-      this.memory.set(threadId, next);
-      return next;
-    });
-  }
-
-  private async persist(threadId: string, state: ThreadModelState): Promise<void> {
-    const metaPath = this.getMetaPath(threadId);
+  private async persist(state: ThreadMetadataState): Promise<void> {
+    const metaPath = this.getMetaPath(state.threadId);
     if (!metaPath || !this.fileSystem.rootPath) {
       return;
     }
 
-    const directory = join(this.fileSystem.rootPath, "threads", threadId);
+    const directory = join(this.fileSystem.rootPath, "threads", state.threadId);
     await mkdir(directory, { recursive: true });
     const temporaryPath = `${metaPath}.${randomUUID()}.tmp`;
     const existing = await readPersistedMetadata(metaPath);
     const now = Date.now();
     const metadata = {
-      id: threadId,
+      id: state.threadId,
       title: typeof existing?.title === "string" ? existing.title : "新しいスレッド",
       ...(typeof existing?.workspaceId === "string" ? { workspaceId: existing.workspaceId } : {}),
-      modelId: state.modelId,
+      ...(state.modelId ? { modelId: state.modelId } : {}),
       revision: state.revision,
-      permissionProfile:
-        typeof existing?.permissionProfile === "string"
-          ? existing.permissionProfile
-          : "confirm-writes",
+      permissionProfile: state.permissionProfile,
       createdAt: isNonNegativeInteger(existing?.createdAt) ? existing.createdAt : now,
       updatedAt: now,
       archived: typeof existing?.archived === "boolean" ? existing.archived : false,
@@ -133,8 +217,12 @@ export class FileThreadModelStore implements ThreadModelStore {
     }
   }
 
-  private getMemoryState(threadId: string): ThreadModelState {
-    const state = { threadId, revision: 0 } satisfies ThreadModelState;
+  private getMemoryState(threadId: string): ThreadMetadataState {
+    const state = {
+      threadId,
+      permissionProfile: "confirm-writes" as const,
+      revision: 0,
+    } satisfies ThreadMetadataState;
     this.memory.set(threadId, state);
     return state;
   }
@@ -166,14 +254,21 @@ export class FileThreadModelStore implements ThreadModelStore {
   }
 }
 
-function parsePersistedState(value: unknown, threadId: string): ThreadModelState {
+function parsePersistedState(value: unknown, threadId: string): ThreadMetadataState {
   if (!isRecord(value)) {
-    return { threadId, revision: 0 };
+    return {
+      threadId,
+      permissionProfile: "confirm-writes",
+      revision: 0,
+    };
   }
 
   return {
     threadId,
     ...(typeof value.modelId === "string" ? { modelId: value.modelId } : {}),
+    permissionProfile: isUserSelectablePermissionProfile(value.permissionProfile)
+      ? value.permissionProfile
+      : "confirm-writes",
     revision: isNonNegativeInteger(value.revision) ? value.revision : 0,
   };
 }

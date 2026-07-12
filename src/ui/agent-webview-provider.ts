@@ -4,12 +4,18 @@ import * as vscode from "vscode";
 
 import type { AgentRunRequest } from "../agent/agent-service";
 import { type ModelCatalog } from "../models/model-catalog";
+import { createPermissionSummary, type PermissionSummary } from "../permissions/permission-profile";
 import {
+  ThreadPermissionRevisionConflictError,
   ThreadModelRevisionConflictError,
   type ThreadModelStore,
 } from "../storage/thread-model-store";
 import { ExtensionWebviewProtocolSession } from "./extension-webview-protocol";
-import { createExtensionToUiMessage, type UiToExtensionMessage } from "./webview-protocol";
+import {
+  createExtensionToUiMessage,
+  DEFAULT_THREAD_ID,
+  type UiToExtensionMessage,
+} from "./webview-protocol";
 
 const WEBVIEW_ROOT = ["out", "webview"] as const;
 
@@ -45,6 +51,8 @@ export interface AgentWebviewProviderOptions {
   readonly modelCatalog?: ModelCatalog;
   readonly threadModelStore?: ThreadModelStore;
   readonly isThreadRunActive?: (threadId: string) => boolean;
+  readonly isWorkspaceTrusted?: () => boolean;
+  readonly onDidGrantWorkspaceTrust?: (listener: () => void) => vscode.Disposable;
   readonly prepareAgentRunRequest?: (
     request: AgentRunRequest,
   ) => Promise<AgentRunRequest> | AgentRunRequest;
@@ -54,6 +62,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   private readonly modelCatalog: ModelCatalog | undefined;
   private readonly threadModelStore: ThreadModelStore | undefined;
   private readonly isThreadRunActive: (threadId: string) => boolean;
+  private readonly isWorkspaceTrusted: () => boolean;
+  private readonly onDidGrantWorkspaceTrust:
+    ((listener: () => void) => vscode.Disposable) | undefined;
   private readonly prepareAgentRunRequest:
     ((request: AgentRunRequest) => Promise<AgentRunRequest> | AgentRunRequest) | undefined;
   private activeThreadId: string | undefined;
@@ -65,6 +76,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     this.modelCatalog = options.modelCatalog;
     this.threadModelStore = options.threadModelStore;
     this.isThreadRunActive = options.isThreadRunActive ?? (() => false);
+    this.isWorkspaceTrusted = options.isWorkspaceTrusted ?? (() => true);
+    this.onDidGrantWorkspaceTrust = options.onDidGrantWorkspaceTrust;
     this.prepareAgentRunRequest = options.prepareAgentRunRequest;
   }
 
@@ -79,11 +92,18 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     const protocolSession = new ExtensionWebviewProtocolSession(webviewView.webview, {
       getModelList: (threadId) => this.getModelList(threadId),
+      getPermissionSummary: (threadId) => this.getPermissionSummary(threadId),
       onMessage: async (message) => {
         await this.handleUiMessage(message, protocolSession);
       },
     });
-    webviewView.onDidDispose?.(() => protocolSession.dispose());
+    const trustSubscription = this.onDidGrantWorkspaceTrust?.(() => {
+      void protocolSession.sendPermissionUpdated(this.activeThreadId ?? DEFAULT_THREAD_ID);
+    });
+    webviewView.onDidDispose?.(() => {
+      trustSubscription?.dispose();
+      protocolSession.dispose();
+    });
   }
 
   private async handleUiMessage(
@@ -92,6 +112,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   ): Promise<void> {
     if (message.type === "select-model") {
       await this.handleSelectModel(message, protocolSession);
+      return;
+    }
+
+    if (message.type === "set-permission") {
+      await this.handleSetPermission(message, protocolSession);
       return;
     }
 
@@ -129,10 +154,12 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       }
 
       try {
+        const permissionSummary = await this.getPermissionSummary(message.payload.threadId);
         await this.prepareAgentRunRequest?.({
           threadId: message.payload.threadId,
           text,
           modelId: modelState.selectedModelId,
+          permissionContext: permissionSummary,
         });
       } catch {
         await this.sendModelError(
@@ -228,6 +255,68 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async handleSetPermission(
+    message: Extract<UiToExtensionMessage, { type: "set-permission" }>,
+    protocolSession: ExtensionWebviewProtocolSession,
+  ): Promise<void> {
+    if (!this.threadModelStore) {
+      await this.sendPermissionError(
+        protocolSession,
+        "PERMISSION_PROFILE_NOT_ALLOWED",
+        "権限状態を保存できません。",
+        message.messageId,
+      );
+      return;
+    }
+
+    if (this.activeThreadId !== undefined && this.activeThreadId !== message.payload.threadId) {
+      await this.sendPermissionError(
+        protocolSession,
+        "PERMISSION_SELECTION_CONFLICT",
+        "現在表示しているスレッドが変更されています。再表示して再試行してください。",
+        message.messageId,
+      );
+      return;
+    }
+
+    if (this.isThreadRunActive(message.payload.threadId)) {
+      await this.sendPermissionError(
+        protocolSession,
+        "PERMISSION_SELECTION_BUSY",
+        "実行中は権限を変更できません。処理の完了後に再試行してください。",
+        message.messageId,
+      );
+      return;
+    }
+
+    try {
+      await this.threadModelStore.updateThreadPermission(
+        message.payload.threadId,
+        message.payload.expectedThreadRevision,
+        message.payload.profile,
+      );
+      await protocolSession.sendPermissionUpdated(message.payload.threadId, message.messageId);
+    } catch (error) {
+      if (error instanceof ThreadPermissionRevisionConflictError) {
+        await this.sendPermissionError(
+          protocolSession,
+          "PERMISSION_SELECTION_CONFLICT",
+          "権限状態が更新されています。最新の状態を確認してください。",
+          message.messageId,
+        );
+        await protocolSession.sendPermissionUpdated(message.payload.threadId, message.messageId);
+        return;
+      }
+
+      await this.sendPermissionError(
+        protocolSession,
+        "TOOL_EXECUTION_FAILED",
+        "権限の変更を保存できませんでした。再試行してください。",
+        message.messageId,
+      );
+    }
+  }
+
   private async getModelList(threadId: string) {
     this.activeThreadId = threadId;
     const models = (this.modelCatalog?.listAvailable() ?? []).map(({ id, label, provider }) => ({
@@ -260,6 +349,22 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     };
   }
 
+  private async getPermissionSummary(threadId: string): Promise<PermissionSummary> {
+    const state = this.threadModelStore
+      ? await this.threadModelStore.getThreadPermissionState(threadId)
+      : {
+          threadId,
+          permissionProfile: "confirm-writes" as const,
+          revision: 0,
+        };
+    return createPermissionSummary(
+      threadId,
+      state.permissionProfile,
+      state.revision,
+      this.isWorkspaceTrusted() ? "trusted" : "restricted",
+    );
+  }
+
   private async sendModelError(
     protocolSession: ExtensionWebviewProtocolSession,
     code:
@@ -267,6 +372,22 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       | "MODEL_SELECTION_CONFLICT"
       | "MODEL_SELECTION_BUSY"
       | "MODEL_NOT_SELECTED"
+      | "TOOL_EXECUTION_FAILED",
+    message: string,
+    correlationId: string,
+  ): Promise<void> {
+    await protocolSession.sendToUi(
+      createExtensionToUiMessage("error", { code, message, retryable: true }, { correlationId }),
+    );
+  }
+
+  private async sendPermissionError(
+    protocolSession: ExtensionWebviewProtocolSession,
+    code:
+      | "PERMISSION_SELECTION_CONFLICT"
+      | "PERMISSION_SELECTION_BUSY"
+      | "PERMISSION_PROFILE_NOT_ALLOWED"
+      | "WORKSPACE_NOT_TRUSTED"
       | "TOOL_EXECUTION_FAILED",
     message: string,
     correlationId: string,

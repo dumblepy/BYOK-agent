@@ -455,6 +455,151 @@ textarea:focus {
   color: var(--vscode-foreground);
 }
 
+.permission-selector {
+  position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.permission-selector-button {
+  max-width: 190px;
+}
+
+.permission-selector-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 110;
+  width: min(310px, calc(100vw - 24px));
+  padding: 6px 0;
+  color: var(--vscode-foreground);
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.24);
+}
+
+.permission-selector-menu-title {
+  padding: 4px 12px 6px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.permission-selector-menu-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: 7px 12px;
+  color: var(--vscode-foreground);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  text-align: left;
+}
+
+.permission-selector-menu-item:hover,
+.permission-selector-menu-item:focus {
+  background: var(--vscode-list-hoverBackground, rgba(255, 255, 255, 0.08));
+  outline: none;
+}
+
+.permission-selector-menu-item-selected {
+  background: var(--vscode-list-inactiveSelectionBackground, transparent);
+}
+
+.permission-selector-menu-item strong,
+.permission-selector-menu-item small {
+  display: block;
+}
+
+.permission-selector-menu-item small {
+  margin-top: 2px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.permission-selector-check {
+  flex-shrink: 0;
+  color: var(--vscode-testing-iconPassed, #4caf50);
+}
+
+.permission-selector-details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 8px;
+  max-width: 240px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.permission-selector-status,
+.permission-selector-error {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.permission-selector-status {
+  color: var(--vscode-descriptionForeground);
+}
+
+.permission-selector-error {
+  color: var(--vscode-errorForeground);
+}
+
+.permission-confirmation {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  display: grid;
+  padding: 16px;
+  background: color-mix(in srgb, var(--vscode-editor-background) 78%, transparent);
+  place-items: center;
+}
+
+.permission-confirmation-panel {
+  width: min(360px, 100%);
+  padding: 16px;
+  color: var(--vscode-foreground);
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-focusBorder);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.3);
+}
+
+.permission-confirmation-panel p {
+  margin-top: 8px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.permission-confirmation-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+.permission-confirm-button {
+  padding: 5px 10px;
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+  border: 0;
+  border-radius: 2px;
+  cursor: pointer;
+}
+
+.permission-confirm-button:hover {
+  background: var(--vscode-button-hoverBackground);
+}
+
 .composer-send-button {
   color: var(--vscode-button-foreground);
   background: var(--vscode-button-background);
@@ -468,7 +613,10 @@ textarea:focus {
 }
 
 .composer-send-button:hover:not(:disabled) {
-  background: var(--vscode-button-hoverBackground, color-mix(in srgb, var(--vscode-button-background) 90%, white));
+  background: var(
+    --vscode-button-hoverBackground,
+    color-mix(in srgb, var(--vscode-button-background) 90%, white)
+  );
 }
 
 .composer-send-button:disabled {

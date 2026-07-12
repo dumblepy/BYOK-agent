@@ -1,5 +1,15 @@
 import { z } from "zod";
 
+import {
+  PERMISSION_RESTRICTIONS,
+  USER_SELECTABLE_PERMISSION_PROFILES,
+  type PermissionProfile as PermissionProfileValue,
+  type PermissionRestriction,
+  type PermissionSummary,
+  type UserSelectablePermissionProfile,
+  type WorkspaceTrustState,
+} from "../permissions/permission-profile";
+
 export const PROTOCOL_VERSION = "1.0" as const;
 export const MAX_MESSAGE_BYTES = 256 * 1024;
 export const DEFAULT_THREAD_ID = "default";
@@ -32,12 +42,18 @@ function messageSchema<TType extends string, TPayload extends z.ZodType>(
   });
 }
 
-const permissionProfileSchema = z.enum([
-  "read-only",
-  "confirm-writes",
-  "workspace-write",
-  "autonomous",
-]);
+const userSelectablePermissionProfileSchema = z.enum(USER_SELECTABLE_PERMISSION_PROFILES);
+const permissionRestrictionSchema = z.enum(PERMISSION_RESTRICTIONS);
+const permissionSummarySchema = z
+  .object({
+    threadId: identifierSchema,
+    threadRevision: z.number().int().nonnegative(),
+    requestedProfile: userSelectablePermissionProfileSchema,
+    effectiveProfile: userSelectablePermissionProfileSchema,
+    workspaceTrust: z.enum(["trusted", "restricted"]),
+    restrictions: z.array(permissionRestrictionSchema).max(PERMISSION_RESTRICTIONS.length),
+  })
+  .strict();
 
 const agentRuntimeStateSchema = z.enum([
   "idle",
@@ -73,6 +89,9 @@ const agentErrorCodeSchema = z.enum([
   "MODEL_SELECTION_CONFLICT",
   "MODEL_SELECTION_BUSY",
   "MODEL_NOT_SELECTED",
+  "PERMISSION_SELECTION_CONFLICT",
+  "PERMISSION_SELECTION_BUSY",
+  "PERMISSION_PROFILE_NOT_ALLOWED",
 ]);
 
 const threadEventSchema = z.discriminatedUnion("kind", [
@@ -222,7 +241,9 @@ export const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
     "set-permission",
     z
       .object({
-        profile: permissionProfileSchema,
+        threadId: identifierSchema,
+        profile: userSelectablePermissionProfileSchema,
+        expectedThreadRevision: z.number().int().nonnegative(),
       })
       .strict(),
   ),
@@ -312,7 +333,7 @@ export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
     "permission-updated",
     z
       .object({
-        profile: permissionProfileSchema,
+        summary: permissionSummarySchema,
       })
       .strict(),
   ),
@@ -338,7 +359,11 @@ export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
   ),
 ]);
 
-export type PermissionProfile = z.infer<typeof permissionProfileSchema>;
+export type PermissionProfile = PermissionProfileValue;
+export type UserSelectablePermissionProfileValue = UserSelectablePermissionProfile;
+export type PermissionRestrictionValue = PermissionRestriction;
+export type WorkspaceTrustStateValue = WorkspaceTrustState;
+export type PermissionSummaryValue = PermissionSummary;
 export type AgentRuntimeState = z.infer<typeof agentRuntimeStateSchema>;
 export type AgentErrorCode = z.infer<typeof agentErrorCodeSchema>;
 export type ThreadEvent = z.infer<typeof threadEventSchema>;
@@ -349,6 +374,10 @@ export type ModelSummary = z.infer<typeof modelSummarySchema>;
 export type UiToExtensionMessage = z.infer<typeof uiToExtensionMessageSchema>;
 export type ExtensionToUiMessage = z.infer<typeof extensionToUiMessageSchema>;
 export type ModelListPayload = Extract<ExtensionToUiMessage, { type: "model-list" }>["payload"];
+export type PermissionUpdatedPayload = Extract<
+  ExtensionToUiMessage,
+  { type: "permission-updated" }
+>["payload"];
 
 export type UiToExtensionMessageType = UiToExtensionMessage["type"];
 export type ExtensionToUiMessageType = ExtensionToUiMessage["type"];

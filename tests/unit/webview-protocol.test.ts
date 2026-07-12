@@ -121,4 +121,39 @@ describe("Webview protocol schemas", () => {
       }),
     ).toBeUndefined();
   });
+
+  it("requires a thread revision and a safe summary for permission changes", () => {
+    const selection = createUiToExtensionMessage("set-permission", {
+      threadId: "thread-1",
+      profile: "workspace-write",
+      expectedThreadRevision: 2,
+    });
+    const update = createExtensionToUiMessage("permission-updated", {
+      summary: {
+        threadId: "thread-1",
+        threadRevision: 3,
+        requestedProfile: "workspace-write",
+        effectiveProfile: "workspace-write",
+        workspaceTrust: "restricted",
+        restrictions: ["commands-disabled", "automatic-writes-disabled"],
+      },
+    });
+
+    expect(parseUiToExtensionMessage(selection)).toEqual(selection);
+    expect(parseExtensionToUiMessage(update)).toEqual(update);
+    expect(
+      parseUiToExtensionMessage({
+        ...selection,
+        payload: { ...selection.payload, profile: "autonomous" },
+      }),
+    ).toBeUndefined();
+    expect(
+      parseExtensionToUiMessage({
+        ...update,
+        payload: {
+          summary: { ...update.payload.summary, restrictions: ["unknown"] },
+        },
+      }),
+    ).toBeUndefined();
+  });
 });

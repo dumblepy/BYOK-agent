@@ -1,11 +1,7 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { JSX } from "preact";
 
-import {
-  getModelSelectorStatusLabel,
-  getSelectedModelLabel,
-  type ModelSelectorState,
-} from "../model-selector-state";
+import { getSelectedModelLabel, type ModelSelectorState } from "../model-selector-state";
 
 export interface ModelSelectorInlineProps {
   readonly state: ModelSelectorState;
@@ -94,7 +90,13 @@ export function ModelSelectorInline({
           fill="none"
           aria-hidden="true"
         >
-          <path d="M2.5 4L5 6.5L7.5 4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+          <path
+            d="M2.5 4L5 6.5L7.5 4"
+            stroke="currentColor"
+            strokeWidth="1.2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
         </svg>
       </button>
 
@@ -102,17 +104,37 @@ export function ModelSelectorInline({
         <div ref={menuRef} class="model-selector-inline-menu" role="menu">
           <div class="model-selector-inline-menu-section">
             <div class="model-selector-inline-menu-section-title">推論</div>
-            <button type="button" class="model-selector-inline-menu-item" role="menuitem" onClick={() => handleSelect("low")}>
+            <button
+              type="button"
+              class="model-selector-inline-menu-item"
+              role="menuitem"
+              onClick={() => handleSelect("low")}
+            >
               <span>低</span>
               <span class="model-selector-inline-menu-check">✓</span>
             </button>
-            <button type="button" class="model-selector-inline-menu-item" role="menuitem" onClick={() => handleSelect("medium")}>
+            <button
+              type="button"
+              class="model-selector-inline-menu-item"
+              role="menuitem"
+              onClick={() => handleSelect("medium")}
+            >
               <span>中</span>
             </button>
-            <button type="button" class="model-selector-inline-menu-item" role="menuitem" onClick={() => handleSelect("high")}>
+            <button
+              type="button"
+              class="model-selector-inline-menu-item"
+              role="menuitem"
+              onClick={() => handleSelect("high")}
+            >
               <span>高</span>
             </button>
-            <button type="button" class="model-selector-inline-menu-item" role="menuitem" onClick={() => handleSelect("very-high")}>
+            <button
+              type="button"
+              class="model-selector-inline-menu-item"
+              role="menuitem"
+              onClick={() => handleSelect("very-high")}
+            >
               <span>非常に高い</span>
             </button>
           </div>
@@ -143,10 +165,20 @@ export function ModelSelectorInline({
           <div class="model-selector-inline-menu-divider" />
 
           <div class="model-selector-inline-menu-section">
-            <button type="button" class="model-selector-inline-menu-item model-selector-inline-menu-item-submenu" role="menuitem">
+            <button
+              type="button"
+              class="model-selector-inline-menu-item model-selector-inline-menu-item-submenu"
+              role="menuitem"
+            >
               <span>速度</span>
               <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
-                <path d="M3.5 2.5L6.5 5L3.5 7.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+                <path
+                  d="M3.5 2.5L6.5 5L3.5 7.5"
+                  stroke="currentColor"
+                  strokeWidth="1.2"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
               </svg>
             </button>
           </div>

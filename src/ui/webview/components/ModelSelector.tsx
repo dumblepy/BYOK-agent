@@ -96,7 +96,13 @@ export function ModelSelector({
           fill="none"
           aria-hidden="true"
         >
-          <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+          <path
+            d="M3 4.5L6 7.5L9 4.5"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+          />
         </svg>
       </button>
 
@@ -104,17 +110,37 @@ export function ModelSelector({
         <div ref={menuRef} class="model-selector-menu" role="menu">
           <div class="model-selector-menu-section">
             <div class="model-selector-menu-section-title">推論</div>
-            <button type="button" class="model-selector-menu-item" role="menuitem" onClick={() => handleSelect("low")}>
+            <button
+              type="button"
+              class="model-selector-menu-item"
+              role="menuitem"
+              onClick={() => handleSelect("low")}
+            >
               <span>低</span>
               <span class="model-selector-menu-check">✓</span>
             </button>
-            <button type="button" class="model-selector-menu-item" role="menuitem" onClick={() => handleSelect("medium")}>
+            <button
+              type="button"
+              class="model-selector-menu-item"
+              role="menuitem"
+              onClick={() => handleSelect("medium")}
+            >
               <span>中</span>
             </button>
-            <button type="button" class="model-selector-menu-item" role="menuitem" onClick={() => handleSelect("high")}>
+            <button
+              type="button"
+              class="model-selector-menu-item"
+              role="menuitem"
+              onClick={() => handleSelect("high")}
+            >
               <span>高</span>
             </button>
-            <button type="button" class="model-selector-menu-item" role="menuitem" onClick={() => handleSelect("very-high")}>
+            <button
+              type="button"
+              class="model-selector-menu-item"
+              role="menuitem"
+              onClick={() => handleSelect("very-high")}
+            >
               <span>非常に高い</span>
             </button>
           </div>
@@ -145,10 +171,20 @@ export function ModelSelector({
           <div class="model-selector-menu-divider" />
 
           <div class="model-selector-menu-section">
-            <button type="button" class="model-selector-menu-item model-selector-menu-item-submenu" role="menuitem">
+            <button
+              type="button"
+              class="model-selector-menu-item model-selector-menu-item-submenu"
+              role="menuitem"
+            >
               <span>速度</span>
               <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                <path d="M4.5 3L7.5 6L4.5 9" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+                <path
+                  d="M4.5 3L7.5 6L4.5 9"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
               </svg>
             </button>
           </div>

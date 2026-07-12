@@ -3,10 +3,12 @@ import type { Uri } from "vscode";
 import { DisposableStore, ManagedService } from "../extension/service-lifecycle";
 import {
   FileThreadModelStore,
+  type ThreadPermissionState,
   type ThreadModelState,
   type ThreadModelStore,
   type ThreadModelStoreFileSystem,
 } from "./thread-model-store";
+import type { UserSelectablePermissionProfile } from "../permissions/permission-profile";
 
 export interface StorageService extends ManagedService, ThreadModelStore {
   readonly serviceName: "storage";
@@ -40,6 +42,22 @@ export class DefaultStorageService extends ManagedService implements StorageServ
     modelId: string,
   ): Promise<ThreadModelState> {
     return this.threadModelStore.updateThreadModel(threadId, expectedRevision, modelId);
+  }
+
+  public getThreadPermissionState(threadId: string): Promise<ThreadPermissionState> {
+    return this.threadModelStore.getThreadPermissionState(threadId);
+  }
+
+  public updateThreadPermission(
+    threadId: string,
+    expectedRevision: number,
+    permissionProfile: UserSelectablePermissionProfile,
+  ): Promise<ThreadPermissionState> {
+    return this.threadModelStore.updateThreadPermission(
+      threadId,
+      expectedRevision,
+      permissionProfile,
+    );
   }
 
   protected override onInitialize(): void {

@@ -15,6 +15,13 @@ import {
   getModelSelectorErrorMessage,
   modelSelectorReducer,
 } from "./webview/model-selector-state";
+import {
+  createInitialPermissionSelectorState,
+  getPermissionErrorMessage,
+  permissionSelectorReducer,
+  requiresPermissionConfirmation,
+} from "./webview/permission-profile-state";
+import type { UserSelectablePermissionProfile } from "../permissions/permission-profile";
 import { ThreadView } from "./webview/components/ThreadView";
 import {
   INITIAL_THREAD_VIEW_STATE,
@@ -44,7 +51,12 @@ function App() {
     modelSelectorReducer,
     createInitialModelSelectorState(DEFAULT_THREAD_ID),
   );
+  const [permissionSelectorState, dispatchPermissionSelector] = useReducer(
+    permissionSelectorReducer,
+    createInitialPermissionSelectorState(DEFAULT_THREAD_ID),
+  );
   const modelSelectionRequestIdRef = useRef<string | undefined>(undefined);
+  const permissionSelectionRequestIdRef = useRef<string | undefined>(undefined);
   const snapshotThreadIdRef = useRef(DEFAULT_THREAD_ID);
   const protocolClient = useMemo(
     () =>
@@ -53,6 +65,11 @@ function App() {
           if (message.type === "thread-snapshot") {
             snapshotThreadIdRef.current = message.payload.threadId;
             dispatchModelSelector({
+              type: "thread-changed",
+              threadId: message.payload.threadId,
+              threadRevision: message.payload.revision,
+            });
+            dispatchPermissionSelector({
               type: "thread-changed",
               threadId: message.payload.threadId,
               threadRevision: message.payload.revision,
@@ -94,12 +111,24 @@ function App() {
                 ? { selectedModelId: message.payload.selectedModelId }
                 : {}),
             });
+          } else if (message.type === "permission-updated") {
+            dispatchPermissionSelector({
+              type: "permission-updated",
+              summary: message.payload.summary,
+            });
           } else if (message.type === "error") {
             if (message.correlationId === modelSelectionRequestIdRef.current) {
               dispatchModelSelector({
                 type: "selection-error",
                 requestId: message.correlationId,
                 message: getModelSelectorErrorMessage(message.payload.code),
+              });
+            }
+            if (message.correlationId === permissionSelectionRequestIdRef.current) {
+              dispatchPermissionSelector({
+                type: "selection-error",
+                requestId: message.correlationId,
+                message: getPermissionErrorMessage(message.payload.code),
               });
             }
             dispatchComposer({
@@ -230,6 +259,55 @@ function App() {
     }
   };
 
+  const sendPermissionSelection = (profile: UserSelectablePermissionProfile): void => {
+    const summary = permissionSelectorState.summary;
+    if (
+      summary === undefined ||
+      (permissionSelectorState.phase !== "ready" &&
+        permissionSelectorState.phase !== "error" &&
+        permissionSelectorState.phase !== "confirming")
+    ) {
+      return;
+    }
+
+    try {
+      const requestId = protocolClient.send("set-permission", {
+        threadId: summary.threadId,
+        profile,
+        expectedThreadRevision: summary.threadRevision,
+      });
+      permissionSelectionRequestIdRef.current = requestId;
+      dispatchPermissionSelector({ type: "selection-requested", profile, requestId });
+    } catch {
+      dispatchPermissionSelector({
+        type: "selection-error",
+        message: "権限の変更要求を送信できませんでした。",
+      });
+    }
+  };
+
+  const handlePermissionSelect = (profile: UserSelectablePermissionProfile): void => {
+    const current = permissionSelectorState.summary?.requestedProfile;
+    if (current === undefined) {
+      return;
+    }
+
+    if (requiresPermissionConfirmation(current, profile)) {
+      dispatchPermissionSelector({ type: "confirmation-requested", profile });
+      return;
+    }
+
+    sendPermissionSelection(profile);
+  };
+
+  const handlePermissionConfirm = (): void => {
+    const profile = permissionSelectorState.pendingProfile;
+    if (profile === undefined) {
+      return;
+    }
+    sendPermissionSelection(profile);
+  };
+
   return (
     <main class="agent-shell">
       <header class="agent-header">
@@ -247,10 +325,14 @@ function App() {
       <Composer
         state={composerState}
         modelSelectorState={modelSelectorState}
+        permissionSelectorState={permissionSelectorState}
         onDraftChange={handleComposerDraftChange}
         onSubmit={handleComposerSubmit}
         onStop={handleComposerStop}
         onModelSelect={handleModelSelect}
+        onPermissionSelect={handlePermissionSelect}
+        onPermissionConfirm={handlePermissionConfirm}
+        onPermissionCancel={() => dispatchPermissionSelector({ type: "confirmation-cancelled" })}
       />
 
       <p class="hint">BYOK設定は後続の設定画面で追加できます。</p>

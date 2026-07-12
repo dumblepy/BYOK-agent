@@ -1,92 +1,106 @@
 ---
-description: 6-ui-webviewのcontent-security-policyを実装するブランチでモデル選択UIを設計するときに読み込む
+description: 6-ui-webviewのcontent-security-policyを実装する
 alwaysApply: false
 ---
-# モデル選択UI
+# 権限プロファイル選択UI
 
-このブランチでは、既存のAgent Sidebar Webviewに、現在のスレッドで利用するモデルを確認・変更するUIとHost側の選択保存境界を実装する。Model Configuration LoaderとAgent Runtimeは未実装のため、差し替え可能なModel Catalog境界と、次回送信時のモデル解決までを対象とする。
+このブランチでは、Agent Sidebar Webviewに権限プロファイルの選択UIを追加する。UIは`read-only`、`confirm-writes`、`workspace-write`だけを選択肢として表示し、現在の要求プロファイルと実効権限を常時表示する。権限判定、Workspace Trustの評価、保存、Agent実行への反映はExtension Hostを正本とする。
 
 ## 実装方針
 
-- Webviewは、Hostから受け取った`ModelSummary`の一覧を表示し、選択要求を送る投影層に限定する。Model Catalog、モデル設定、SecretStorage、Provider通信、Thread StoreはExtension Host側に置く。
-- モデル一覧は、設定優先順位を解決し、ProviderとSecretStorageの利用条件を満たす利用可能なモデルだけをHost側で列挙する。APIキー、認証ヘッダー、Provider URL、内部設定をWebviewへ渡さない。
-- `select-model`は必ず`threadId`、`modelId`、`expectedThreadRevision`を持ち、Host側で現在のWebviewセッション、スレッド、モデルの利用可能性、revision、Run状態を再検証する。
-- 選択成功後にThread Storeの`meta.json.modelId`を原子的に更新し、Hostが更新済み`model-list`を返す。確定通知前の楽観的な表示変更は行わず、失敗時は以前の確定状態を維持する。
-- `send-message`にはモデルIDを追加しない。Hostがスレッドの最新メタデータからモデルを解決し、次回リクエストの`AgentRunRequest`へ渡すことで、選択結果の反映を保証する。
-- 実行中はUIとHostの両方でモデル変更を拒否し、現在のRunが使用するモデルと次回リクエストのモデルを混在させない。
-- Webview通信は既存のバージョン付きEnvelopeとZod検証、messageId重複排除、correlationIdを再利用する。不正な値、未知のモデル、古いrevision、異なるスレッドの一覧は適用しない。
-- UIはネイティブ`select`または同等のキーボード操作可能な単一選択UIを使い、VS Code標準テーマトークンとCodiconだけで状態を表現する。状態を色だけで区別せず、ラベルとアクセシビリティ通知を付ける。
-- Webview状態や`localStorage`へモデル選択を保存しない。永続化の正本は`globalStorage/threads/<thread-id>/meta.json`とし、秘密情報やProvider応答を保存しない。
+- Webviewは、Hostから受け取った権限要約を表示し、選択要求を送る投影層に限定する。Permission Policy、Thread Store、Workspace Trust、Agent RuntimeはExtension Host側に置く。
+- `autonomous`は型として存在しても、このUIの選択肢、既定値、説明文、ショートカットには含めない。明示的な別途有効化がない限り利用不可とする。
+- 権限状態はHostからの`permission-updated`を正本として表示する。UIの楽観的更新やWebview状態への永続化は行わず、Hostの確定通知を受けてから表示を更新する。
+- プロファイル変更は現在のスレッドの`permissionProfile`を更新する操作とし、`threadId`と`expectedThreadRevision`を付けてHostへ送る。Hostはセッション、スレッド、revision、実行状態、Workspace Trustを再検証する。
+- `confirm-writes`または`workspace-write`への切り替えなど、書き込み能力を広げる変更は、変更内容と影響範囲を説明する確認UIを表示してから要求を送る。確認前に選択状態を変更しない。
+- Workspace TrustがRestrictedのときは、コマンド実行、自動ファイル変更、ワークスペース由来の外部モデルURL・MCPを有効化しない。要求プロファイルと実効権限が異なる場合は、両方をUIに表示する。
+- Agent実行開始時にHostがスレッド正本からプロファイルを解決し、`AgentRunRequest`へ渡す。Agent実行中の各Tool CallでもPermission PolicyとWorkspace Trustを再評価し、UIから渡されたプロファイルを認可の根拠にしない。
+- 既存のバージョン付きEnvelope、Zodの受信検証、messageIdの重複排除、correlationIdを使用する。権限の状態通知にAPIキー、認証ヘッダー、ファイル内容、Provider設定を含めない。
+- 表示はVS Code標準テーマトークンとCodiconを使い、状態を色だけで区別しない。キーボード操作、フォーカス、`aria-live`、確認ダイアログのフォーカストラップを設計する。
 
 ## 実装対象（次の実装フェーズ）
 
-- `src/ui/webview/components/ModelSelector.tsx`
-- `src/ui/webview/model-selector-state.ts`
+- `src/ui/webview/components/PermissionProfileSelector.tsx`
+- `src/ui/webview/permission-profile-state.ts`
 - `src/ui/main.tsx`
 - `src/ui/styles.css`
 - `src/ui/webview-protocol.ts`
-- Extension HostのUIルーティング、Model Catalog、Thread Store境界
-- `tests/unit/`、`tests/extension-integration/`のモデル選択・通信・永続化テスト
+- Extension Hostの権限ルーティング、Permission Policy、Thread Store、Agent実行準備境界
+- `tests/unit/`、`tests/extension-integration/`、`tests/agent-simulation/`の権限選択・通信・永続化・Agent反映テスト
 
 ## 状態と操作契約
 
 ```ts
-type ModelSelectorPhase = "loading" | "ready" | "selecting" | "error";
+type PermissionSelectorPhase =
+  | "loading"
+  | "ready"
+  | "confirming"
+  | "updating"
+  | "error";
 
-interface ModelSelectorState {
-  phase: ModelSelectorPhase;
-  threadId?: string;
-  threadRevision?: number;
-  models: readonly ModelSummary[];
-  selectedModelId?: string;
-  pendingModelId?: string;
+type WorkspaceTrustState = "trusted" | "restricted";
+
+interface PermissionSummary {
+  threadId: string;
+  threadRevision: number;
+  requestedProfile: "read-only" | "confirm-writes" | "workspace-write";
+  effectiveProfile: "read-only" | "confirm-writes" | "workspace-write";
+  workspaceTrust: WorkspaceTrustState;
+  restrictions: readonly ("commands-disabled" | "automatic-writes-disabled")[];
+}
+
+interface PermissionSelectorState {
+  phase: PermissionSelectorPhase;
+  summary?: PermissionSummary;
+  pendingProfile?: PermissionSummary["requestedProfile"];
   errorMessage?: string;
 }
 ```
 
-- `loading`: `model-list`待ち。選択UIは操作不可。
-- `ready`: 利用可能モデル一覧と現在のモデルを表示する。
-- `selecting`: 選択要求を一度だけ送信し、確定通知まで操作を無効化する。
-- `error`: 前回の確定モデルを維持し、安全なエラー文を表示して再試行可能にする。
-- モデル一覧が空、または`selectedModelId`がない場合は空状態を表示し、Composerの送信はHost側でも拒否する。
-- 現在表示中の`threadId`と異なる`model-list`、古い`threadRevision`、一覧に存在しない`selectedModelId`はReducerへ適用しない。
-- 選択確定後の次の`send-message`は、HostがThread Storeの`meta.json.modelId`を読み取ってモデルを解決する。WebviewはモデルIDを送信要求へ追加しない。
+- `loading`: 初期スナップショット待ち。選択UIは操作不可。
+- `ready`: 現在の要求プロファイル、実効プロファイル、Workspace Trust、制限を常時表示する。
+- `confirming`: 書き込み能力を広げる変更の説明を表示し、承認またはキャンセルを待つ。
+- `updating`: `set-permission`を一度だけ送信し、確定通知まで操作を無効化する。
+- `error`: 確定済みの権限状態を維持し、安全なエラー文を表示して再試行可能にする。
+- 現在表示中の`threadId`と異なる通知、古い`threadRevision`、未対応のプロファイルはReducerへ適用しない。
+- 選択確定後の次の`send-message`は、HostがThread Storeから最新の`permissionProfile`を解決する。Webviewは`send-message`へプロファイルを追加しない。
 
 ## 進捗
 
-- [x] `AGENTS.md`、`project.mdc`、`branch.mdc`、既存のブランチルール、モデル・UI・通信設計を確認する
-- [x] `documents/design.md`へモデル選択UIの実装方針と詳細設計を記録する
-- [x] スレッド単位の選択、revision競合、永続化、次回リクエストへの反映契約を定義する
-- [x] モデル選択UIと状態Reducerを実装する
-- [x] `select-model`／`model-list`の通信スキーマとHostルーティングを実装する
-- [x] Thread Store、Model Catalog、`AgentRunRequest`準備境界、次回送信時のモデル解決を実装する
-- [x] UI、通信、競合、永続化、次回リクエスト反映のテストを追加する
+- [x] `AGENTS.md`、`project.mdc`、`branch.mdc`、旧ブランチルール、権限・UI・通信・保存設計を確認する
+- [x] `documents/design.md`へ権限プロファイル選択UIの実装方針と詳細設計を記録する
+- [x] 要求プロファイル、実効プロファイル、Workspace Trust、危険モード確認、Agent実行反映の契約を定義する
+- [x] 権限プロファイルUIと状態Reducerを実装する
+- [x] `set-permission`／`permission-updated`の通信スキーマとHostルーティングを実装する
+- [x] Thread Storeへの原子的な保存とAgentRunRequestへの反映を実装する
+- [x] UI、通信、競合、Restricted Mode、Agent実行反映のテストを追加する
 - [x] 型チェック、Lint、フォーマット、テスト、Webviewセキュリティ検査を実行する
 
 ## 完了条件
 
-1. 利用可能なモデル一覧と、現在のスレッドに確定しているモデルを表示できる。
-2. UIから選択したモデルが、対象スレッドの`meta.json.modelId`へ安全に保存される。
-3. 選択確定後の次回`send-message`が、Hostのスレッド正本から選択モデルを解決して実行する。
-4. 未知モデル、異なるスレッド、古いrevision、実行中の変更、重複要求が保存やRunへ影響しない。
-5. Webviewへ秘密情報や不要なProvider設定が渡らず、Light、Dark、High Contrastで操作状態を識別できる。
+1. `read-only`、`confirm-writes`、`workspace-write`を選択でき、現在の要求プロファイルと実効権限を常時確認できる。
+2. 書き込み能力を広げる切り替え前に、変更内容、許可される操作、常時確認対象を説明し、承認なしではHostへ要求を送らない。
+3. 選択結果が現在のスレッドの`meta.json.permissionProfile`へ安全に保存される。
+4. 選択確定後の次回Agent実行で、Hostがスレッド正本から解決したプロファイルが`AgentRunRequest`と各Tool Callの権限判定へ反映される。
+5. 未知プロファイル、別スレッド、古いrevision、実行中の変更、重複要求、Restricted Modeによる制限が安全に処理される。
+6. Webviewへ秘密情報や不要なワークスペース情報を渡さず、Light、Dark、High Contrastで状態と操作可否を識別できる。
 
 ## 対象外
 
-- Model Configuration Loader、Agent Runtimeの実行ループ、Provider呼び出し
-- モデル設定JSON Schema、Model Catalog、Model Configuration Loaderそのものの実装
-- Provider Adapter、Agent Runtime、AgentLoop、Prompt、Context、Toolの実装
-- Threadの作成・一覧・切り替えUIの新規設計（現在のスレッドIDを受け取る境界だけ定義する）
-- 権限プロファイル選択、Composer、ThreadView、CSPの再設計
-- APIキー、認証ヘッダー、環境変数、ファイル内容、非公開推論内容のWebview表示
+- `autonomous`をユーザー向けUIから有効化する機能
+- Permission Policyそのものの全Tool Category定義、承認ダイアログ、ChangeSet適用、コマンド実行機構の実装
+- Agent Runtime、Provider、Context、Prompt、Tool Calling Loopの新規実装
+- Workspace Trust機構自体の変更、ワークスペース外操作の許可
+- モデル選択UI、Composer、ThreadView、CSPの再設計
+- APIキー、認証ヘッダー、環境変数、ファイル内容、非公開推論内容のWebview表示・保存
 - `git add`、`git commit`、既存の未コミット変更の整理・上書き
 
 ## 検証方針（実装フェーズ）
 
-- 状態テストで、一覧受信、現在モデル表示、空一覧、選択中の二重操作抑止、成功、失敗、再試行、古い通知の無視を検証する。
-- 通信テストで、Envelope、`threadId`、`expectedThreadRevision`、`correlationId`、受信検証、messageId重複排除を検証する。
-- Hostテストで、モデルの利用可能性、スレッド境界、revision競合、Run中拒否、原子的なメタデータ更新を検証する。
-- Agent連携テストで、選択確定後の次回`send-message`がThread Storeのモデルを使い、実行中Runのモデルを変更しないことを検証する。
+- 状態テストで、初期スナップショット、現在状態表示、危険モード確認、キャンセル、更新中の二重操作抑止、成功、失敗、再試行、古い通知の無視を検証する。
+- 通信テストで、Envelope、`threadId`、`expectedThreadRevision`、`correlationId`、列挙値検証、messageId重複排除を検証する。
+- Hostテストで、スレッド境界、revision競合、Run中拒否、Workspace Trustによる実効権限制限、`meta.json`の原子的更新を検証する。
+- Agentシミュレーションで、選択確定後の次回RunがThread Storeのプロファイルを使い、各Tool Callで再評価されることを検証する。
 - 実APIテストは追加せず、明示的な環境変数がある場合だけ既存方針に従って実行する。
 
 ## 参考資料
@@ -94,21 +108,20 @@ interface ModelSelectorState {
 - `AGENTS.md`
 - `.cursor/rules/project.mdc`
 - `.cursor/rules/branch.mdc`
-- `documents/design.md` §5、§14.1、§14.2、§14.2.3、§14.3、§15、§17
-- `documents/issues.md`のMilestone 1「モデル選択UI」およびMilestone 2「モデル設定・Thread Store」
+- `documents/design.md` §11、§14.2、§14.3、§15、§16、§17
+- `documents/issues.md`のMilestone 1「権限プロファイル選択UI」およびMilestone 10「権限と承認」
 - `src/ui/webview-protocol.ts`
 - `src/ui/webview-protocol-client.ts`
 - `src/ui/extension-webview-protocol.ts`
-- `src/ui/main.tsx`
-- `src/storage/storage-service.ts`
-- `src/agent/agent-service.ts`
+- `src/storage/`
+- `src/permissions/`
+- `src/agent/`
 
 ## 調査結果・設計まとめ
 
-- 既存の`webview-protocol.ts`には`select-model`と`model-list`の骨格があるが、スレッドIDとrevisionが不足している。設計上は対象スレッドと楽観的競合検査を明示する。
-- 既存の`model-list`はHostからUIへ送られるが、実装前は空の一覧を返すだけだったため、Model CatalogとThread StoreをHost側へ接続した。設定ファイルの読み込みはModel Configuration Loaderの責務として残している。
-- `documents/design.md`の`ThreadMetadata`には既に`modelId`があり、選択結果の正本はWebview状態ではなくスレッドの`meta.json`に置く。
-- `send-message`は現在`threadId`と本文だけを持つ。モデルIDを追加せず、Hostが送信時点のスレッドメタデータから解決することで、選択結果が次回リクエストへ反映される。
-- `ModelSummary`は`id`、`label`、`provider`に限定し、SecretStorageの内容、APIキー、URL、Providerの内部設定をWebviewへ漏らさない。
-- `Thread Store`の更新成功後に`model-list`を返すため、UI表示と永続化の確定タイミングを一致させる。revision競合時は上書きせず、最新状態を再取得する。
-- Agent Runtimeはまだ実行処理を持たないため、Hostは次回`send-message`の前にスレッド正本のモデルを検証・解決し、`AgentService.prepareRunRequest`へ`modelId`を渡してからユーザーメッセージイベントを受け付ける。Provider呼び出しと実行ループへの接続はAgent Runtime実装時に行う。
+- `documents/design.md`には4種のPermission Profile、スレッドメタデータの`permissionProfile`、`set-permission`、`permission-updated`の既存契約がある。今回のUIでは`autonomous`を公開選択肢にしない。
+- 現行契約の`set-permission`はプロファイルだけを持つため、モデル選択UIと同じく、対象スレッドと楽観的競合検査を明示できるよう`threadId`と`expectedThreadRevision`を追加する設計とする。
+- Restricted Modeでは要求プロファイルと実際に利用可能な権限が一致しない可能性があるため、`requestedProfile`と`effectiveProfile`、制限理由を分離して表示する。
+- 選択結果の正本はWebview状態ではなく`globalStorage/threads/<thread-id>/meta.json`とする。Hostは保存成功後にだけ`permission-updated`を発行する。
+- Agent実行時は`send-message`の値を認可の根拠にせず、Hostが送信時点のThread StoreとWorkspace Trustから権限コンテキストを再構築する。Tool実行前にも再評価する。
+- UIは権限を付与する主体ではなく、Hostの確定状態を表示する主体である。これにより、古いWebview、改ざんされたメッセージ、複数クライアントの競合が権限昇格に直結しない。

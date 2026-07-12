@@ -1,11 +1,13 @@
 import { DisposableStore, ManagedService } from "../extension/service-lifecycle";
 import type { ProviderService } from "../providers/provider-service";
+import type { PermissionContext } from "../permissions/permission-profile";
 import type { StorageService } from "../storage/storage-service";
 
 export interface AgentRunRequest {
   readonly threadId: string;
   readonly text: string;
   readonly modelId: string;
+  readonly permissionContext: PermissionContext;
 }
 
 export interface AgentService extends ManagedService {

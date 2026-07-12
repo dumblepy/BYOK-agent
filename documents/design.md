@@ -1679,6 +1679,174 @@ Webviewへ渡すのは`ModelSummary`とスレッド識別・revisionだけであ
 
 完了条件は、利用可能なモデル一覧と現在のモデルを表示でき、現在のスレッドに対する選択を安全に保存でき、選択確定後の次回`send-message`がHostのスレッドメタデータから選択モデルを解決して`AgentService.prepareRunRequest`へ渡すこととする。Provider呼び出しと実行ループへの接続はAgent Runtimeの責務とする。
 
+### 14.2.4 権限プロファイル選択UI詳細設計
+
+権限プロファイル選択UIは、現在のスレッドでAgentが利用できる権限プロファイルを確認・変更するWebview専用のUIとする。権限判定、Workspace Trustの評価、スレッドメタデータの更新、Agent実行への反映はExtension Hostが担当する。WebviewはHostから受け取った権限要約を表示し、検証済みの選択要求を送るだけにする。
+
+#### 目的と責務境界
+
+UIの選択肢は`read-only`、`confirm-writes`、`workspace-write`の3つに限定する。`autonomous`は内部の`PermissionProfile`型に残るが、このUIの一覧、既定値、説明、ショートカットには含めず、明示的な別設定がない限り利用できない。
+
+Webviewが担当するのは次の表示・操作だけとする。
+
+* 現在の要求プロファイル、実効プロファイル、Workspace Trust、適用中の制限を常時表示する
+* 3つの選択肢の名称、許可される代表的な操作、常時確認対象を表示する
+* 書き込み能力を広げる切り替え前に説明と確認を表示する
+* 確認済みの選択要求を現在のスレッドとrevision付きでHostへ送る
+* Hostの確定通知、競合、拒否、エラーを表示する
+
+次の責務はWebviewへ持たせない。
+
+* Permission Policy、Tool Category、Workspace Trust、Thread Storeの独自判定
+* APIキー、認証ヘッダー、Provider URL、ファイルシステム、環境変数へのアクセス
+* UI状態や`localStorage`への権限の永続化
+* `send-message`へプロファイルを埋め込むこと、またはUI表示だけでAgent実行を許可すること
+* ワークスペース内の指示ファイルやユーザー入力を理由に安全制約を緩和すること
+
+#### 状態モデルと表示契約
+
+HostからUIへ渡す権限情報は、表示に必要な最小要約とする。
+
+```ts
+type PermissionProfile =
+  | "read-only"
+  | "confirm-writes"
+  | "workspace-write"
+  | "autonomous";
+
+type UserSelectablePermissionProfile = Exclude<PermissionProfile, "autonomous">;
+type WorkspaceTrustState = "trusted" | "restricted";
+type PermissionRestriction =
+  | "commands-disabled"
+  | "automatic-writes-disabled"
+  | "workspace-provider-disabled"
+  | "workspace-mcp-disabled";
+
+interface PermissionSummary {
+  threadId: string;
+  threadRevision: number;
+  requestedProfile: UserSelectablePermissionProfile;
+  effectiveProfile: UserSelectablePermissionProfile;
+  workspaceTrust: WorkspaceTrustState;
+  restrictions: readonly PermissionRestriction[];
+}
+
+type PermissionSelectorPhase =
+  | "loading"
+  | "ready"
+  | "confirming"
+  | "updating"
+  | "error";
+
+interface PermissionSelectorState {
+  phase: PermissionSelectorPhase;
+  summary?: PermissionSummary;
+  pendingProfile?: UserSelectablePermissionProfile;
+  errorMessage?: string;
+}
+```
+
+`requestedProfile`はスレッドに保存されたユーザーの選択、`effectiveProfile`はWorkspace Trustと安全制約を加味して実際に利用可能な権限を表す。両者が異なる場合は「選択中」と「実効」のラベルを分け、理由となる`restrictions`を説明する。これにより、表示上は`workspace-write`でもRestricted Modeにより自動書き込みやコマンドが使えない状態を、権限昇格と誤認させない。
+
+`loading`では選択操作を無効化し、`ready`では確定状態を表示する。`confirming`では危険モードの説明と承認・キャンセルを表示し、`updating`では要求を一度だけ送信する。`error`では最後にHostが確定した状態を維持し、安全なエラー文だけを表示して再試行可能にする。UIは通知を受ける前に要求プロファイルを確定状態として表示してはならない。
+
+#### プロファイルの説明と危険モード確認
+
+選択肢には、権限名だけでなく、許可される代表操作と制限を併記する。
+
+| プロファイル | UIで説明する内容 | 危険度の扱い |
+|---|---|---|
+| `read-only` | 読み取り、検索、診断取得。編集とコマンドは不可 | 基準となる安全側の状態 |
+| `confirm-writes` | 読み取りとChangeSet作成。ディスク反映とコマンドは毎回確認 | 書き込み操作を伴うため確認を表示 |
+| `workspace-write` | ワークスペース内の変更をChangeSetへ追加。ディスク反映は確認。安全なテストは事前ルールにより自動実行可能 | より広い書き込み・実行能力のため確認を表示 |
+
+現在のプロファイルより書き込み・実行能力を広げる選択では、次の情報を確認UIに表示する。
+
+* 変更前後のプロファイル
+* 新たに可能になる操作（ChangeSet作成、ワークスペース内変更、許可されたテスト実行など）
+* 引き続き常に確認が必要な操作（削除、大量変更、Git書き込み、外部通信、秘密情報操作、破壊的コマンド、設定変更など）
+* Workspace Trustが制限する操作
+* 実行中のAgentには適用されず、次回Runから適用されること
+
+`read-only`への切り替えなど、権限を狭める変更もHostの検証と確定通知を必要とする。確認ダイアログを閉じた場合やキャンセルした場合は、現在の確定状態を維持する。確認UIはWebview内のキーボード操作可能なダイアログとし、初期フォーカス、Escape、承認・キャンセル、`aria-describedby`、`aria-live`を定義する。ブラウザの任意コードを実行する確認や、確認文にユーザー入力・ファイル内容をそのまま反射することは禁止する。
+
+#### 選択要求、保存、競合
+
+選択要求は次の契約でHostへ送る。
+
+```ts
+interface SetPermissionPayload {
+  threadId: string;
+  profile: UserSelectablePermissionProfile;
+  expectedThreadRevision: number;
+}
+```
+
+Hostは次の順序で検証する。
+
+1. Envelope、プロトコルバージョン、プロファイル列挙値、`threadId`、`expectedThreadRevision`を検証する。
+2. 現在のWebviewセッション、表示中のスレッド、Thread Store上のスレッドが一致することを確認する。
+3. Agent Runが実行中でないことを確認する。実行中はプロファイルを変更せず、安全なエラーを返す。
+4. Workspace TrustとPermission Policyを評価し、要求プロファイルを許可できるか確認する。Restricted Modeで無効になる能力を要求プロファイル自体に混ぜない。
+5. `expectedThreadRevision`と現在のrevisionを比較する。不一致なら保存せず、最新の`permission-updated`を返す。
+6. `meta.json.permissionProfile`とrevisionを一時ファイル経由で原子的に保存する。
+7. 保存成功後にだけ、再計算した`PermissionSummary`を`permission-updated`として送る。
+
+保存失敗、競合、Workspace Trustによる拒否、未知のプロファイルでは、UIの確定表示を変更しない。複数のWebview要求や同じ`messageId`の再送はHostの重複排除規則で一度だけ処理し、古い通知や別スレッドの通知をReducerへ適用しない。
+
+#### Workspace Trustと実効権限
+
+`workspace.isTrusted`の変化はHostが監視し、変化時に現在のスレッドの`PermissionSummary`を再計算してUIへ通知する。Restricted Modeでは、少なくともコマンド実行、自動ファイル変更、ワークスペース定義の外部モデルURL、ワークスペース定義のMCPサーバー、リポジトリ内スクリプト実行を無効化する。要求プロファイルの保存値を勝手に書き換えず、`effectiveProfile`と`restrictions`で実効状態を表す。
+
+実行中にWorkspace Trustが変化した場合、現在のRunが持つ権限コンテキストを次のTool Callから再評価する。既に開始した危険操作をUIの表示だけで取り消したことにはせず、必要なキャンセルや承認の扱いはAgent RuntimeとPermission Policyの責務とする。UIはHostから通知された実効状態を表示する。
+
+#### Agent実行への反映
+
+`send-message`にはプロファイルを含めない。Hostは送信要求を受けた時点で、次の情報から`PermissionContext`を構築して`AgentRunRequest`へ渡す。
+
+```ts
+interface PermissionContext {
+  requestedProfile: UserSelectablePermissionProfile;
+  effectiveProfile: UserSelectablePermissionProfile;
+  workspaceTrust: WorkspaceTrustState;
+  restrictions: readonly PermissionRestriction[];
+  threadRevision: number;
+}
+```
+
+Agent RuntimeはRun開始時にこのContextを保持し、Tool Callごとに現在のWorkspace Trust、Threadの権限revision、Permission Policyを再評価する。`read-only`では編集・コマンドToolを候補から除外または拒否し、`confirm-writes`ではChangeSet作成とコマンドを確認経由にし、`workspace-write`では設計済みのワークスペース内自動処理だけを許可する。常に確認する操作はプロファイルで上書きしない。
+
+選択確定後の次回Agent実行で、Thread Storeの`permissionProfile`が`AgentRunRequest`の権限Contextへ反映されることを完了条件とする。Webviewの表示値、古い`set-permission`要求、ユーザー入力、ワークスペース指示ファイルを権限の根拠にしない。
+
+#### 通信契約
+
+既存の判別共用体へ次の形で組み込む。
+
+```ts
+type UiToExtensionPermissionMessage = MessageEnvelope<"set-permission", SetPermissionPayload>;
+
+type ExtensionToUiPermissionMessage = MessageEnvelope<"permission-updated", {
+  summary: PermissionSummary;
+}>;
+```
+
+実際のプロトコルでは、既存の`permission-updated`のpayloadを`PermissionSummary`へ拡張し、`set-permission`を`threadId`、`profile`、`expectedThreadRevision`付きへ更新する。`ui-ready`後、スレッド切り替え後、Workspace Trust変更後、選択成功または競合後にHostが現在の要約を送る。両方向の受信境界でZodの`safeParse`を実行し、検証前の値をDOM、ログ、永続化、権限判定へ渡さない。
+
+#### 実装単位と検証方針
+
+実装時は次の単位へ分割する。
+
+* `src/ui/webview/components/PermissionProfileSelector.tsx`: 選択肢、現在状態、制限、危険モード確認、アクセシビリティ
+* `src/ui/webview/permission-profile-state.ts`: 状態、確認、更新中、確定通知、競合・エラーの純粋な状態遷移
+* `src/ui/main.tsx`: Permission Selectorと既存`WebviewProtocolClient`、現在のスレッド状態の接続
+* `src/ui/styles.css`: 権限表示、確認ダイアログ、フォーカス、無効状態、Light/Dark/High Contrast対応
+* `src/ui/webview-protocol.ts`: `set-permission`と`permission-updated`のpayload、Zodスキーマ、型定義
+* Extension HostのUIルーティング、Permission Policy、Thread Store、Agent Service境界: 再検証、原子的保存、実効権限計算、次回Runへの反映
+
+テストでは、3選択肢の表示、`autonomous`の非表示、現在状態の常時表示、危険モードの説明・承認・キャンセル、更新中の二重操作抑止、未知プロファイル、別スレッド、revision競合、Run中拒否、Restricted Mode、Workspace Trust変更、原子的保存、次回Agent実行への反映を検証する。通信テストではEnvelope、payload上限、列挙値、相関ID、重複排除、古い通知の無視を検証する。実APIを呼ぶテストは追加せず、明示的な環境変数がある場合だけ既存の実APIテスト方針に従う。
+
+完了条件は、3つのプロファイルを安全に選択でき、現在の要求・実効権限を常時表示し、書き込み能力を広げる前に説明と確認を行い、選択確定後の次回Agent実行がHostのThread Storeから解決した権限Contextを用いてToolごとの権限判定を行うこととする。`autonomous`の有効化、承認ダイアログそのものの一般化、Permission Policyの全操作定義は本UI設計の完了条件に含めない。
+
 ## 14.3 Webview通信
 
 Extension HostとWebviewの通信は、VS Code Webview APIの`postMessage`を搬送路とし、その上に本拡張専用のバージョン付きメッセージプロトコルを定義する。WebviewはUI状態の投影とユーザー操作を担当し、会話・Agent実行・権限・変更の正本はExtension Hostが保持する。
@@ -1738,7 +1906,9 @@ type UiToExtensionMessage =
       expectedThreadRevision: number;
     }>
   | MessageEnvelope<"set-permission", {
-      profile: PermissionProfile;
+      threadId: string;
+      profile: Exclude<PermissionProfile, "autonomous">;
+      expectedThreadRevision: number;
     }>
   | MessageEnvelope<"request-thread-snapshot", {
       threadId: string;
@@ -1788,7 +1958,7 @@ type ExtensionToUiMessage =
       selectedModelId?: string;
     }>
   | MessageEnvelope<"permission-updated", {
-      profile: PermissionProfile;
+      summary: PermissionSummary;
     }>
   | MessageEnvelope<"protocol-error", {
       code: "UNSUPPORTED_VERSION" | "INVALID_MESSAGE" | "MESSAGE_TOO_LARGE";

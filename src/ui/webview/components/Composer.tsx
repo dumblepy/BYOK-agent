@@ -11,24 +11,38 @@ import {
 } from "../composer-state";
 import { MAX_COMPOSER_DRAFT_LENGTH } from "../../webview-state";
 import type { ModelSelectorState } from "../model-selector-state";
+import {
+  INITIAL_PERMISSION_SELECTOR_STATE,
+  type PermissionSelectorState,
+} from "../permission-profile-state";
+import type { UserSelectablePermissionProfile } from "../../../permissions/permission-profile";
+import { PermissionProfileSelector } from "./PermissionProfileSelector";
 import { ModelSelectorInline } from "./ModelSelectorInline";
 
 export interface ComposerProps {
   readonly state: ComposerState;
   readonly modelSelectorState: ModelSelectorState;
+  readonly permissionSelectorState?: PermissionSelectorState;
   readonly onDraftChange: (draft: string) => void;
   readonly onSubmit: () => void;
   readonly onStop: () => void;
   readonly onModelSelect: (modelId: string) => void;
+  readonly onPermissionSelect?: (profile: UserSelectablePermissionProfile) => void;
+  readonly onPermissionConfirm?: () => void;
+  readonly onPermissionCancel?: () => void;
 }
 
 export function Composer({
   state,
   modelSelectorState,
+  permissionSelectorState = INITIAL_PERMISSION_SELECTOR_STATE,
   onDraftChange,
   onSubmit,
   onStop,
   onModelSelect,
+  onPermissionSelect = () => undefined,
+  onPermissionConfirm = () => undefined,
+  onPermissionCancel = () => undefined,
 }: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isBusy = isComposerBusy(state.phase);
@@ -77,29 +91,23 @@ export function Composer({
       />
       <div class="composer-toolbar">
         <div class="composer-toolbar-left">
-          <button
-            type="button"
-            class="composer-toolbar-button"
-            aria-label="添付ファイルを追加"
-          >
+          <button type="button" class="composer-toolbar-button" aria-label="添付ファイルを追加">
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path d="M8 3V13M3 8H13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              <path
+                d="M8 3V13M3 8H13"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+              />
             </svg>
           </button>
-          <button
-            type="button"
-            class="composer-toolbar-button composer-toolbar-mode-button"
-            aria-label="アクセスモードを選択"
-          >
-            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
-              <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.2" />
-              <path d="M7 4V7L9 8.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
-            </svg>
-            <span>フルアクセス</span>
-            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
-              <path d="M2.5 4L5 6.5L7.5 4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
-            </svg>
-          </button>
+          <PermissionProfileSelector
+            state={permissionSelectorState}
+            disabled={isBusy}
+            onSelect={onPermissionSelect}
+            onConfirm={onPermissionConfirm}
+            onCancel={onPermissionCancel}
+          />
         </div>
         <div class="composer-toolbar-right">
           <ModelSelectorInline
@@ -125,7 +133,13 @@ export function Composer({
             onClick={onSubmit}
           >
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path d="M8 13V3M8 3L4 7M8 3L12 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+              <path
+                d="M8 13V3M8 3L4 7M8 3L12 7"
+                stroke="currentColor"
+                strokeWidth="1.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
             </svg>
           </button>
         </div>
