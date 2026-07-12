@@ -98,4 +98,27 @@ describe("Webview protocol schemas", () => {
 
     expect(parseExtensionToUiMessage(message)).toEqual(message);
   });
+
+  it("requires a thread revision for model selection and publishes a thread model list", () => {
+    const selection = createUiToExtensionMessage("select-model", {
+      threadId: "thread-1",
+      modelId: "coding-primary",
+      expectedThreadRevision: 2,
+    });
+    const modelList = createExtensionToUiMessage("model-list", {
+      threadId: "thread-1",
+      threadRevision: 3,
+      models: [{ id: "coding-primary", label: "Coding Primary", provider: "primary" }],
+      selectedModelId: "coding-primary",
+    });
+
+    expect(parseUiToExtensionMessage(selection)).toEqual(selection);
+    expect(parseExtensionToUiMessage(modelList)).toEqual(modelList);
+    expect(
+      parseUiToExtensionMessage({
+        ...selection,
+        payload: { ...selection.payload, expectedThreadRevision: -1 },
+      }),
+    ).toBeUndefined();
+  });
 });

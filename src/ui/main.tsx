@@ -10,6 +10,11 @@ import {
   isComposerDraftSubmittable,
   normalizeComposerDraft,
 } from "./webview/composer-state";
+import {
+  createInitialModelSelectorState,
+  getModelSelectorErrorMessage,
+  modelSelectorReducer,
+} from "./webview/model-selector-state";
 import { ThreadView } from "./webview/components/ThreadView";
 import {
   INITIAL_THREAD_VIEW_STATE,
@@ -35,6 +40,11 @@ function App() {
     createInitialComposerState(stateStore.state.composerDraft),
   );
   const [threadState, dispatchThread] = useReducer(threadViewReducer, INITIAL_THREAD_VIEW_STATE);
+  const [modelSelectorState, dispatchModelSelector] = useReducer(
+    modelSelectorReducer,
+    createInitialModelSelectorState(DEFAULT_THREAD_ID),
+  );
+  const modelSelectionRequestIdRef = useRef<string | undefined>(undefined);
   const snapshotThreadIdRef = useRef(DEFAULT_THREAD_ID);
   const protocolClient = useMemo(
     () =>
@@ -42,6 +52,11 @@ function App() {
         onMessage: (message) => {
           if (message.type === "thread-snapshot") {
             snapshotThreadIdRef.current = message.payload.threadId;
+            dispatchModelSelector({
+              type: "thread-changed",
+              threadId: message.payload.threadId,
+              threadRevision: message.payload.revision,
+            });
             dispatchThread({
               type: "replace-snapshot",
               revision: message.payload.revision,
@@ -69,7 +84,24 @@ function App() {
                 state: message.payload.state,
               });
             }
+          } else if (message.type === "model-list") {
+            dispatchModelSelector({
+              type: "model-list",
+              threadId: message.payload.threadId,
+              threadRevision: message.payload.threadRevision,
+              models: message.payload.models,
+              ...(message.payload.selectedModelId
+                ? { selectedModelId: message.payload.selectedModelId }
+                : {}),
+            });
           } else if (message.type === "error") {
+            if (message.correlationId === modelSelectionRequestIdRef.current) {
+              dispatchModelSelector({
+                type: "selection-error",
+                requestId: message.correlationId,
+                message: getModelSelectorErrorMessage(message.payload.code),
+              });
+            }
             dispatchComposer({
               type: "error",
               message: getComposerErrorMessage(message.payload.code),
@@ -131,6 +163,14 @@ function App() {
       return;
     }
 
+    if (modelSelectorState.selectedModelId === undefined) {
+      dispatchModelSelector({
+        type: "selection-error",
+        message: "モデルを選択してから送信してください。",
+      });
+      return;
+    }
+
     try {
       const messageId = protocolClient.send("send-message", {
         threadId: snapshotThreadIdRef.current,
@@ -145,6 +185,31 @@ function App() {
       dispatchComposer({
         type: "error",
         message: "メッセージを送信できませんでした。もう一度お試しください。",
+      });
+    }
+  };
+
+  const handleModelSelect = (modelId: string): void => {
+    if (
+      modelSelectorState.threadId === undefined ||
+      modelSelectorState.threadRevision === undefined ||
+      (modelSelectorState.phase !== "ready" && modelSelectorState.phase !== "error")
+    ) {
+      return;
+    }
+
+    try {
+      const requestId = protocolClient.send("select-model", {
+        threadId: modelSelectorState.threadId,
+        modelId,
+        expectedThreadRevision: modelSelectorState.threadRevision,
+      });
+      modelSelectionRequestIdRef.current = requestId;
+      dispatchModelSelector({ type: "selection-requested", modelId, requestId });
+    } catch {
+      dispatchModelSelector({
+        type: "selection-error",
+        message: "モデルの変更要求を送信できませんでした。",
       });
     }
   };
@@ -181,10 +246,13 @@ function App() {
 
       <Composer
         state={composerState}
+        modelSelectorState={modelSelectorState}
         onDraftChange={handleComposerDraftChange}
         onSubmit={handleComposerSubmit}
         onStop={handleComposerStop}
+        onModelSelect={handleModelSelect}
       />
+
       <p class="hint">BYOK設定は後続の設定画面で追加できます。</p>
     </main>
   );

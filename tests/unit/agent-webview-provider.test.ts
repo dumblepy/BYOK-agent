@@ -12,6 +12,8 @@ const vscodeMock = vi.hoisted(() => ({
 vi.mock("vscode", () => vscodeMock);
 
 import { AgentWebviewProvider } from "../../src/ui/agent-webview-provider";
+import { StaticModelCatalog } from "../../src/models/model-catalog";
+import { FileThreadModelStore } from "../../src/storage/thread-model-store";
 import { createUiToExtensionMessage } from "../../src/ui/webview-protocol";
 
 function createWebviewView() {
@@ -138,6 +140,124 @@ describe("AgentWebviewProvider", () => {
             text: "複数行\nの依頼",
           },
         },
+      }),
+    );
+  });
+
+  it("lists models, persists a thread selection, and rejects stale selections", async () => {
+    const store = new FileThreadModelStore();
+    const prepareAgentRunRequest = vi.fn((request) => request);
+    const provider = new AgentWebviewProvider(
+      {
+        extensionUri: { path: "/extension" },
+      } as never,
+      {
+        modelCatalog: new StaticModelCatalog([
+          { id: "coding-primary", label: "Coding Primary", provider: "primary" },
+          { id: "coding-fast", label: "Coding Fast", provider: "primary" },
+        ]),
+        threadModelStore: store,
+        prepareAgentRunRequest,
+      },
+    );
+    const view = createWebviewView();
+    provider.resolveWebviewView(view as never);
+
+    const ready = createUiToExtensionMessage("ui-ready", {
+      clientInstanceId: "00000000-0000-4000-8000-000000000001",
+      supportedProtocolVersions: ["1.0"],
+    });
+    view.emit(ready);
+    await flush();
+
+    const initialList = view.sent.findLast(
+      (message) => (message as { type?: string }).type === "model-list",
+    ) as { payload: { threadRevision: number; selectedModelId?: string } };
+    expect(initialList.payload).toMatchObject({
+      threadRevision: 1,
+      selectedModelId: "coding-fast",
+    });
+
+    const selection = createUiToExtensionMessage("select-model", {
+      threadId: "default",
+      modelId: "coding-primary",
+      expectedThreadRevision: initialList.payload.threadRevision,
+    });
+    view.emit(selection);
+    await flush();
+
+    const updatedList = view.sent.findLast(
+      (message) => (message as { type?: string }).type === "model-list",
+    ) as { payload: { threadRevision: number; selectedModelId?: string } };
+    expect(updatedList.payload).toMatchObject({
+      threadRevision: 2,
+      selectedModelId: "coding-primary",
+    });
+    expect(await store.getThreadModelState("default")).toMatchObject({
+      modelId: "coding-primary",
+      revision: 2,
+    });
+
+    const nextMessage = createUiToExtensionMessage("send-message", {
+      threadId: "default",
+      text: "選択モデルで実行してください",
+    });
+    view.emit(nextMessage);
+    await flush();
+    expect(prepareAgentRunRequest).toHaveBeenCalledWith({
+      threadId: "default",
+      text: "選択モデルで実行してください",
+      modelId: "coding-primary",
+    });
+
+    const staleSelection = createUiToExtensionMessage("select-model", {
+      threadId: "default",
+      modelId: "coding-fast",
+      expectedThreadRevision: 1,
+    });
+    view.emit(staleSelection);
+    await flush();
+    expect(view.sent).toContainEqual(
+      expect.objectContaining({
+        type: "error",
+        correlationId: staleSelection.messageId,
+        payload: expect.objectContaining({ code: "MODEL_SELECTION_CONFLICT" }),
+      }),
+    );
+  });
+
+  it("rejects model changes while a thread run is active", async () => {
+    const provider = new AgentWebviewProvider({ extensionUri: { path: "/extension" } } as never, {
+      modelCatalog: new StaticModelCatalog([
+        { id: "coding-primary", label: "Coding Primary", provider: "primary" },
+        { id: "coding-fast", label: "Coding Fast", provider: "primary" },
+      ]),
+      threadModelStore: new FileThreadModelStore(),
+      isThreadRunActive: () => true,
+    });
+    const view = createWebviewView();
+    provider.resolveWebviewView(view as never);
+    view.emit(
+      createUiToExtensionMessage("ui-ready", {
+        clientInstanceId: "00000000-0000-4000-8000-000000000002",
+        supportedProtocolVersions: ["1.0"],
+      }),
+    );
+    await flush();
+
+    const selection = createUiToExtensionMessage("select-model", {
+      threadId: "default",
+      modelId: "coding-primary",
+      expectedThreadRevision: 1,
+    });
+    view.emit(selection);
+    await flush();
+
+    expect(view.sent).toContainEqual(
+      expect.objectContaining({
+        type: "error",
+        correlationId: selection.messageId,
+        payload: expect.objectContaining({ code: "MODEL_SELECTION_BUSY" }),
       }),
     );
   });

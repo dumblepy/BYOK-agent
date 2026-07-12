@@ -1,111 +1,114 @@
 ---
-description: 6-ui-webviewのcontent-security-policyを実装するブランチでメッセージ入力Composerを実装するときに読み込む
+description: 6-ui-webviewのcontent-security-policyを実装するブランチでモデル選択UIを設計するときに読み込む
 alwaysApply: false
 ---
-# メッセージ入力Composer
+# モデル選択UI
 
-このブランチでは、既存のPreact Webview UIに、複数行のユーザーメッセージを入力し、検証済みの通信メッセージとしてExtension Hostへ送信できるComposerを実装する。対象は入力欄、下書き復元、送信・停止操作、入力中／送信中／実行中／停止中／失敗状態、キーボード操作、状態表示、関連テストである。実装は`documents/design.md` §14.2.2の設計と既存の§14.3、§14.4の通信・状態契約に従う。
+このブランチでは、既存のAgent Sidebar Webviewに、現在のスレッドで利用するモデルを確認・変更するUIとHost側の選択保存境界を実装する。Model Configuration LoaderとAgent Runtimeは未実装のため、差し替え可能なModel Catalog境界と、次回送信時のモデル解決までを対象とする。
 
 ## 実装方針
 
-- Webviewは入力と操作の投影だけを担当し、会話の正本、Agent Runtime、Provider、Storage、権限判定はExtension Host側に置く。
-- Composerは`WebviewProtocolClient`を介して既存の`send-message`と`cancel-run`を使う。コンポーネントからWebview API、`postMessage`、`unknown`値を直接扱わない。
-- 下書きは既存の`AgentWebviewStateV1`の`composerDraft`だけに保存する。APIキー、Thread、Run、送信履歴、ファイル内容、内部エラーをWebview状態へ保存しない。
-- 入力はCRLF／CRをLFへ正規化し、100,000文字上限と空白のみ判定をUI・Hostの両方で行う。送信時に本文の前後の空白や改行を勝手に削除しない。
-- `inputting`は送信可能な下書きがある状態、`submitting`は送信後のHost通知待ち、`running`と`stopping`はHostの検証済み状態通知に基づく状態とする。UIがAgent実行を推測してはならない。
-- MVPは同時送信を許可せず、送信要求の重複を防ぐ。停止は有効な`runId`に対する`cancel-run`を一度だけ送り、Webview破棄だけではキャンセルしない。
-- Enterは送信、Shift+EnterとAlt+Enterは改行、Ctrl+Enter／Cmd+Enterは送信とする。IME変換中は送信せず、Ctrl/Cmd+Shift+Enterなど未定義の組み合わせは通常の改行動作へ委譲する。
-- 送信ボタンと停止ボタンはVS Code標準テーマトークンとCodiconまたは明確なテキストを使い、`aria-label`、`aria-describedby`、`aria-live`、フォーカス表示を提供する。独自画像や製品固有の外観は使わない。
-- Webview通信の受信値は既存のZodスキーマで検証してから状態更新へ渡す。ユーザー本文をHTML、CSS、URL、スクリプト、ログ、例外文へ反射しない。
+- Webviewは、Hostから受け取った`ModelSummary`の一覧を表示し、選択要求を送る投影層に限定する。Model Catalog、モデル設定、SecretStorage、Provider通信、Thread StoreはExtension Host側に置く。
+- モデル一覧は、設定優先順位を解決し、ProviderとSecretStorageの利用条件を満たす利用可能なモデルだけをHost側で列挙する。APIキー、認証ヘッダー、Provider URL、内部設定をWebviewへ渡さない。
+- `select-model`は必ず`threadId`、`modelId`、`expectedThreadRevision`を持ち、Host側で現在のWebviewセッション、スレッド、モデルの利用可能性、revision、Run状態を再検証する。
+- 選択成功後にThread Storeの`meta.json.modelId`を原子的に更新し、Hostが更新済み`model-list`を返す。確定通知前の楽観的な表示変更は行わず、失敗時は以前の確定状態を維持する。
+- `send-message`にはモデルIDを追加しない。Hostがスレッドの最新メタデータからモデルを解決し、次回リクエストの`AgentRunRequest`へ渡すことで、選択結果の反映を保証する。
+- 実行中はUIとHostの両方でモデル変更を拒否し、現在のRunが使用するモデルと次回リクエストのモデルを混在させない。
+- Webview通信は既存のバージョン付きEnvelopeとZod検証、messageId重複排除、correlationIdを再利用する。不正な値、未知のモデル、古いrevision、異なるスレッドの一覧は適用しない。
+- UIはネイティブ`select`または同等のキーボード操作可能な単一選択UIを使い、VS Code標準テーマトークンとCodiconだけで状態を表現する。状態を色だけで区別せず、ラベルとアクセシビリティ通知を付ける。
+- Webview状態や`localStorage`へモデル選択を保存しない。永続化の正本は`globalStorage/threads/<thread-id>/meta.json`とし、秘密情報やProvider応答を保存しない。
 
-## 実装対象
+## 実装対象（次の実装フェーズ）
 
-- `src/ui/webview/components/Composer.tsx`
-- `src/ui/webview/composer-state.ts`
+- `src/ui/webview/components/ModelSelector.tsx`
+- `src/ui/webview/model-selector-state.ts`
 - `src/ui/main.tsx`
 - `src/ui/styles.css`
-- 必要最小限の`src/ui/extension-webview-protocol.ts`およびUIサービス境界のHost側ルーティング
-- `tests/unit/`の入力正規化、キー操作、状態遷移、下書き復元、通信呼び出しテスト
+- `src/ui/webview-protocol.ts`
+- Extension HostのUIルーティング、Model Catalog、Thread Store境界
+- `tests/unit/`、`tests/extension-integration/`のモデル選択・通信・永続化テスト
 
 ## 状態と操作契約
 
-| 状態 | 条件 | UI操作 |
-|---|---|---|
-| `idle` | 下書きが空で実行なし | 入力可、送信不可、停止非表示 |
-| `inputting` | 下書きに非空白文字あり | 入力可、送信可、停止非表示 |
-| `submitting` | `send-message`送信済み | 入力・送信不可、受付状態表示 |
-| `running` | Hostが実行中と通知 | 入力・送信不可、停止可 |
-| `stopping` | `cancel-run`送信済み | 入力・送信・停止不可、停止中表示 |
-| `error` | 操作失敗または実行失敗 | 再試行可、実行中なら停止可 |
+```ts
+type ModelSelectorPhase = "loading" | "ready" | "selecting" | "error";
 
-- `send-message`のEnvelope `messageId`を重複排除キーとして扱い、Enterとボタンは同じ送信処理を使う。
-- `cancel-run`は現在の`activeRunId`に対してのみ発行し、停止完了または終了エラーまで`stopping`を維持する。
-- 送信失敗時は、ユーザーが新しい入力を開始していない場合に限り、保留本文を下書きへ復元する。
-- Host側はThread、client session、Run、権限を再確認し、Composerは受付成功を推測せず相関した状態通知またはエラーで更新する。
+interface ModelSelectorState {
+  phase: ModelSelectorPhase;
+  threadId?: string;
+  threadRevision?: number;
+  models: readonly ModelSummary[];
+  selectedModelId?: string;
+  pendingModelId?: string;
+  errorMessage?: string;
+}
+```
+
+- `loading`: `model-list`待ち。選択UIは操作不可。
+- `ready`: 利用可能モデル一覧と現在のモデルを表示する。
+- `selecting`: 選択要求を一度だけ送信し、確定通知まで操作を無効化する。
+- `error`: 前回の確定モデルを維持し、安全なエラー文を表示して再試行可能にする。
+- モデル一覧が空、または`selectedModelId`がない場合は空状態を表示し、Composerの送信はHost側でも拒否する。
+- 現在表示中の`threadId`と異なる`model-list`、古い`threadRevision`、一覧に存在しない`selectedModelId`はReducerへ適用しない。
+- 選択確定後の次の`send-message`は、HostがThread Storeの`meta.json.modelId`を読み取ってモデルを解決する。WebviewはモデルIDを送信要求へ追加しない。
 
 ## 進捗
 
-- [x] `AGENTS.md`、`project.mdc`、`branch.mdc`、現在のブランチルール、UI・通信・状態設計を確認する
-- [x] `documents/design.md` §14.2.2へComposerの実装方針と詳細設計を記録する
-- [x] Enter、修飾キー、入力値上限、送信・停止状態、下書き保存の契約を定義する
-- [x] Composerの状態ロジックと入力正規化を実装する
-- [x] Composerコンポーネントと既存Appへ接続する
-- [x] `send-message`／`cancel-run`とHost側ルーティングを接続する
-- [x] テーマ、アクセシビリティ、入力中・送信中・実行中・停止中・失敗表示を実装する
-- [x] 単体、コンポーネント、通信、Extension Integrationテストを追加する
-- [ ] 実際のAgent RuntimeとComposerの実行状態を接続する（別Issue）
-- [ ] 型チェック、Lint、フォーマット、テスト、Webviewセキュリティ検査を実行する
+- [x] `AGENTS.md`、`project.mdc`、`branch.mdc`、既存のブランチルール、モデル・UI・通信設計を確認する
+- [x] `documents/design.md`へモデル選択UIの実装方針と詳細設計を記録する
+- [x] スレッド単位の選択、revision競合、永続化、次回リクエストへの反映契約を定義する
+- [x] モデル選択UIと状態Reducerを実装する
+- [x] `select-model`／`model-list`の通信スキーマとHostルーティングを実装する
+- [x] Thread Store、Model Catalog、`AgentRunRequest`準備境界、次回送信時のモデル解決を実装する
+- [x] UI、通信、競合、永続化、次回リクエスト反映のテストを追加する
+- [x] 型チェック、Lint、フォーマット、テスト、Webviewセキュリティ検査を実行する
 
 ## 完了条件
 
-1. 空白だけの入力は送信されず、複数行本文を保持したユーザーメッセージがUIからHostへ一度だけ送信される。
-2. 送信ボタン、Enter、Shift+Enter、Ctrl/Cmd+Enter、Alt+Enter、IME変換中の挙動が設計どおりに動く。
-3. `idle`、`inputting`、`submitting`、`running`、`stopping`、`error`を状態とラベルで識別できる。
-4. 実行中は有効なRunだけを停止でき、二重停止や古いRunへの停止要求を発行しない。
-5. Webview再生成時に有効な未送信下書きだけが復元され、秘密情報やThread／Run情報が保存されない。
-6. 受信検証、サイズ制限、重複排除、相関IDを経由した安全な通信がテストされる。
-7. Light、Dark、High Contrastで操作対象、フォーカス、無効状態、エラーを識別できる。
+1. 利用可能なモデル一覧と、現在のスレッドに確定しているモデルを表示できる。
+2. UIから選択したモデルが、対象スレッドの`meta.json.modelId`へ安全に保存される。
+3. 選択確定後の次回`send-message`が、Hostのスレッド正本から選択モデルを解決して実行する。
+4. 未知モデル、異なるスレッド、古いrevision、実行中の変更、重複要求が保存やRunへ影響しない。
+5. Webviewへ秘密情報や不要なProvider設定が渡らず、Light、Dark、High Contrastで操作状態を識別できる。
 
 ## 対象外
 
-- ThreadView、Markdown、Tool Activity、ChangeSet、Approvalの再設計
-- ファイル・選択範囲・診断・画像添付、`/`コマンド、`@`検索
-- Provider Adapter、Agent Runtime、AgentLoop、会話永続化、会話タイトル生成
-- モデル選択、権限選択、CSP、nonce、`localResourceRoots`の新規設計
-- APIキー、Authorizationヘッダー、環境変数、ファイル内容、非公開推論内容のWebview表示
+- Model Configuration Loader、Agent Runtimeの実行ループ、Provider呼び出し
+- モデル設定JSON Schema、Model Catalog、Model Configuration Loaderそのものの実装
+- Provider Adapter、Agent Runtime、AgentLoop、Prompt、Context、Toolの実装
+- Threadの作成・一覧・切り替えUIの新規設計（現在のスレッドIDを受け取る境界だけ定義する）
+- 権限プロファイル選択、Composer、ThreadView、CSPの再設計
+- APIキー、認証ヘッダー、環境変数、ファイル内容、非公開推論内容のWebview表示
 - `git add`、`git commit`、既存の未コミット変更の整理・上書き
 
-## 検証方針
+## 検証方針（実装フェーズ）
 
-- 純粋ロジックで、改行正規化、空白判定、上限境界、各Enter操作、IME、状態遷移、二重送信抑止を検証する。
-- コンポーネントテストで、複数行入力、送信・停止ボタン、入力中・送信中・実行中・停止中・失敗状態、アクセシブルなラベルを検証する。
-- Webview状態テストで、初期化時一度だけの復元、入力ごとの最小状態保存、不正状態の破棄を検証する。
-- 通信テストで、`send-message`／`cancel-run`のEnvelope、相関ID、Host受信検証、重複メッセージの無視を検証する。
-- 実装後に`pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、`pnpm check:webview-security`を実行する。実APIテストは明示的な環境変数がある場合だけ許可する。
+- 状態テストで、一覧受信、現在モデル表示、空一覧、選択中の二重操作抑止、成功、失敗、再試行、古い通知の無視を検証する。
+- 通信テストで、Envelope、`threadId`、`expectedThreadRevision`、`correlationId`、受信検証、messageId重複排除を検証する。
+- Hostテストで、モデルの利用可能性、スレッド境界、revision競合、Run中拒否、原子的なメタデータ更新を検証する。
+- Agent連携テストで、選択確定後の次回`send-message`がThread Storeのモデルを使い、実行中Runのモデルを変更しないことを検証する。
+- 実APIテストは追加せず、明示的な環境変数がある場合だけ既存方針に従って実行する。
 
 ## 参考資料
 
 - `AGENTS.md`
 - `.cursor/rules/project.mdc`
 - `.cursor/rules/branch.mdc`
-- `documents/design.md` §14.1、§14.2、§14.2.2、§14.3、§14.4、§16、§19
-- `documents/issues.md`のMilestone 1「メッセージ入力Composer」
-- `src/ui/main.tsx`
+- `documents/design.md` §5、§14.1、§14.2、§14.2.3、§14.3、§15、§17
+- `documents/issues.md`のMilestone 1「モデル選択UI」およびMilestone 2「モデル設定・Thread Store」
 - `src/ui/webview-protocol.ts`
 - `src/ui/webview-protocol-client.ts`
 - `src/ui/extension-webview-protocol.ts`
-- `src/ui/webview-state.ts`
-- `src/ui/styles.css`
+- `src/ui/main.tsx`
+- `src/storage/storage-service.ts`
+- `src/agent/agent-service.ts`
 
 ## 調査結果・設計まとめ
 
-- 既存の`main.tsx`には下書き復元済みのtextareaと無効化された送信ボタンがあるため、Composerはこの責務を独立コンポーネントへ切り出し、既存の`WebviewProtocolClient`へ接続する。
-- `webview-protocol.ts`には`send-message`、`cancel-run`、`run-state`、`error`の判別共用体とZod検証が既にある。新規の搬送路や手書きの受信型は追加せず、必要な不足だけを最小変更する。
-- `extension-webview-protocol.ts`は現在`ui-ready`とスナップショットを処理し、一般操作のHandlerは未接続である。Composerの完了条件には、既存の検証境界を保ったHost側ルーティングの接続を含めるが、Agent実行の実装は別Issueとする。
-- `webview-state.ts`は`composerDraft`を上限付きで保存できる。Composerの状態追加では既存の`version: 1`契約を維持し、実行状態や秘密情報を拡張しない。
-- `ThreadView`は会話表示のみを担当するため、ComposerからThreadViewのReducerやメッセージ正本へ直接依存しない。送信後の表示はHostからのスナップショット／イベントで更新する。
-- `SYW-ARCH-001`、`SYW-ARCH-002`、`SYW-UI-001`、`SYW-UI-003`、`SYW-SEC-001`、`SYW-SEC-004`を、Host境界、Webview安全性、テーマ、通信検証、ログの判断基準とする。
-- Composer状態ロジック、複数行入力、Enter操作、下書き同期、アクセシブルな送信・停止表示を実装した。
-- `WebviewProtocolClient`は送信した`messageId`を返し、Host側は検証済み`send-message`を相関付き`thread-event(user-message)`としてWebviewへ返す。Agent Runtime接続前のMVP受付経路として実装している。
-- Extension Hostのキャンセル処理はAgent Runtimeの接続点を残した検証済みルーティングまでとし、実際のAgent実行・停止完了イベントは別Issueとする。
-- Composer状態、描画、通信、Hostルーティングのテストを追加し、型チェック、Lint、フォーマット、全テスト、Webviewセキュリティ検査が成功している。
+- 既存の`webview-protocol.ts`には`select-model`と`model-list`の骨格があるが、スレッドIDとrevisionが不足している。設計上は対象スレッドと楽観的競合検査を明示する。
+- 既存の`model-list`はHostからUIへ送られるが、実装前は空の一覧を返すだけだったため、Model CatalogとThread StoreをHost側へ接続した。設定ファイルの読み込みはModel Configuration Loaderの責務として残している。
+- `documents/design.md`の`ThreadMetadata`には既に`modelId`があり、選択結果の正本はWebview状態ではなくスレッドの`meta.json`に置く。
+- `send-message`は現在`threadId`と本文だけを持つ。モデルIDを追加せず、Hostが送信時点のスレッドメタデータから解決することで、選択結果が次回リクエストへ反映される。
+- `ModelSummary`は`id`、`label`、`provider`に限定し、SecretStorageの内容、APIキー、URL、Providerの内部設定をWebviewへ漏らさない。
+- `Thread Store`の更新成功後に`model-list`を返すため、UI表示と永続化の確定タイミングを一致させる。revision競合時は上書きせず、最新状態を再取得する。
+- Agent Runtimeはまだ実行処理を持たないため、Hostは次回`send-message`の前にスレッド正本のモデルを検証・解決し、`AgentService.prepareRunRequest`へ`modelId`を渡してからユーザーメッセージイベントを受け付ける。Provider呼び出しと実行ループへの接続はAgent Runtime実装時に行う。

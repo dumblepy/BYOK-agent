@@ -10,15 +10,26 @@ import {
   type ComposerState,
 } from "../composer-state";
 import { MAX_COMPOSER_DRAFT_LENGTH } from "../../webview-state";
+import type { ModelSelectorState } from "../model-selector-state";
+import { ModelSelectorInline } from "./ModelSelectorInline";
 
 export interface ComposerProps {
   readonly state: ComposerState;
+  readonly modelSelectorState: ModelSelectorState;
   readonly onDraftChange: (draft: string) => void;
   readonly onSubmit: () => void;
   readonly onStop: () => void;
+  readonly onModelSelect: (modelId: string) => void;
 }
 
-export function Composer({ state, onDraftChange, onSubmit, onStop }: ComposerProps) {
+export function Composer({
+  state,
+  modelSelectorState,
+  onDraftChange,
+  onSubmit,
+  onStop,
+  onModelSelect,
+}: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isBusy = isComposerBusy(state.phase);
   const canSubmit = !isBusy && isComposerDraftSubmittable(state.draft);
@@ -50,51 +61,74 @@ export function Composer({ state, onDraftChange, onSubmit, onStop }: ComposerPro
 
   return (
     <section class="composer" aria-label="メッセージ入力">
-      <label class="composer-label" htmlFor="prompt">
-        依頼
-      </label>
       <textarea
         ref={textareaRef}
         id="prompt"
         class="composer-input"
         rows={4}
         maxLength={MAX_COMPOSER_DRAFT_LENGTH}
-        placeholder="何を作りたいですか？"
+        placeholder="何でもできます"
         value={state.draft}
         disabled={isBusy}
-        aria-describedby="composer-hint composer-status composer-error"
+        aria-describedby="composer-status composer-error"
         aria-busy={isBusy}
         onInput={handleInput}
         onKeyDown={handleKeyDown}
       />
-      <div class="composer-footer">
-        <p id="composer-hint" class="hint">
-          Enterで送信、Shift+Enterで改行
-        </p>
-        <span class="composer-count" aria-label={`入力文字数 ${state.draft.length}文字`}>
-          {state.draft.length.toLocaleString()} / {MAX_COMPOSER_DRAFT_LENGTH.toLocaleString()}
-        </span>
-      </div>
-      <div class="composer-actions">
-        {state.phase === "running" ? (
+      <div class="composer-toolbar">
+        <div class="composer-toolbar-left">
           <button
             type="button"
-            class="composer-button composer-stop-button"
-            aria-label="エージェントを停止"
-            onClick={onStop}
+            class="composer-toolbar-button"
+            aria-label="添付ファイルを追加"
           >
-            停止
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M8 3V13M3 8H13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+            </svg>
           </button>
-        ) : null}
-        <button
-          type="button"
-          class="composer-button composer-send-button"
-          disabled={!canSubmit}
-          aria-label="メッセージを送信"
-          onClick={onSubmit}
-        >
-          {state.phase === "submitting" ? "送信中…" : "送信"}
-        </button>
+          <button
+            type="button"
+            class="composer-toolbar-button composer-toolbar-mode-button"
+            aria-label="アクセスモードを選択"
+          >
+            <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+              <circle cx="7" cy="7" r="5.5" stroke="currentColor" strokeWidth="1.2" />
+              <path d="M7 4V7L9 8.5" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" />
+            </svg>
+            <span>フルアクセス</span>
+            <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
+              <path d="M2.5 4L5 6.5L7.5 4" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        </div>
+        <div class="composer-toolbar-right">
+          <ModelSelectorInline
+            state={modelSelectorState}
+            disabled={isBusy}
+            onSelect={onModelSelect}
+          />
+          {state.phase === "running" ? (
+            <button
+              type="button"
+              class="composer-toolbar-button composer-stop-button"
+              aria-label="エージェントを停止"
+              onClick={onStop}
+            >
+              停止
+            </button>
+          ) : null}
+          <button
+            type="button"
+            class="composer-toolbar-button composer-send-button"
+            disabled={!canSubmit}
+            aria-label="メッセージを送信"
+            onClick={onSubmit}
+          >
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+              <path d="M8 13V3M8 3L4 7M8 3L12 7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        </div>
       </div>
       <p id="composer-status" class="composer-status" aria-live="polite">
         {statusLabel}

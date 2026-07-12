@@ -4,6 +4,9 @@ import { describe, expect, it, vi } from "vitest";
 
 import { Composer } from "../../src/ui/webview/components/Composer";
 import { createInitialComposerState, composerReducer } from "../../src/ui/webview/composer-state";
+import { INITIAL_MODEL_SELECTOR_STATE } from "../../src/ui/webview/model-selector-state";
+
+const defaultModelSelectorState = INITIAL_MODEL_SELECTOR_STATE;
 
 describe("Composer", () => {
   it("renders a multiline input, character count, and send affordance", () => {
@@ -11,18 +14,18 @@ describe("Composer", () => {
     const html = renderToString(
       h(Composer, {
         state,
+        modelSelectorState: defaultModelSelectorState,
         onDraftChange: vi.fn(),
         onSubmit: vi.fn(),
         onStop: vi.fn(),
+        onModelSelect: vi.fn(),
       }),
     );
 
     expect(html).toContain('aria-label="メッセージ入力"');
     expect(html).toContain('rows="4"');
     expect(html).toContain("調査してください");
-    expect(html).toContain("/ 100,000");
     expect(html).toContain("メッセージを送信");
-    expect(html).toContain("Enterで送信、Shift+Enterで改行");
   });
 
   it("renders the running and stopping controls accessibly", () => {
@@ -41,9 +44,11 @@ describe("Composer", () => {
     const html = renderToString(
       h(Composer, {
         state,
+        modelSelectorState: defaultModelSelectorState,
         onDraftChange: vi.fn(),
         onSubmit: vi.fn(),
         onStop: vi.fn(),
+        onModelSelect: vi.fn(),
       }),
     );
 
@@ -62,9 +67,11 @@ describe("Composer", () => {
     const html = renderToString(
       h(Composer, {
         state,
+        modelSelectorState: defaultModelSelectorState,
         onDraftChange: vi.fn(),
         onSubmit: vi.fn(),
         onStop: vi.fn(),
+        onModelSelect: vi.fn(),
       }),
     );
 

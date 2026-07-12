@@ -5,6 +5,7 @@ import {
   parseExtensionToUiMessage,
   parseUiToExtensionMessage,
   type ExtensionToUiMessage,
+  type ModelListPayload,
   type ThreadEvent,
   type UiToExtensionMessage,
 } from "./webview-protocol";
@@ -16,6 +17,7 @@ export interface WebviewMessagePort {
 
 export interface ExtensionWebviewProtocolHandlers {
   readonly onMessage?: (message: UiToExtensionMessage) => void | Promise<void>;
+  readonly getModelList?: (threadId: string) => ModelListPayload | Promise<ModelListPayload>;
 }
 
 const MAX_SEEN_MESSAGE_IDS = 2_048;
@@ -149,13 +151,6 @@ export class ExtensionWebviewProtocolSession {
     await this.sendThreadSnapshot("default", message.messageId);
     await this.sendToUi(
       createExtensionToUiMessage(
-        "model-list",
-        { models: [] },
-        { correlationId: message.messageId },
-      ),
-    );
-    await this.sendToUi(
-      createExtensionToUiMessage(
         "permission-updated",
         { profile: "read-only" },
         { correlationId: message.messageId },
@@ -176,6 +171,18 @@ export class ExtensionWebviewProtocolSession {
         },
         { correlationId },
       ),
+    );
+    await this.sendModelList(threadId, correlationId);
+  }
+
+  public async sendModelList(threadId: string, correlationId?: string): Promise<void> {
+    const payload = (await this.handlers.getModelList?.(threadId)) ?? {
+      threadId,
+      threadRevision: 0,
+      models: [],
+    };
+    await this.sendToUi(
+      createExtensionToUiMessage("model-list", payload, correlationId ? { correlationId } : {}),
     );
   }
 

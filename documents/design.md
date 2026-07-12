@@ -1552,6 +1552,133 @@ Host側では、受信メッセージをZodスキーマで検証し、現在のT
 
 完了条件は、空白だけの入力を送信せず、複数行本文を保持したユーザーメッセージをComposerから検証済み`send-message`としてHostへ一度だけ送信できること、実行中に停止要求を検証済み`cancel-run`として一度だけ送信できること、入力中・送信中・実行中・停止中・失敗時の状態がユーザーと支援技術へ明確に伝わることとする。Composer以外のThreadView、Provider、AgentLoop、Storage、添付機能の完了を本Issueの条件に含めない。
 
+### 14.2.3 モデル選択UI詳細設計
+
+モデル選択UIは、現在表示しているスレッドに紐づくモデルを確認・変更するWebview専用のUIとする。モデル一覧の正本、モデル設定の解決、利用可能性の判定、スレッドメタデータの更新、次回リクエストへの適用はExtension Hostが担当する。WebviewはHostから受け取った検証済みの要約を表示し、選択要求を送るだけにする。
+
+#### 目的と責務境界
+
+モデル選択UIの責務は次のとおりとする。
+
+* Hostから受け取った利用可能なモデル一覧を表示する
+* 現在のスレッドの`selectedModelId`を表示する
+* モデルの表示名とProvider名を区別して表示する
+* 選択中、成功、失敗、利用可能なモデルがない状態を表示する
+* 選択要求を現在の`threadId`と既知のスレッドrevision付きでHostへ送る
+* Hostからの確定通知を受けて表示を更新する
+
+次の責務はWebviewへ持たせない。
+
+* JSONモデル設定、Provider URL、APIキー、SecretStorage、Provider接続の読み込み
+* モデル名からの能力推測や、モデルが利用可能かどうかの独自判定
+* `threadId`、選択済みモデル、スレッドrevisionの履歴からの推測
+* 選択モデルを`send-message`へ直接埋め込むこと
+* Webview状態、`localStorage`、URL、Cookieへのモデル設定の永続化
+
+#### モデル一覧の情報源と表示契約
+
+Extension HostはModel CatalogとModel Configuration Loaderで設定優先順位を解決し、構成が有効で、ProviderとSecretStorageの利用条件を満たし、Agent実行に利用できるモデルだけを`models`へ含める。APIキー本体、認証ヘッダー、外部URLの詳細、モデル能力の不要な内部設定はWebviewへ渡さない。モデル要約は次の最小情報とする。
+
+```ts
+interface ModelSummary {
+  id: string;
+  label: string;
+  provider: string;
+}
+
+interface ModelListState {
+  threadId: string;
+  threadRevision: number;
+  models: readonly ModelSummary[];
+  selectedModelId?: string;
+}
+```
+
+`models`の順序はHost側で決定的に並べる。既定では表示名、同名の場合はモデルIDの昇順とし、Webview側で並べ替えない。`selectedModelId`は現在のスレッドメタデータに保存されたモデルが利用可能な場合だけ設定し、常に`models`内のIDと一致させる。利用可能なモデルがない、または保存済みモデルが解決不能な場合は`selectedModelId`を省略し、UIは安全な空状態を表示して送信操作を許可しない。この状態でWebviewが任意のモデルIDを補ってはならない。
+
+モデル要約を受け取ったUIは、モデルIDを表示用ラベルとして扱わず、必ず`label`を表示する。ただし同じ`label`が複数ある場合は、識別可能性のためProvider名を併記する。Provider名は設定内の識別子であり、認証情報や接続先を意味しない。
+
+#### UI状態と表示
+
+モデル選択の状態はComposerの状態へ混在させず、`ModelSelectorState`として管理する。
+
+```ts
+type ModelSelectorPhase = "loading" | "ready" | "selecting" | "error";
+
+interface ModelSelectorState {
+  phase: ModelSelectorPhase;
+  threadId?: string;
+  threadRevision?: number;
+  models: readonly ModelSummary[];
+  selectedModelId?: string;
+  pendingModelId?: string;
+  errorMessage?: string;
+}
+```
+
+ヘッダーでは現在のモデル名を常時表示し、選択UIはネイティブ`select`または同等のキーボード操作可能な単一選択UIとする。選択肢にはモデル名を表示し、必要な場合だけProvider名を補助情報として表示する。`loading`ではプレースホルダー、`ready`では現在のモデルと選択肢、`selecting`では選択中のモデルと操作不能状態、`error`では以前に確定していたモデルを維持した上で安全なエラー文を表示する。選択確定前にUIだけを新しいモデルへ切り替えない。
+
+利用可能なモデルが空の場合は「利用可能なモデルがありません」と表示し、選択UIを無効化する。現在のモデルが未選択の場合は「モデル未選択」と表示する。固定色や独自画像を使わず、VS Code標準テーマトークンとCodiconを必要最小限使用する。現在のモデル、選択中、エラー、無効状態は色だけで区別せず、可視ラベルとアクセシブルな状態通知を併用する。
+
+#### スレッド単位の変更と適用タイミング
+
+モデル変更はスレッドメタデータの`modelId`を更新する操作であり、Webview全体の既定値やユーザー設定を書き換えない。Hostは選択要求を受信した時点で、次を順番に検証する。
+
+1. 通信Envelope、`threadId`、`modelId`、`expectedThreadRevision`を検証する。
+2. 現在のWebviewセッションと、操作対象スレッドが一致することを確認する。
+3. Model Catalog上に同じモデルIDが一つだけ存在し、利用可能なモデルであることを確認する。
+4. `expectedThreadRevision`が現在のスレッドrevisionと一致することを確認する。不一致なら保存せず、最新のモデル一覧を再送する。
+5. 実行中のRunがないことを確認し、Thread Storeの`meta.json`へ`modelId`を原子的に保存する。
+6. 保存成功後にrevisionを進め、更新後の`model-list`を要求の`messageId`に対応する`correlationId`付きでWebviewへ送る。
+
+選択要求が成功するまで、現在のモデル表示は変更しない。失敗時もスレッドの保存値を変更せず、Hostが返す安全なエラーを表示して最新状態を再取得する。実行中の変更はUIで無効化し、Host側でも拒否する。これにより、実行中のRunが使用するモデルと、次回リクエストに使用するモデルが混在しない。
+
+Composerの`send-message`にはモデルIDを含めない。Hostは送信要求の`threadId`から最新の`meta.json.modelId`を取得し、その時点で解決したModel Definitionを`AgentRunRequest`へ渡す。したがって、選択成功通知を受けた後の次の`send-message`だけでなく、UIが古い表示を持っていても、実際のリクエストはHostのスレッド正本に従う。保存済みモデルが解決できない場合はRunを開始せず、モデル選択を促す安全なエラーを返す。
+
+#### 通信契約
+
+既存のバージョン付きEnvelopeとZod検証を再利用し、モデル選択の要求と応答を次の形へ揃える。
+
+```ts
+type SelectModelPayload = {
+  threadId: string;
+  modelId: string;
+  expectedThreadRevision: number;
+};
+
+type ModelListPayload = {
+  threadId: string;
+  threadRevision: number;
+  models: readonly ModelSummary[];
+  selectedModelId?: string;
+};
+```
+
+`select-model`はUIからHostへの要求、`model-list`はHostからUIへの一覧・確定状態の通知とする。`model-list`は`ui-ready`後、スレッドスナップショットの復元後、スレッド切り替え後、モデル変更の成功または競合後に送信する。UIは現在表示中の`threadId`と異なる`model-list`を適用せず、スレッド切り替え処理へ委譲する。
+
+`model-list`は現在のモデルの確定通知を兼ねるため、モデル変更専用の楽観的なUIイベントは追加しない。要求の`messageId`は`correlationId`として使用し、重複した`select-model`は既存のHostセッションの重複排除規則で一度だけ処理する。`select-model`の検証失敗、モデル不在、revision競合、実行中拒否は、既存の`error`またはプロトコルエラーの安全な分類で返し、Providerの生レスポンスや設定内容を表示しない。
+
+#### 永続化とセキュリティ
+
+選択結果は`globalStorage/threads/<thread-id>/meta.json`の`modelId`へ保存する。保存対象はモデルID、更新時刻、revisionなどスレッドメタデータに必要な値だけとし、APIキー、Authorizationヘッダー、Provider応答、プロンプト、ファイル内容を保存しない。保存は現在値との競合検査後に原子的に行い、失敗時に部分的な`meta.json`を残さない。
+
+Webviewへ渡すのは`ModelSummary`とスレッド識別・revisionだけである。モデル選択UIはSecretStorage、ファイルシステム、Provider Adapter、Storage実装へ直接依存しない。受信値は通信境界で検証してから状態Reducerへ渡し、モデルラベルやエラー文をHTML、URL、ログ、スクリプトとして解釈しない。
+
+#### 実装単位と検証方針
+
+実装時は次の単位へ分割する。
+
+* `src/ui/webview/components/ModelSelector.tsx`: モデル名、Provider補助情報、選択UI、状態表示、アクセシビリティ
+* `src/ui/webview/model-selector-state.ts`: 一覧適用、選択要求、確定通知、競合・エラーの純粋な状態遷移
+* `src/ui/main.tsx`: 現在のスレッド状態とModel Selector、`WebviewProtocolClient`の接続
+* `src/ui/styles.css`: ヘッダー内のレイアウト、フォーカス、無効状態、Light/Dark/High Contrast対応
+* `src/ui/webview-protocol.ts`: `select-model`と`model-list`のスレッドID・revisionを含むスキーマ更新
+* Extension HostのUIルーティング、Model Catalog、Thread Store境界: 検証、利用可能性判定、原子的な保存、確定通知
+
+テストでは、モデル一覧の決定的表示、現在モデルの反映、空一覧、選択中の二重操作抑止、未知モデルの拒否、スレッドID不一致、revision競合、実行中拒否、保存成功後の確定通知、次の`send-message`でThread Storeのモデルが使われることを検証する。通信テストでは、Envelope、payload上限、相関ID、重複排除、古い`model-list`の無視を検証する。実APIを呼ぶテストは追加せず、明示的な環境変数がある場合だけ既存の実APIテスト方針に従う。
+
+完了条件は、利用可能なモデル一覧と現在のモデルを表示でき、現在のスレッドに対する選択を安全に保存でき、選択確定後の次回`send-message`がHostのスレッドメタデータから選択モデルを解決して`AgentService.prepareRunRequest`へ渡すこととする。Provider呼び出しと実行ループへの接続はAgent Runtimeの責務とする。
+
 ## 14.3 Webview通信
 
 Extension HostとWebviewの通信は、VS Code Webview APIの`postMessage`を搬送路とし、その上に本拡張専用のバージョン付きメッセージプロトコルを定義する。WebviewはUI状態の投影とユーザー操作を担当し、会話・Agent実行・権限・変更の正本はExtension Hostが保持する。
@@ -1606,7 +1733,9 @@ type UiToExtensionMessage =
       changeSetId: string;
     }>
   | MessageEnvelope<"select-model", {
+      threadId: string;
       modelId: string;
+      expectedThreadRevision: number;
     }>
   | MessageEnvelope<"set-permission", {
       profile: PermissionProfile;
@@ -1653,6 +1782,8 @@ type ExtensionToUiMessage =
       files: readonly ChangeFileSummary[];
     }>
   | MessageEnvelope<"model-list", {
+      threadId: string;
+      threadRevision: number;
       models: readonly ModelSummary[];
       selectedModelId?: string;
     }>
@@ -1896,6 +2027,7 @@ interface ThreadMetadata {
   title: string;
   workspaceId?: string;
   modelId: string;
+  revision: number;
   permissionProfile: PermissionProfile;
   createdAt: number;
   updatedAt: number;

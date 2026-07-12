@@ -1,8 +1,14 @@
 import type { Uri } from "vscode";
 
 import { DisposableStore, ManagedService } from "../extension/service-lifecycle";
+import {
+  FileThreadModelStore,
+  type ThreadModelState,
+  type ThreadModelStore,
+  type ThreadModelStoreFileSystem,
+} from "./thread-model-store";
 
-export interface StorageService extends ManagedService {
+export interface StorageService extends ManagedService, ThreadModelStore {
   readonly serviceName: "storage";
 }
 
@@ -15,9 +21,25 @@ export class DefaultStorageService extends ManagedService implements StorageServ
   public readonly serviceName = "storage" as const;
 
   private readonly disposables = new DisposableStore();
+  private readonly threadModelStore: ThreadModelStore;
 
   public constructor(private readonly dependencies: StorageServiceDependencies) {
     super();
+    this.threadModelStore = new FileThreadModelStore(
+      getThreadModelStoreFileSystem(dependencies.globalStorageUri),
+    );
+  }
+
+  public getThreadModelState(threadId: string): Promise<ThreadModelState> {
+    return this.threadModelStore.getThreadModelState(threadId);
+  }
+
+  public updateThreadModel(
+    threadId: string,
+    expectedRevision: number,
+    modelId: string,
+  ): Promise<ThreadModelState> {
+    return this.threadModelStore.updateThreadModel(threadId, expectedRevision, modelId);
   }
 
   protected override onInitialize(): void {
@@ -28,4 +50,9 @@ export class DefaultStorageService extends ManagedService implements StorageServ
   protected override onDispose(): Promise<void> {
     return this.disposables.dispose();
   }
+}
+
+function getThreadModelStoreFileSystem(globalStorageUri: Uri): ThreadModelStoreFileSystem {
+  const rootPath = (globalStorageUri as Uri & { readonly fsPath?: unknown }).fsPath;
+  return typeof rootPath === "string" ? { rootPath } : {};
 }

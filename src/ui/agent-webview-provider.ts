@@ -2,6 +2,12 @@ import { randomBytes } from "node:crypto";
 
 import * as vscode from "vscode";
 
+import type { AgentRunRequest } from "../agent/agent-service";
+import { type ModelCatalog } from "../models/model-catalog";
+import {
+  ThreadModelRevisionConflictError,
+  type ThreadModelStore,
+} from "../storage/thread-model-store";
 import { ExtensionWebviewProtocolSession } from "./extension-webview-protocol";
 import { createExtensionToUiMessage, type UiToExtensionMessage } from "./webview-protocol";
 
@@ -35,8 +41,32 @@ function createContentSecurityPolicy(webview: vscode.Webview, nonce: string): st
   ].join("; ");
 }
 
+export interface AgentWebviewProviderOptions {
+  readonly modelCatalog?: ModelCatalog;
+  readonly threadModelStore?: ThreadModelStore;
+  readonly isThreadRunActive?: (threadId: string) => boolean;
+  readonly prepareAgentRunRequest?: (
+    request: AgentRunRequest,
+  ) => Promise<AgentRunRequest> | AgentRunRequest;
+}
+
 export class AgentWebviewProvider implements vscode.WebviewViewProvider {
-  public constructor(private readonly context: vscode.ExtensionContext) {}
+  private readonly modelCatalog: ModelCatalog | undefined;
+  private readonly threadModelStore: ThreadModelStore | undefined;
+  private readonly isThreadRunActive: (threadId: string) => boolean;
+  private readonly prepareAgentRunRequest:
+    ((request: AgentRunRequest) => Promise<AgentRunRequest> | AgentRunRequest) | undefined;
+  private activeThreadId: string | undefined;
+
+  public constructor(
+    private readonly context: vscode.ExtensionContext,
+    options: AgentWebviewProviderOptions = {},
+  ) {
+    this.modelCatalog = options.modelCatalog;
+    this.threadModelStore = options.threadModelStore;
+    this.isThreadRunActive = options.isThreadRunActive ?? (() => false);
+    this.prepareAgentRunRequest = options.prepareAgentRunRequest;
+  }
 
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
     const webviewRoot = vscode.Uri.joinPath(this.context.extensionUri, ...WEBVIEW_ROOT);
@@ -48,6 +78,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.html = this.getHtml(webviewView.webview, webviewRoot);
 
     const protocolSession = new ExtensionWebviewProtocolSession(webviewView.webview, {
+      getModelList: (threadId) => this.getModelList(threadId),
       onMessage: async (message) => {
         await this.handleUiMessage(message, protocolSession);
       },
@@ -59,6 +90,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     message: UiToExtensionMessage,
     protocolSession: ExtensionWebviewProtocolSession,
   ): Promise<void> {
+    if (message.type === "select-model") {
+      await this.handleSelectModel(message, protocolSession);
+      return;
+    }
+
     if (message.type !== "send-message") {
       // Agent execution and cancellation are connected by the Agent Runtime task.
       return;
@@ -80,6 +116,35 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (this.modelCatalog && this.threadModelStore) {
+      const modelState = await this.getModelList(message.payload.threadId);
+      if (modelState.selectedModelId === undefined) {
+        await this.sendModelError(
+          protocolSession,
+          "MODEL_NOT_SELECTED",
+          "モデルを選択してから送信してください。",
+          message.messageId,
+        );
+        return;
+      }
+
+      try {
+        await this.prepareAgentRunRequest?.({
+          threadId: message.payload.threadId,
+          text,
+          modelId: modelState.selectedModelId,
+        });
+      } catch {
+        await this.sendModelError(
+          protocolSession,
+          "TOOL_EXECUTION_FAILED",
+          "モデルへのリクエストを準備できませんでした。再試行してください。",
+          message.messageId,
+        );
+        return;
+      }
+    }
+
     await protocolSession.sendThreadEvent(
       message.payload.threadId,
       {
@@ -88,6 +153,126 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         text,
       },
       message.messageId,
+    );
+  }
+
+  private async handleSelectModel(
+    message: Extract<UiToExtensionMessage, { type: "select-model" }>,
+    protocolSession: ExtensionWebviewProtocolSession,
+  ): Promise<void> {
+    if (!this.modelCatalog || !this.threadModelStore) {
+      await this.sendModelError(
+        protocolSession,
+        "MODEL_NOT_FOUND",
+        "利用可能なモデルを取得できません。",
+        message.messageId,
+      );
+      return;
+    }
+
+    if (this.activeThreadId !== undefined && this.activeThreadId !== message.payload.threadId) {
+      await this.sendModelError(
+        protocolSession,
+        "MODEL_SELECTION_CONFLICT",
+        "現在表示しているスレッドが変更されています。再表示して再試行してください。",
+        message.messageId,
+      );
+      return;
+    }
+
+    if (this.isThreadRunActive(message.payload.threadId)) {
+      await this.sendModelError(
+        protocolSession,
+        "MODEL_SELECTION_BUSY",
+        "実行中はモデルを変更できません。処理の完了後に再試行してください。",
+        message.messageId,
+      );
+      return;
+    }
+
+    if (!this.modelCatalog.findAvailable(message.payload.modelId)) {
+      await this.sendModelError(
+        protocolSession,
+        "MODEL_NOT_FOUND",
+        "選択したモデルは利用できません。モデル一覧を更新してください。",
+        message.messageId,
+      );
+      return;
+    }
+
+    try {
+      await this.threadModelStore.updateThreadModel(
+        message.payload.threadId,
+        message.payload.expectedThreadRevision,
+        message.payload.modelId,
+      );
+      await protocolSession.sendModelList(message.payload.threadId, message.messageId);
+    } catch (error) {
+      if (error instanceof ThreadModelRevisionConflictError) {
+        await this.sendModelError(
+          protocolSession,
+          "MODEL_SELECTION_CONFLICT",
+          "モデル一覧が更新されています。最新の状態を確認してください。",
+          message.messageId,
+        );
+        await protocolSession.sendModelList(message.payload.threadId, message.messageId);
+        return;
+      }
+
+      await this.sendModelError(
+        protocolSession,
+        "TOOL_EXECUTION_FAILED",
+        "モデルの変更を保存できませんでした。再試行してください。",
+        message.messageId,
+      );
+    }
+  }
+
+  private async getModelList(threadId: string) {
+    this.activeThreadId = threadId;
+    const models = (this.modelCatalog?.listAvailable() ?? []).map(({ id, label, provider }) => ({
+      id,
+      label,
+      provider,
+    }));
+    const state = this.threadModelStore
+      ? await this.threadModelStore.getThreadModelState(threadId)
+      : { threadId, revision: 0 };
+    let resolvedState = state;
+
+    if (this.threadModelStore && models.length > 0 && state.modelId === undefined) {
+      resolvedState = await this.threadModelStore.updateThreadModel(
+        threadId,
+        state.revision,
+        models[0].id,
+      );
+    }
+
+    const selectedModelId =
+      resolvedState.modelId && models.some((model) => model.id === resolvedState.modelId)
+        ? resolvedState.modelId
+        : undefined;
+    return {
+      threadId,
+      threadRevision: resolvedState.revision,
+      models,
+      ...(selectedModelId ? { selectedModelId } : {}),
+    };
+  }
+
+  private async sendModelError(
+    protocolSession: ExtensionWebviewProtocolSession,
+    code:
+      | "MODEL_NOT_FOUND"
+      | "MODEL_SELECTION_CONFLICT"
+      | "MODEL_SELECTION_BUSY"
+      | "MODEL_NOT_SELECTED"
+      | "TOOL_EXECUTION_FAILED",
+    message: string,
+    correlationId: string,
+  ): Promise<void> {
+    await protocolSession.sendToUi(
+      createExtensionToUiMessage("error", { code, message, retryable: true }, { correlationId }),
     );
   }
 

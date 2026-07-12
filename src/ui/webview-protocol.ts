@@ -69,6 +69,10 @@ const agentErrorCodeSchema = z.enum([
   "FILE_OUTSIDE_WORKSPACE",
   "USER_CANCELLED",
   "AGENT_LIMIT_REACHED",
+  "MODEL_NOT_FOUND",
+  "MODEL_SELECTION_CONFLICT",
+  "MODEL_SELECTION_BUSY",
+  "MODEL_NOT_SELECTED",
 ]);
 
 const threadEventSchema = z.discriminatedUnion("kind", [
@@ -208,7 +212,9 @@ export const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
     "select-model",
     z
       .object({
+        threadId: identifierSchema,
         modelId: identifierSchema,
+        expectedThreadRevision: z.number().int().nonnegative(),
       })
       .strict(),
   ),
@@ -295,6 +301,8 @@ export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
     "model-list",
     z
       .object({
+        threadId: identifierSchema,
+        threadRevision: z.number().int().nonnegative(),
         models: z.array(modelSummarySchema).max(256),
         selectedModelId: identifierSchema.optional(),
       })
@@ -340,6 +348,7 @@ export type ChangeFileSummary = z.infer<typeof changeFileSummarySchema>;
 export type ModelSummary = z.infer<typeof modelSummarySchema>;
 export type UiToExtensionMessage = z.infer<typeof uiToExtensionMessageSchema>;
 export type ExtensionToUiMessage = z.infer<typeof extensionToUiMessageSchema>;
+export type ModelListPayload = Extract<ExtensionToUiMessage, { type: "model-list" }>["payload"];
 
 export type UiToExtensionMessageType = UiToExtensionMessage["type"];
 export type ExtensionToUiMessageType = ExtensionToUiMessage["type"];
