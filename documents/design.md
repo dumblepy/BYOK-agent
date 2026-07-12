@@ -1362,6 +1362,72 @@ Webview状態はJSONにシリアライズできる最小のデータだけに限
 5. `setState()`へ秘密情報、ファイル内容、会話の正本が渡されない。
 6. `retainContextWhenHidden: false`と既存のWebviewセキュリティ設定が維持される。
 
+### 14.5 Webview資産読み込みとContent Security Policy
+
+Webviewは表示とユーザー操作だけを担当するサンドボックスであり、実行可能な資産と読み込み元を最小限に限定する。CSPはHTMLの`meta`要素で設定し、HTML生成時に作成したnonceをスクリプト実行の唯一の許可根拠とする。nonceはWebviewのHTMLを生成するたびに暗号学的に安全な乱数から新しく生成し、他の状態やメッセージへ公開しない。
+
+#### 14.5.1 許可する資産
+
+初期UIで許可するローカル資産は、拡張機能の`out/webview`配下にあるビルド済みの`main.js`と`main.css`だけとする。URIは既知の相対パスから`webview.asWebviewUri`で生成し、外部URL、CDN、ワークスペースの資産、ユーザー入力から組み立てたURIは使用しない。
+
+```text
+ExtensionContext.extensionUri
+└── out/
+    └── webview/
+        ├── main.js
+        └── main.css
+```
+
+`webview.options.localResourceRoots`には`extensionUri/out/webview`の単一URIだけを設定する。拡張機能全体、ワークスペース、ホームディレクトリをルートにしない。これにより、`asWebviewUri`を使用する場合でもWebviewが参照できるローカルファイルの範囲を資産ディレクトリに閉じ込める。
+
+#### 14.5.2 CSPポリシー
+
+現行UIの最小ポリシーは次のとおりとする。`${webview.cspSource}`は`main.css`の読み込みに必要なWebviewのリソース元だけに使用し、`script-src`には含めない。
+
+```text
+default-src 'none';
+base-uri 'none';
+object-src 'none';
+frame-src 'none';
+form-action 'none';
+connect-src 'none';
+img-src 'none';
+font-src 'none';
+style-src ${webview.cspSource};
+script-src 'nonce-${nonce}';
+```
+
+次を明示的に禁止する。
+
+* `unsafe-inline`および`unsafe-eval`
+* インライン`<script>`、インラインイベントハンドラー、`javascript:` URI
+* nonceのないスクリプト、外部スクリプト、CDN読み込み
+* `eval`、`new Function`、実行時コード生成
+* 現行UIで不要なネットワーク接続、画像、フォント、フレーム、フォーム送信
+
+スクリプト要素はnonce付きの`main.js`一つだけとする。CSSは外部の`main.css`へ置き、スタイル属性や`<style>`要素を追加するためにインライン許可を緩和しない。画像、フォント、通信などを将来追加する場合は、用途・取得元・サイズ・権限を設計書へ記録し、必要な最小のCSPディレクティブだけを追加する。
+
+#### 14.5.3 HTML生成と境界
+
+```text
+WebviewViewProvider.resolveWebviewView
+  ├─ webview.options
+  │    ├─ enableScripts: true
+  │    └─ localResourceRoots: [extensionUri/out/webview]
+  └─ webview.html
+       ├─ CSP meta（nonceを含む）
+       ├─ asWebviewUri(out/webview/main.css)
+       └─ nonce付き asWebviewUri(out/webview/main.js)
+```
+
+HTML属性へ値を埋め込む場合は、nonceと資産URIが属性境界を壊さないことを保証する。ユーザー入力、APIキー、Authorizationヘッダー、ファイル内容、プロンプト、Tool ResultなどをHTMLや資産URIへ埋め込まない。WebviewとExtension Host間のメッセージはHTML生成と別の境界で扱い、後続の通信実装で受信検証を必須とする。
+
+#### 14.5.4 検証と完了条件
+
+自動検証では、HTMLに必須CSPディレクティブがあること、`unsafe-inline`と`unsafe-eval`がないこと、CSPのnonceとscript要素のnonceが一致すること、既知の`main.js`と`main.css`だけが参照されること、`localResourceRoots`が`out/webview`の単一URIであることを確認する。ビルド済み`main.js`には`eval`、`new Function`、外部リソースを示すHTTP(S) URL、インライン実行コードを混入させない。ただし、DOM名前空間判定に必要な固定の`www.w3.org`名前空間URIは通信先ではないため、静的検査で明示的に許可する。
+
+Extension Development Hostでは、初回表示、入力操作、Webview再生成を確認し、開発者ツールのコンソールにCSP違反がないことを確認する。CSP違反を無視する設定や、違反発生時だけポリシーを緩める分岐は認めない。初回表示から再生成までUIがCSP違反なしで動作し、自動検証と静的検査が成功することを本タスクの完了条件とする。
+
 ---
 
 ## 15. 会話・イベント保存

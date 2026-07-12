@@ -43,6 +43,7 @@
     "_compile": "pnpm run _compile:extension && pnpm run _bundle:webview",
     "_compile:extension": "tsc -p tsconfig.extension.json",
     "_bundle:webview": "node scripts/build-webview.mjs",
+    "check:webview-security": "pnpm _bundle:webview && node scripts/check-webview-security.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
     "watch": "tsc -p tsconfig.json --watch",
     "lint": "eslint .",
@@ -50,7 +51,7 @@
     "format:check": "prettier --check .vscode package.json tsconfig.json tsconfig.extension.json tsconfig.webview.json tsconfig.eslint.json eslint.config.mjs vitest.config.ts pnpm-workspace.yaml scripts src tests resources .prettierrc.json",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
-    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test",
+    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm check:webview-security",
     "vscode:prepublish": "pnpm _compile",
     "build": "pnpm run _compile && vsce package --no-dependencies"
   },

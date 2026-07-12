@@ -4,6 +4,34 @@ import * as vscode from "vscode";
 
 const WEBVIEW_ROOT = ["out", "webview"] as const;
 
+function escapeHtmlAttribute(value: string): string {
+  return value.replace(
+    /[&<>"]/g,
+    (character) =>
+      ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+      })[character] ?? character,
+  );
+}
+
+function createContentSecurityPolicy(webview: vscode.Webview, nonce: string): string {
+  return [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "object-src 'none'",
+    "frame-src 'none'",
+    "form-action 'none'",
+    "connect-src 'none'",
+    "img-src 'none'",
+    "font-src 'none'",
+    `style-src ${webview.cspSource}`,
+    `script-src 'nonce-${nonce}'`,
+  ].join("; ");
+}
+
 export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   public constructor(private readonly context: vscode.ExtensionContext) {}
 
@@ -18,9 +46,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private getHtml(webview: vscode.Webview, webviewRoot: vscode.Uri): string {
-    const nonce = randomBytes(16).toString("base64");
-    const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(webviewRoot, "main.js"));
-    const styleUri = webview.asWebviewUri(vscode.Uri.joinPath(webviewRoot, "main.css"));
+    const nonce = randomBytes(16).toString("hex");
+    const scriptUri = escapeHtmlAttribute(
+      webview.asWebviewUri(vscode.Uri.joinPath(webviewRoot, "main.js")).toString(),
+    );
+    const styleUri = escapeHtmlAttribute(
+      webview.asWebviewUri(vscode.Uri.joinPath(webviewRoot, "main.css")).toString(),
+    );
+    const contentSecurityPolicy = escapeHtmlAttribute(createContentSecurityPolicy(webview, nonce));
 
     return `<!DOCTYPE html>
 <html lang="ja">
@@ -29,14 +62,14 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}' ${webview.cspSource};"
+      content="${contentSecurityPolicy};"
     />
     <link rel="stylesheet" href="${styleUri}" />
     <title>BYOK Agent</title>
   </head>
   <body>
     <div id="app"></div>
-    <script nonce="${nonce}" src="${scriptUri}"></script>
+    <script nonce="${escapeHtmlAttribute(nonce)}" src="${scriptUri}"></script>
   </body>
 </html>`;
   }

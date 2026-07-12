@@ -1,0 +1,121 @@
+---
+description: 6-ui-webviewのcontent-security-policyを実装するブランチでWebviewのCSPを実装するときに読み込む
+alwaysApply: false
+---
+# Webview Content Security Policy
+
+このブランチでは、Agent SidebarのWebviewに対して、実行可能な資産と読み込み元を最小限に限定したContent Security Policy（CSP）を適用する。対象はHTMLのCSP、nonce付きスクリプト、`localResourceRoots`、Webview資産の読み込み検証であり、Extension Hostとの通信、会話保存、Agent実行、Provider、Composer送信処理には進まない。
+
+## 実装方針
+
+- `resolveWebviewView`でWebviewごとに暗号学的に安全なnonceを生成する。nonceはHTML生成単位で新しくし、`script`要素の`nonce`属性とCSPの`script-src`だけで使用する。
+- Webviewのスクリプトは、nonceを持つ外部`main.js`の`script`要素1つだけから起動する。インラインJavaScript、インラインイベントハンドラー、`eval`、`new Function`、実行時コード生成は使用しない。
+- `main.js`と`main.css`は`extensionUri/out/webview`配下の既知のファイルだけを`asWebviewUri`で参照する。外部URL、CDN、ワークスペース内の資産、ユーザー入力から組み立てた資産URIは許可しない。
+- `localResourceRoots`は`extensionUri/out/webview`を指す単一のURIだけに限定する。拡張機能全体、ワークスペース、ホームディレクトリをルートにしない。
+- CSPは`default-src 'none'`を基準に、現行UIに必要なCSSとnonce付きスクリプトだけを許可する。`script-src`はnonceのみとし、Webview全体を許可するソース式を併記しない。
+- `unsafe-inline`と`unsafe-eval`はCSPに記載せず、コード・バンドル・HTMLにも導入しない。CSP違反を握りつぶすための緩和策を追加しない。
+- 現行UIでは画像、フォント、フレーム、フォーム送信、ネットワーク接続を使用しないため、それらの取得元は許可しない。将来追加する場合は、このルールと`documents/design.md`を先に更新し、必要な最小の許可だけを追加する。
+- HTML属性へ値を埋め込む場合は、nonceと資産URIが属性境界を壊さないことを保証する。CSPのためにHTMLへユーザー入力を直接埋め込まない。
+
+## CSPポリシー
+
+設計上の最小ポリシーは次のとおりとする。`${webview.cspSource}`はCSSの`asWebviewUri`を許可するために使用し、スクリプトの許可には使用しない。
+
+```text
+default-src 'none';
+base-uri 'none';
+object-src 'none';
+frame-src 'none';
+form-action 'none';
+connect-src 'none';
+img-src 'none';
+font-src 'none';
+style-src ${webview.cspSource};
+script-src 'nonce-${nonce}';
+```
+
+`style-src`は`main.css`の読み込みに必要なWebviewのリソース元だけを許可する。スタイル属性や`<style>`要素を追加する場合は、インライン許可を復活させず、CSS資産へ移す。スクリプトは`nonce`一致が必須であり、nonceのないスクリプトや外部スクリプトは実行させない。
+
+## 資産境界
+
+```text
+ExtensionContext.extensionUri
+└── out/
+    └── webview/
+        ├── main.js  # nonce付きで読み込む唯一のJavaScript
+        └── main.css # WebviewのCSS
+```
+
+Webviewの設定とHTML生成は次の境界を守る。
+
+```text
+resolveWebviewView
+  ├─ webview.options
+  │    ├─ enableScripts: true
+  │    └─ localResourceRoots: [extensionUri/out/webview]
+  └─ webview.html
+       ├─ CSP meta
+       ├─ asWebviewUri(out/webview/main.css)
+       └─ nonce付き asWebviewUri(out/webview/main.js)
+```
+
+Extension Hostの秘密情報、ワークスペースのファイル内容、APIキー、Authorizationヘッダー、メッセージのペイロードをHTMLや資産URIへ埋め込まない。Webviewの表示に必要な値と、将来のメッセージ通信で扱う値は責務を分離する。
+
+## 検証方針
+
+- HTML生成の単体テストで、CSPの必須ディレクティブ、`unsafe-inline`/`unsafe-eval`の不在、nonceの一致、scriptタグへのnonce付与、既知の`main.js`/`main.css` URIだけの使用を検証する。
+- Webviewオプションの単体テストで、`enableScripts`が有効であり、`localResourceRoots`が`out/webview`の単一URIと一致することを検証する。
+- ビルド後の`main.js`を静的検査し、`eval`、`new Function`、外部URL、インライン実行コードが生成物へ混入していないことを確認する。検査は依存ライブラリの更新時にも実行する。
+- Extension Development Hostで初回表示、入力操作、Webviewの再生成を確認し、開発者ツールのコンソールにCSP違反がないことを確認する。CSP違反を無視する設定や、違反時だけポリシーを緩める分岐は認めない。
+- `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、Webviewバンドルを完了させる。実装は行わない本作業では、これらの検証項目を実装後の完了条件として記録する。
+
+## 完了条件
+
+1. Webviewが`default-src 'none'`を基準としたCSPで起動する。
+2. JavaScriptは毎回生成されたnonceと一致する`main.js`だけが実行できる。
+3. `unsafe-inline`、`unsafe-eval`、インラインJavaScript、外部スクリプトが存在しない。
+4. `localResourceRoots`が`extensionUri/out/webview`だけに限定される。
+5. 外部ネットワーク、画像、フォント、フレーム、フォーム送信が現行UIから利用できない。
+6. 初回表示・入力操作・Webview再生成がCSP違反なしで動作し、静的検査とテストが成功する。
+
+## 対象外
+
+- Extension HostとWebview間のメッセージプロトコル
+- Composerの送信、停止、ストリーミング
+- Thread/Event/Artifactの永続化
+- Provider、AgentLoop、Tool、権限、ChangeSet
+- Markdownレンダリング、HTMLサニタイズ、Command URIの実装本体
+- WebviewのUIデザイン変更
+- `git add`、`git commit`、既存変更の整理・上書き
+
+## 参考資料
+
+- `AGENTS.md`
+- `.cursor/rules/project.mdc`
+- `.cursor/rules/branch.mdc`
+- `.cursor/rules/branch/5-ui-agent-sidebarのwebview-view-providerを実装する.mdc`
+- `documents/issues.md`の「Milestone 1: UI基盤 / WebviewのContent Security Policyを実装する」
+- `documents/design.md`の「14. UI設計」「16. セキュリティ設計」
+- `src/ui/agent-webview-provider.ts`
+- `scripts/build-webview.mjs`
+
+## 進捗
+
+- [x] 現行のCSP、nonce、資産URI、`localResourceRoots`、Webviewバンドルを調査する
+- [x] CSPの許可範囲、nonceの責務、資産境界を設計書へ定義する
+- [x] このブランチの対象範囲、対象外、完了条件、検証方針を定義する
+- [x] nonce専用のCSPと最小権限の資産読み込みを実装する
+- [x] CSP、nonce、`localResourceRoots`、バンドル内容の自動検証を追加する
+- [ ] Extension Development HostでCSP違反なしのUI動作を確認する
+
+## 調査結果・設計まとめ
+
+- `src/ui/agent-webview-provider.ts`は、`randomBytes`でnonceを生成し、`main.js`と`main.css`を`asWebviewUri`で読み込んでいる。
+- 現状の`localResourceRoots`は`extensionUri/out/webview`の単一URIであり、最小範囲の方針に合致している。この境界を維持する。
+- 現状のCSPは`default-src 'none'`、`style-src ${webview.cspSource}`、`script-src 'nonce-${nonce}' ${webview.cspSource}`を設定している。後者はWebviewのリソース元もスクリプト許可に含むため、nonce専用ポリシーとしては設計上の許可範囲を狭める余地がある。
+- `scripts/build-webview.mjs`はesbuildのIIFEバンドルを生成する。CSP適用後も、バンドルや依存ライブラリが`eval`または`new Function`を必要としないことを検証する。
+- 現行UIは外部スクリプト、画像、フォント、ネットワーク接続、フォーム送信を使用していないため、これらを許可しないポリシーを採用する。
+- Preactの生成バンドルにはSVG、MathML、HTMLの標準名前空間URIが含まれるため、バンドル静的検査ではこれらの固定URIだけを非通信の許可値として扱い、それ以外のHTTP(S) URLを検出する。
+- `src/ui/agent-webview-provider.ts`でCSPをnonce専用に更新し、HTML属性値をエスケープする。`tests/unit/agent-webview-provider.test.ts`でCSP、nonce、資産ルート、既知の資産URIを検証する。
+- `scripts/check-webview-security.mjs`と`check:webview-security`スクリプトで、Webviewバンドルの`eval`、`new Function`、`javascript:` URI、外部HTTP(S) URLを検査する。
+- Extension Development Hostの実行バイナリがこの環境にないため、初回表示・入力操作・Webview再生成時のコンソール確認は未実施である。自動検証成功をもって代替せず、完了条件に未実施として残す。
