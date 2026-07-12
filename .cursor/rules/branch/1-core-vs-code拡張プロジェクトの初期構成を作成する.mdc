@@ -1,0 +1,162 @@
+---
+description: 1-core-vs-code拡張プロジェクトの初期構成を作成するブランチでの開発時に読み込む
+alwaysApply: false
+---
+# VS Code拡張プロジェクトの初期構成
+
+このブランチでは、BYOK専用VS Codeコーディングエージェントの実装に先立ち、TypeScriptで開発・検証・Extension Host起動ができる最小のプロジェクト基盤を整備する。今回の作業では基盤の設定と空の拡張機能の起動確認までを対象とし、Provider、Agent、UI、Tool、Storageなどの機能実装には進まない。
+
+## 実装方針
+
+- VS Codeデスクトップ版のNode.js Extension Hostを対象とする。Webview、Language Model API、VS Code本体の内部API、外部サービスには依存しない。
+- `package.json`を拡張機能マニフェストとNodeパッケージ設定の基準とし、`main`からコンパイル済みExtension Hostエントリポイントを参照する。
+- TypeScriptのソースは`src/`に置き、コンパイル成果物は`out/`に分離する。`out/`や依存パッケージはリポジトリに含めない。
+- `src/`直下は設計書で定めた責務別ディレクトリだけを将来の配置先として扱う。初期構成では必要な空ディレクトリを作成し、実装コードは空の`activate`/`deactivate`だけに限定する。
+- `resources/`は拡張機能が参照する静的リソース、`tests/`はテストコードのルートとする。初期段階で機能用のリソースやテストケースは作らない。
+- ESLintはTypeScriptを解析対象にし、Prettierと競合しない構成にする。Lintとフォーマットは個別のスクリプトとして実行可能にする。
+- テストランナーはNode上で実行できるものを採用し、将来の4層（unit / provider-contract / agent-simulation / extension-integration）に分割できるテストディレクトリ構成を先に用意する。実APIへの接続はこのブランチのテストに含めない。
+- 開発用起動はVS Codeの標準デバッグ構成（`F5`またはRun and Debug）でExtension Development Hostを起動できるようにする。起動後に拡張機能が有効化されることを最小の統合確認とする。
+- 設定・ツール・依存関係は最小限にし、今回の完了条件に不要なコマンド、APIキー、ネットワーク処理、テレメトリは追加しない。
+- UI実装のランタイムはReactではなくPreactに統一する。PreactのWebviewバンドルと初期画面までを実装し、会話通信やAgent機能は後続ブランチで実装する。
+- VSIX生成は`@vscode/vsce`を使用し、`pnpm package`でコンパイル後に`byok-vscode-agent-<version>.vsix`をリポジトリルートへ出力する。Marketplaceへの公開は行わない。
+
+## 設計
+
+### 1. 想定する構成
+
+```text
+.
+├── .vscode/
+│   ├── launch.json             # Extension Development Host起動
+│   └── tasks.json              # 必要なビルドタスク（採用する場合）
+├── resources/                  # 静的リソースの配置先
+│   └── activity-bar.svg        # Activity Bar用の独自SVGアイコン
+├── scripts/
+│   └── build-webview.mjs       # Preact Webviewバンドル
+├── src/
+│   ├── extension/              # activate/deactivateと拡張機能の境界
+│   ├── ui/                     # Webview provider、Preact画面、スタイル
+│   ├── agent/
+│   ├── models/
+│   ├── providers/
+│   ├── context/
+│   ├── prompts/
+│   ├── tools/
+│   ├── changes/
+│   ├── permissions/
+│   ├── storage/
+│   └── observability/
+├── tests/
+│   ├── unit/
+│   ├── provider-contract/
+│   ├── agent-simulation/
+│   └── extension-integration/
+├── package.json
+├── tsconfig.json
+├── eslint.config.*             # ESLint設定
+├── .prettierrc.*               # Prettier設定
+└── .vscodeignore               # パッケージ除外設定
+```
+
+Webviewの生成物は`out/webview/main.js`と`out/webview/main.css`に出力する。VSIXには`out/`と`resources/activity-bar.svg`を含め、ソース、テスト、ビルドスクリプト、ルールファイルは含めない。
+
+`out/`、`node_modules/`、カバレッジ出力などの生成物は`.gitignore`で除外する。ディレクトリだけをGitで保持する必要がある場合は、空のプレースホルダーを置くが、実装を示すコードやダミー機能は追加しない。
+
+### 2. Extension Host境界
+
+- `src/extension/extension.ts`（ファイル名は命名規則に合わせてよい）を唯一の拡張機能エントリポイントとする。
+- `activate(context)`はVS Codeから呼び出せる有効な関数として公開し、`byokAgent.view`に`AgentWebviewProvider`を登録する。
+- `deactivate()`はリソースを保持しないため、不要な処理を持たない。将来のサービス解放点としてエントリポイントに残す。
+- `package.json`の`engines.vscode`はプロジェクトで採用するVS Code APIの最低バージョンを明示し、`main`は`out/extension/extension.js`など実際のビルド出力と一致させる。
+- Extension Hostから起動した際、コンパイル済みエントリポイントの読み込み失敗やactivate時例外がないことを確認する。確認のためのログが必要な場合も、秘密情報やユーザーのファイル内容は出力しない。
+- Webviewは`localResourceRoots`を`out/webview`だけに限定し、CSP、nonce付きスクリプト、外部リソースなしで初期画面を表示する。
+
+### 3. TypeScript・Lint・Formatter
+
+- TypeScriptはNode向けに設定し、`src/**/*.ts`を入力、`out/`を出力とする。型チェックで検出できる設定（strict系）を採用する。
+- 本番ソースとテストソースで必要な型定義を分け、テストの型を本番バンドルへ混入させない。
+- ESLintはTypeScript対応の推奨ルールをベースにし、Prettierの整形結果と衝突しないよう連携する。Lint無効化コメントは初期構成では追加しない。
+- Prettierの対象範囲と除外範囲を明示し、生成物・依存ディレクトリ・VS Codeのデバッグ用生成ファイルは対象外にする。
+- `typecheck`、`lint`、`format`、`format:check`、`compile`、`test`を再現可能なnpm scriptsとして提供する。`check`相当のスクリプトがある場合は、型チェック・Lint・フォーマット検査・テストをまとめて実行する。
+
+### 4. テスト環境
+
+初期構成でテストランナーを導入し、少なくとも次のディレクトリを予約する。
+
+- `tests/unit/`: 純粋なユニットテスト
+- `tests/provider-contract/`: Provider契約テスト
+- `tests/agent-simulation/`: Agentシミュレーションテスト
+- `tests/extension-integration/`: Extension Hostを含む統合テスト
+
+このブランチで必須なのは、設定が壊れていないことを確認する最小テスト実行と、Extension Development Hostで空の拡張機能が有効化されることの確認である。ProviderやAgentのテスト、実APIアクセス、APIキー利用、複雑なVS Code統合テストは後続ブランチに送る。
+
+### 5. 開発体験と生成物
+
+- `F5`でビルドまたはコンパイルが先に実行され、その後Extension Development Hostが起動する構成にする。手動の事前コマンドを完了条件にしない。
+- デバッグ構成は現在の拡張機能プロジェクト自身を対象にし、別のワークスペースやグローバルな拡張機能を誤って起動しない。
+- `preLaunchTask`を利用する場合は、タスク名と実際に登録したビルドタスク名を一致させる。
+- `package.npm`または同等のパッケージ管理で依存バージョンを固定・再現可能にし、ロックファイルを管理対象にする。
+- パッケージング検証を追加する場合も、今回の空の拡張機能を壊さない範囲に留める。VSIX公開、Marketplace公開、署名、リリース自動化は対象外とする。
+
+## 進捗
+
+- [x] プロジェクトのNode・TypeScript・VS Code APIの対象バージョンとパッケージマネージャーを確定する
+- [x] `package.json`、`tsconfig.json`、ESLint、Prettier、ignore設定を追加する
+- [x] `src`、`resources`、`tests`および設計書で定義された責務別サブディレクトリを作成する
+- [x] 空のExtension Hostエントリポイント（`activate`/`deactivate`）を追加する
+- [x] unit / provider-contract / agent-simulation / extension-integration のテストディレクトリを整える
+- [x] VS CodeのExtension Development Host起動構成を追加する
+- [x] 型チェック、Lint、Prettier検査、テスト、コンパイルを実行して成功を確認する
+- [x] Reactを導入せず、Preact依存関係とJSX変換設定を追加する
+- [x] `@vscode/vsce`と`pnpm package`を追加する
+- [x] `pnpm package`でVSIXを生成し、拡張機能マニフェストとExtension Host成果物が含まれることを確認する
+- [x] Activity Barに独自SVGアイコン付きのView ContainerとWebview Viewを定義する
+- [x] Preactの初期画面をesbuildでバンドルし、Webview providerから安全に読み込む
+- [ ] Extension Development Hostで空の拡張機能が正常に有効化されることを確認する
+- [x] 実装範囲をActivity Barと初期UIまでに限定し、Agent機能を先行実装していないことをレビューする
+
+## 完了条件
+
+以下をすべて満たした時点で完了とする。
+
+1. TypeScriptのコンパイルが成功し、Extension Hostエントリポイントが`package.json`の`main`から解決できる。
+2. ESLint、Prettierの検査、テストランナーがローカルコマンドで再実行でき、失敗がない。
+3. `src/`、`resources/`、`tests/`の基本ディレクトリと、設計書に定めた将来の責務別ディレクトリが存在する。
+4. VS Codeの開発用Extension Hostをデバッグ起動できる。
+5. 起動したExtension Development HostでActivity Barにアイコンが表示され、初期Webview画面が例外なく表示される。
+6. `pnpm package`でインストール可能な`.vsix`が生成され、`package.json`と`out/extension/extension.js`を含む。
+7. Provider、Agent、Tool、Storage、APIキー、Webview通信などの後続機能をこのブランチに含めていない。
+
+## 対象外
+
+- WebviewとExtension Host間の通信プロトコル、メッセージ処理
+- Agent機能と接続するComposer、会話履歴、ストリーミング
+- Provider Adapter、モデル設定、SecretStorage、ネットワーク通信
+- AgentLoop、コンテキスト管理、プロンプト、Tool Calling、ChangeSet、権限管理
+- 会話保存、観測性、テレメトリ、OSSライセンス・NOTICEの実装
+- Marketplace公開、CI/CD、Git操作
+
+## 参考資料
+
+- `AGENTS.md`
+- `.cursor/rules/project.mdc`
+- `.cursor/rules/branch.mdc`
+- `documents/issues.md` の「Milestone 0: プロジェクト基盤」
+- `documents/design.md` の目的、アーキテクチャ、ディレクトリ構成、テスト設計、実装フェーズ
+
+## 調査結果・設計まとめ
+
+- 既存のIssue一覧では、このブランチの対象は「Milestone 0 / [Core] VS Code拡張プロジェクトの初期構成を作成する」と定義されている。
+- プロジェクトルールでは、`src/`直下の責務別構成と、テスト4層（unit / provider-contract / agent-simulation / extension-integration）が必須である。
+- 初期構成の完了条件は、機能提供ではなく、コンパイル・静的検査・テスト・Extension Development Host起動・空の拡張機能の有効化を確認できることとする。
+- 既存の作業ツリーには本ブランチとは無関係の変更があるため、それらを上書き・整理・ステージングしない。`git add`および`git commit`は禁止する。
+- Node.js 24.18.0・pnpm 11.12.0を実行環境として確認し、パッケージマネージャーはpnpmに固定した。TypeScript 7はtypescript-eslint 8.63.0と実行時互換性がなかったため、TypeScript 5.9.3へ変更した。
+- `module`/`moduleResolution`はTypeScript 5.9とVS Code Extension Hostに合わせてNode16とし、ビルド成果物は`out/extension/extension.js`に出力する。
+- Prettierは既存の`AGENTS.md`・設計書・ルール・Docker関連ファイルを変更しないよう、初期構成で管理するファイルだけを検査対象にした。
+- `pnpm check`、`pnpm compile`、コンパイル済みエントリポイントのexport確認、マニフェストとlaunch設定の整合性確認は成功した。実行環境に`code`/`code-insiders`コマンドがないため、Extension Development Hostの実起動確認は未実施である。
+- Preactは`dependencies`に固定し、`tsconfig.json`の`jsxImportSource`を`preact`に設定する。ReactおよびReact向けのランタイム依存は追加しない。
+- VSIXは公式の`@vscode/vsce` CLIで生成する。`vscode:prepublish`でコンパイルを行い、`package`スクリプトから`vsce package --no-dependencies`を呼び出す。pnpmの仮想ストアをnpmが解決できないため依存検出を無効化し、Webview実装時は別途バンドル方式を確定する。
+- `pnpm-workspace.yaml`で依存パッケージのビルドスクリプトを明示的に不許可にし、pnpm 11の再現可能なインストールとVSIX生成を両立する。
+- Activity BarのView ContainerとWebview Viewは`package.json`のContribution Pointで宣言し、Extension Hostでは`registerWebviewViewProvider`で`byokAgent.view`に結び付ける。
+- Preact画面はesbuildのJavaScript APIでIIFEにバンドルし、CSSとともに`out/webview`へ出力する。WebviewはCSPのnonceと`localResourceRoots`制限を設定し、外部スクリプト・インラインスクリプト・ワークスペース内容を読み込まない。
+- `tsconfig.json`はVS Codeの言語サービスがTSXをPreactとして解釈できるようTSXをincludeし、Extension Hostの出力は`tsconfig.extension.json`へ分離する。CSS副作用importには`styles.d.ts`で型宣言を与える。

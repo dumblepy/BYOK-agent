@@ -1,0 +1,9 @@
+node_modules/
+.pnpm-store/
+out/
+coverage/
+.vscode-test/
+.DS_Store
+*.log
+*.vsix
+*.diff
