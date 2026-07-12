@@ -159,3 +159,4 @@ Webviewの生成物は`out/webview/main.js`と`out/webview/main.css`に出力す
 - `pnpm-workspace.yaml`で依存パッケージのビルドスクリプトを明示的に不許可にし、pnpm 11の再現可能なインストールとVSIX生成を両立する。
 - Activity BarのView ContainerとWebview Viewは`package.json`のContribution Pointで宣言し、Extension Hostでは`registerWebviewViewProvider`で`byokAgent.view`に結び付ける。
 - Preact画面はesbuildのJavaScript APIでIIFEにバンドルし、CSSとともに`out/webview`へ出力する。WebviewはCSPのnonceと`localResourceRoots`制限を設定し、外部スクリプト・インラインスクリプト・ワークスペース内容を読み込まない。
+- `tsconfig.json`はVS Codeの言語サービスがTSXをPreactとして解釈できるようTSXをincludeし、Extension Hostの出力は`tsconfig.extension.json`へ分離する。CSS副作用importには`styles.d.ts`で型宣言を与える。
