@@ -2,11 +2,19 @@ import { render } from "preact";
 import { useState } from "preact/hooks";
 
 import "./styles.css";
+import { WebviewProtocolClient, type WebviewProtocolApi } from "./webview-protocol-client";
 import { createAgentWebviewStateStore, type WebviewStateApi } from "./webview-state";
 
-declare function acquireVsCodeApi(): WebviewStateApi;
+declare function acquireVsCodeApi(): WebviewStateApi & WebviewProtocolApi;
 
-const stateStore = createAgentWebviewStateStore(acquireVsCodeApi());
+const vscodeApi = acquireVsCodeApi();
+const stateStore = createAgentWebviewStateStore(vscodeApi);
+const protocolClient = new WebviewProtocolClient(vscodeApi, window, {
+  onSequenceGap: (message) => {
+    protocolClient.send("request-thread-snapshot", { threadId: message.payload.threadId });
+  },
+});
+protocolClient.start();
 
 function App() {
   const [composerDraft, setComposerDraft] = useState(stateStore.state.composerDraft);

@@ -2,6 +2,8 @@ import { randomBytes } from "node:crypto";
 
 import * as vscode from "vscode";
 
+import { ExtensionWebviewProtocolSession } from "./extension-webview-protocol";
+
 const WEBVIEW_ROOT = ["out", "webview"] as const;
 
 function escapeHtmlAttribute(value: string): string {
@@ -43,6 +45,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       localResourceRoots: [webviewRoot],
     };
     webviewView.webview.html = this.getHtml(webviewView.webview, webviewRoot);
+
+    const protocolSession = new ExtensionWebviewProtocolSession(webviewView.webview);
+    webviewView.onDidDispose?.(() => protocolSession.dispose());
   }
 
   private getHtml(webview: vscode.Webview, webviewRoot: vscode.Uri): string {

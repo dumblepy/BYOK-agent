@@ -41,7 +41,7 @@
   },
   "scripts": {
     "_compile": "pnpm run _compile:extension && pnpm run _bundle:webview",
-    "_compile:extension": "tsc -p tsconfig.extension.json",
+    "_compile:extension": "tsc -p tsconfig.extension.json --noEmit && node scripts/build-extension.mjs",
     "_bundle:webview": "node scripts/build-webview.mjs",
     "check:webview-security": "pnpm _bundle:webview && node scripts/check-webview-security.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
@@ -56,7 +56,8 @@
     "build": "pnpm run _compile && vsce package --no-dependencies"
   },
   "dependencies": {
-    "preact": "10.29.7"
+    "preact": "10.29.7",
+    "zod": "4.1.12"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

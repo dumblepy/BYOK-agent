@@ -1,92 +1,80 @@
 ---
-description: 6-ui-webviewのcontent-security-policyを実装するブランチでWebviewのCSPを実装するときに読み込む
+description: 6-ui-webviewのcontent-security-policyを実装するブランチでExtension HostとWebviewの通信プロトコルを設計するときに読み込む
 alwaysApply: false
 ---
-# Webview Content Security Policy
+# Extension HostとWebviewの通信プロトコル
 
-このブランチでは、Agent SidebarのWebviewに対して、実行可能な資産と読み込み元を最小限に限定したContent Security Policy（CSP）を適用する。対象はHTMLのCSP、nonce付きスクリプト、`localResourceRoots`、Webview資産の読み込み検証であり、Extension Hostとの通信、会話保存、Agent実行、Provider、Composer送信処理には進まない。
+このブランチでは、Agent SidebarのWebviewとExtension Hostの間で型安全に双方向メッセージを送受信できるプロトコルを定義する。対象はメッセージの型、共通エンベロープ、プロトコルバージョン、Zodによる受信検証、相関・順序制御、再接続時のスナップショット同期であり、実装は次の作業で行う。
 
 ## 実装方針
 
-- `resolveWebviewView`でWebviewごとに暗号学的に安全なnonceを生成する。nonceはHTML生成単位で新しくし、`script`要素の`nonce`属性とCSPの`script-src`だけで使用する。
-- Webviewのスクリプトは、nonceを持つ外部`main.js`の`script`要素1つだけから起動する。インラインJavaScript、インラインイベントハンドラー、`eval`、`new Function`、実行時コード生成は使用しない。
-- `main.js`と`main.css`は`extensionUri/out/webview`配下の既知のファイルだけを`asWebviewUri`で参照する。外部URL、CDN、ワークスペース内の資産、ユーザー入力から組み立てた資産URIは許可しない。
-- `localResourceRoots`は`extensionUri/out/webview`を指す単一のURIだけに限定する。拡張機能全体、ワークスペース、ホームディレクトリをルートにしない。
-- CSPは`default-src 'none'`を基準に、現行UIに必要なCSSとnonce付きスクリプトだけを許可する。`script-src`はnonceのみとし、Webview全体を許可するソース式を併記しない。
-- `unsafe-inline`と`unsafe-eval`はCSPに記載せず、コード・バンドル・HTMLにも導入しない。CSP違反を握りつぶすための緩和策を追加しない。
-- 現行UIでは画像、フォント、フレーム、フォーム送信、ネットワーク接続を使用しないため、それらの取得元は許可しない。将来追加する場合は、このルールと`documents/design.md`を先に更新し、必要な最小の許可だけを追加する。
-- HTML属性へ値を埋め込む場合は、nonceと資産URIが属性境界を壊さないことを保証する。CSPのためにHTMLへユーザー入力を直接埋め込まない。
+- メッセージは`protocolVersion`、`messageId`、`type`、`sentAt`、任意の`correlationId`、`payload`を持つ共通エンベロープに統一する。MVPのバージョンは`"1.0"`とする。
+- UI→ExtensionとExtension→UIを別々の判別共用体として定義し、`type`ごとのpayload型を固定する。未知の`type`を黙って無視して操作を続行しない。
+- Zodスキーマを型と実行時検証の単一の正本とし、`z.infer`からTypeScript型を導出する。手書き型と検証ロジックの二重管理を作らない。
+- Extension Hostの`onDidReceiveMessage`とWebviewの受信処理の双方で、`unknown`を検証してからDispatcherまたはReducerへ渡す。検証前の値をDOM、ログ、権限判定、ファイル操作に渡さない。
+- Extension Hostを会話・Agent実行・権限・ChangeSetの正本とする。WebviewはUI投影として扱い、再生成時は`ui-ready`を送り、スナップショットから再同期する。
+- `messageId`で重複を排除し、`correlationId`で要求と応答・イベントを関連付ける。`thread-event`と`run-state`には単調増加する`sequence`を持たせ、欠番時はスナップショットを再取得する。
+- 操作要求を受けたExtension Hostは、IDの存在だけで許可せず、現在の状態・権限・Workspace Trust・ChangeSetの`baseHash`を再確認する。
+- APIキー、Authorizationヘッダー、生の環境変数、不要なファイル内容、非公開推論内容をメッセージに含めない。表示用データも最小限のSummary型に限定する。
+- 実装対象はプロトコル定義・検証・送受信アダプター・状態同期・テストまでとし、Provider、AgentLoop、会話永続化、UIデザイン変更はこのブランチで実装しない。
 
-## CSPポリシー
+## メッセージ設計
 
-設計上の最小ポリシーは次のとおりとする。`${webview.cspSource}`はCSSの`asWebviewUri`を許可するために使用し、スクリプトの許可には使用しない。
-
-```text
-default-src 'none';
-base-uri 'none';
-object-src 'none';
-frame-src 'none';
-form-action 'none';
-connect-src 'none';
-img-src 'none';
-font-src 'none';
-style-src ${webview.cspSource};
-script-src 'nonce-${nonce}';
-```
-
-`style-src`は`main.css`の読み込みに必要なWebviewのリソース元だけを許可する。スタイル属性や`<style>`要素を追加する場合は、インライン許可を復活させず、CSS資産へ移す。スクリプトは`nonce`一致が必須であり、nonceのないスクリプトや外部スクリプトは実行させない。
-
-## 資産境界
+詳細な型定義とライフサイクルは`documents/design.md` §14.3に記載する。実装時の主要メッセージは次のとおり。
 
 ```text
-ExtensionContext.extensionUri
-└── out/
-    └── webview/
-        ├── main.js  # nonce付きで読み込む唯一のJavaScript
-        └── main.css # WebviewのCSS
+Webview                         Extension Host
+   │                                  │
+   ├─ ui-ready ──────────────────────▶│ 検証・セッション確立
+   │◀──────────────────── host-ready ─┤
+   │◀────────────── thread-snapshot ──┤ 正本から初期状態を同期
+   ├─ send-message ──────────────────▶│ 状態・権限を再評価して実行
+   │◀─────────────── thread-event ────┤
+   │◀────────────────── run-state ─────┤
+   ├─ approve/reject-tool ───────────▶│ 承認状態を再確認
+   │◀──────── approval-requested ──────┤
 ```
 
-Webviewの設定とHTML生成は次の境界を守る。
+## 進捗
 
-```text
-resolveWebviewView
-  ├─ webview.options
-  │    ├─ enableScripts: true
-  │    └─ localResourceRoots: [extensionUri/out/webview]
-  └─ webview.html
-       ├─ CSP meta
-       ├─ asWebviewUri(out/webview/main.css)
-       └─ nonce付き asWebviewUri(out/webview/main.js)
-```
-
-Extension Hostの秘密情報、ワークスペースのファイル内容、APIキー、Authorizationヘッダー、メッセージのペイロードをHTMLや資産URIへ埋め込まない。Webviewの表示に必要な値と、将来のメッセージ通信で扱う値は責務を分離する。
-
-## 検証方針
-
-- HTML生成の単体テストで、CSPの必須ディレクティブ、`unsafe-inline`/`unsafe-eval`の不在、nonceの一致、scriptタグへのnonce付与、既知の`main.js`/`main.css` URIだけの使用を検証する。
-- Webviewオプションの単体テストで、`enableScripts`が有効であり、`localResourceRoots`が`out/webview`の単一URIと一致することを検証する。
-- ビルド後の`main.js`を静的検査し、`eval`、`new Function`、外部URL、インライン実行コードが生成物へ混入していないことを確認する。検査は依存ライブラリの更新時にも実行する。
-- Extension Development Hostで初回表示、入力操作、Webviewの再生成を確認し、開発者ツールのコンソールにCSP違反がないことを確認する。CSP違反を無視する設定や、違反時だけポリシーを緩める分岐は認めない。
-- `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、Webviewバンドルを完了させる。実装は行わない本作業では、これらの検証項目を実装後の完了条件として記録する。
+- [x] `project.mdc`、`branch.mdc`、既存のブランチルール、既存の`documents/design.md` §14.3を確認する
+- [x] 双方向メッセージ、共通エンベロープ、バージョン、相関・順序制御の設計を`documents/design.md`へ記録する
+- [x] このブランチの対象範囲、対象外、実装方針、完了条件、検証方針を定義する
+- [x] メッセージ型とZodスキーマを実装する
+- [x] Extension HostとWebview双方の受信境界に検証を接続する
+- [x] `ui-ready`、スナップショット同期、イベントの重複排除・欠番検出を実装する
+- [x] 異常系・セキュリティ境界・型検査のテストを追加する
+- [x] 型チェック、Lint、フォーマット、単体テスト、Extension Integration Testを実行する
 
 ## 完了条件
 
-1. Webviewが`default-src 'none'`を基準としたCSPで起動する。
-2. JavaScriptは毎回生成されたnonceと一致する`main.js`だけが実行できる。
-3. `unsafe-inline`、`unsafe-eval`、インラインJavaScript、外部スクリプトが存在しない。
-4. `localResourceRoots`が`extensionUri/out/webview`だけに限定される。
-5. 外部ネットワーク、画像、フォント、フレーム、フォーム送信が現行UIから利用できない。
-6. 初回表示・入力操作・Webview再生成がCSP違反なしで動作し、静的検査とテストが成功する。
+1. UI→Extension、Extension→UIの全メッセージが共通エンベロープと判別共用体で型定義されている。
+2. `protocolVersion: "1.0"`、`messageId`、必要な`correlationId`、イベントの`sequence`が送受信される。
+3. 両方向の受信境界でZod検証を通過したメッセージだけが内部処理へ到達する。
+4. 未知のtype、異なるメジャーバージョン、必須フィールド欠損、誤った型、過大ペイロードを拒否できる。
+5. Webview再生成後に`ui-ready`からスナップショットを取得し、Extension Hostの正本と再同期できる。
+6. 重複イベント、欠番イベント、破棄済みWebview、無効な操作IDを安全に処理できる。
+7. メッセージを通じて秘密情報や不要なワークスペース情報がWebviewへ渡らない。
+8. 実装後の自動テストとExtension Development Hostで、初期化・送信・キャンセル・承認・再同期を確認できる。
 
 ## 対象外
 
-- Extension HostとWebview間のメッセージプロトコル
-- Composerの送信、停止、ストリーミング
-- Thread/Event/Artifactの永続化
-- Provider、AgentLoop、Tool、権限、ChangeSet
-- Markdownレンダリング、HTMLサニタイズ、Command URIの実装本体
-- WebviewのUIデザイン変更
-- `git add`、`git commit`、既存変更の整理・上書き
+- メッセージプロトコルの実装コード
+- Composerの送信処理、AgentLoop、Provider通信
+- 会話・イベントの永続化
+- ChangeSetや権限サービス本体
+- WebviewのCSP、nonce、`localResourceRoots`の変更
+- UIレイアウト、テーマ、Markdownレンダリング
+- `git add`、`git commit`、既存の未コミット変更の整理・上書き
+
+## 検証方針
+
+- スキーマ単体テストで、全メッセージの正常系、未知のtype、バージョン不一致、欠損、誤型、文字列長超過、配列上限超過、ペイロードサイズ超過を検証する。
+- Dispatcher/Reducerのテストで、検証前の値が内部処理へ届かないこと、無効な操作ID・古い`sequence`・重複`messageId`が無害に処理されることを検証する。
+- ライフサイクルテストで、`ui-ready`から`host-ready`とスナップショットを受け、Webview再生成後に正本へ再同期できることを検証する。
+- 相関テストで、要求の`messageId`と応答・エラーの`correlationId`が一致し、複数要求を取り違えないことを検証する。
+- Extension Integration TestでVS Code Webview APIの送受信アダプターを接続し、秘密情報・不要なファイル内容がpayloadに入らないことを確認する。
+- 実装後に`pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、Extension Integration Testを実行する。実APIテストは明示的な環境変数がある場合だけ許可する。
 
 ## 参考資料
 
@@ -94,28 +82,21 @@ Extension Hostの秘密情報、ワークスペースのファイル内容、API
 - `.cursor/rules/project.mdc`
 - `.cursor/rules/branch.mdc`
 - `.cursor/rules/branch/5-ui-agent-sidebarのwebview-view-providerを実装する.mdc`
-- `documents/issues.md`の「Milestone 1: UI基盤 / WebviewのContent Security Policyを実装する」
-- `documents/design.md`の「14. UI設計」「16. セキュリティ設計」
+- `documents/design.md`の「14.3 Webview通信」「17. 主要インターフェース」「19. テスト設計」
+- `documents/issues.md`のUI基盤・Webview関連Issue
 - `src/ui/agent-webview-provider.ts`
-- `scripts/build-webview.mjs`
-
-## 進捗
-
-- [x] 現行のCSP、nonce、資産URI、`localResourceRoots`、Webviewバンドルを調査する
-- [x] CSPの許可範囲、nonceの責務、資産境界を設計書へ定義する
-- [x] このブランチの対象範囲、対象外、完了条件、検証方針を定義する
-- [x] nonce専用のCSPと最小権限の資産読み込みを実装する
-- [x] CSP、nonce、`localResourceRoots`、バンドル内容の自動検証を追加する
-- [ ] Extension Development HostでCSP違反なしのUI動作を確認する
+- `src/ui/`配下のWebviewエントリーポイント
 
 ## 調査結果・設計まとめ
 
-- `src/ui/agent-webview-provider.ts`は、`randomBytes`でnonceを生成し、`main.js`と`main.css`を`asWebviewUri`で読み込んでいる。
-- 現状の`localResourceRoots`は`extensionUri/out/webview`の単一URIであり、最小範囲の方針に合致している。この境界を維持する。
-- 現状のCSPは`default-src 'none'`、`style-src ${webview.cspSource}`、`script-src 'nonce-${nonce}' ${webview.cspSource}`を設定している。後者はWebviewのリソース元もスクリプト許可に含むため、nonce専用ポリシーとしては設計上の許可範囲を狭める余地がある。
-- `scripts/build-webview.mjs`はesbuildのIIFEバンドルを生成する。CSP適用後も、バンドルや依存ライブラリが`eval`または`new Function`を必要としないことを検証する。
-- 現行UIは外部スクリプト、画像、フォント、ネットワーク接続、フォーム送信を使用していないため、これらを許可しないポリシーを採用する。
-- Preactの生成バンドルにはSVG、MathML、HTMLの標準名前空間URIが含まれるため、バンドル静的検査ではこれらの固定URIだけを非通信の許可値として扱い、それ以外のHTTP(S) URLを検出する。
-- `src/ui/agent-webview-provider.ts`でCSPをnonce専用に更新し、HTML属性値をエスケープする。`tests/unit/agent-webview-provider.test.ts`でCSP、nonce、資産ルート、既知の資産URIを検証する。
-- `scripts/check-webview-security.mjs`と`check:webview-security`スクリプトで、Webviewバンドルの`eval`、`new Function`、`javascript:` URI、外部HTTP(S) URLを検査する。
-- Extension Development Hostの実行バイナリがこの環境にないため、初回表示・入力操作・Webview再生成時のコンソール確認は未実施である。自動検証成功をもって代替せず、完了条件に未実施として残す。
+- 既存のUI設計はメッセージを判別共用体で定義し、受信検証を必須としているため、今回の設計で共通エンベロープ・双方向の型・検証境界を具体化する。
+- VS Code Webview APIは`unknown`を型安全な内部値として保証しないため、Host/Webview双方の受信入口を信頼境界として扱う。
+- UIは再生成され得る一時的な投影であり、会話・Agent実行・権限・ChangeSetの正本をHostに置く既存アーキテクチャと、`ui-ready`／スナップショット同期が整合する。
+- 既存のCSPと`localResourceRoots`は通信payloadの安全性を代替しない。CSPは資産実行境界、Zod検証はメッセージデータ境界として責務を分離する。
+- `src/ui/webview-protocol.ts`を共有の正本とし、共通エンベロープ、UI→Host／Host→UIの判別共用体、Zodスキーマ、生成・受信検証関数を集約した。
+- `src/ui/extension-webview-protocol.ts`でHost側の受信検証、`ui-ready`応答、初期スナップショット、重複排除、無効メッセージへのprotocol-errorを実装した。
+- `src/ui/webview-protocol-client.ts`でWebview側の受信検証、重複排除、sequence欠番検出、スナップショット再取得要求を実装し、`main.tsx`の初期化時に`ui-ready`を送るよう接続した。
+- Webview再読込時に`crypto.randomUUID`が利用できない実行環境でもUI初期化を止めないよう、`createMessageId`は`randomUUID`、`getRandomValues`、非機密のUUID形式フォールバックの順で生成する。
+- Extension HostのTypeScript出力は実行時にZodを解決できない配布環境があるため、`scripts/build-extension.mjs`でExtension Hostのエントリーポイントをesbuildバンドルし、`vscode`以外のランタイム依存を成果物へ内包する。
+- Zodがバンドルへ含める固定のJSON SchemaメタデータとURL検証テンプレートは通信先ではないため、`scripts/check-webview-security.mjs`で限定的に許可した。CSPの`connect-src 'none'`は維持している。
+- `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`（32件）、`pnpm check:webview-security`は成功した。Extension Development Hostの実操作確認は、この環境にVS Code実行バイナリがないため未実施である。

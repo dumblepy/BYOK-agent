@@ -1284,21 +1284,192 @@ interface ToolActivityView {
 
 ## 14.3 Webview通信
 
-すべてのメッセージを判別共用体で定義する。
+Extension HostとWebviewの通信は、VS Code Webview APIの`postMessage`を搬送路とし、その上に本拡張専用のバージョン付きメッセージプロトコルを定義する。WebviewはUI状態の投影とユーザー操作を担当し、会話・Agent実行・権限・変更の正本はExtension Hostが保持する。
+
+### 14.3.1 共通エンベロープ
+
+すべてのメッセージは、方向に関係なく同じエンベロープを持つ。`type`が判別子であり、`payload`は`type`ごとに異なる判別共用体の要素である。
+
+```ts
+type ProtocolVersion = "1.0";
+
+interface MessageEnvelope<TType extends string, TPayload> {
+  protocolVersion: ProtocolVersion;
+  messageId: string;       // UUID。送信側が生成する一意なID
+  type: TType;
+  sentAt: number;           // Unix epoch milliseconds
+  correlationId?: string;  // 要求と応答・イベントを関連付けるID
+  payload: TPayload;
+}
+```
+
+`protocolVersion`は互換性のあるメジャー・マイナー表記とする。MVPでは`"1.0"`だけを受け付け、メジャー番号が異なるメッセージは処理せず、プロトコルエラーとして扱う。後方互換なマイナー更新を行う場合は、受信側が未知の任意フィールドを無視できるようにし、既存の必須フィールドや既存の`type`の意味を変更しない。互換性を壊す変更はメジャー番号を上げる。
+
+`messageId`は再送・重複排除とログ相関に使う。`correlationId`は要求に対する状態通知やエラーを関連付けるために使い、UI入力の`messageId`をそのまま実行IDとして扱わない。時刻は表示・診断用途に限り、認証や認可の根拠にしない。
+
+### 14.3.2 UIからExtension Hostへのメッセージ
 
 ```ts
 type UiToExtensionMessage =
-  | { type: "send-message"; threadId: string; text: string }
-  | { type: "cancel-run"; runId: string }
-  | { type: "approve-tool"; approvalId: string }
-  | { type: "reject-tool"; approvalId: string }
-  | { type: "apply-change-set"; changeSetId: string }
-  | { type: "discard-change-set"; changeSetId: string }
-  | { type: "select-model"; modelId: string }
-  | { type: "set-permission"; profile: PermissionProfile };
+  | MessageEnvelope<"ui-ready", {
+      clientInstanceId: string;
+      supportedProtocolVersions: readonly ProtocolVersion[];
+    }>
+  | MessageEnvelope<"send-message", {
+      threadId: string;
+      text: string;
+    }>
+  | MessageEnvelope<"cancel-run", {
+      runId: string;
+    }>
+  | MessageEnvelope<"approve-tool", {
+      approvalId: string;
+    }>
+  | MessageEnvelope<"reject-tool", {
+      approvalId: string;
+      reason?: string;
+    }>
+  | MessageEnvelope<"apply-change-set", {
+      changeSetId: string;
+    }>
+  | MessageEnvelope<"discard-change-set", {
+      changeSetId: string;
+    }>
+  | MessageEnvelope<"select-model", {
+      modelId: string;
+    }>
+  | MessageEnvelope<"set-permission", {
+      profile: PermissionProfile;
+    }>
+  | MessageEnvelope<"request-thread-snapshot", {
+      threadId: string;
+    }>;
 ```
 
-受信内容はZodまたはJSON Schemaで必ず検証する。
+`ui-ready`はWebviewの初期化完了時に一度だけ送信する。Extension Hostはこれを契機に現在のUI向けスナップショットを返す。`send-message`、承認、ChangeSet適用などの操作は、Extension Host側で現在のスレッド・実行・権限・`baseHash`を再確認する。メッセージに含まれるIDの存在だけを根拠に操作を許可してはならない。
+
+### 14.3.3 Extension HostからUIへのメッセージ
+
+```ts
+type ExtensionToUiMessage =
+  | MessageEnvelope<"host-ready", {
+      clientInstanceId: string;
+      protocolVersion: ProtocolVersion;
+    }>
+  | MessageEnvelope<"thread-snapshot", {
+      threadId: string;
+      revision: number;
+      events: readonly ThreadEvent[];
+    }>
+  | MessageEnvelope<"thread-event", {
+      threadId: string;
+      sequence: number;
+      event: ThreadEvent;
+    }>
+  | MessageEnvelope<"run-state", {
+      runId: string;
+      threadId: string;
+      state: AgentRuntimeState;
+      sequence: number;
+    }>
+  | MessageEnvelope<"approval-requested", {
+      approvalId: string;
+      action: ProposedActionSummary;
+      expiresAt?: number;
+    }>
+  | MessageEnvelope<"change-set-updated", {
+      changeSetId: string;
+      status: ChangeSetStatus;
+      files: readonly ChangeFileSummary[];
+    }>
+  | MessageEnvelope<"model-list", {
+      models: readonly ModelSummary[];
+      selectedModelId?: string;
+    }>
+  | MessageEnvelope<"permission-updated", {
+      profile: PermissionProfile;
+    }>
+  | MessageEnvelope<"protocol-error", {
+      code: "UNSUPPORTED_VERSION" | "INVALID_MESSAGE" | "MESSAGE_TOO_LARGE";
+      message: string;
+      rejectedMessageId?: string;
+    }>
+  | MessageEnvelope<"error", {
+      code: AgentErrorCode;
+      message: string;
+      retryable: boolean;
+    }>;
+```
+
+`thread-event`と`run-state`は、それぞれの`threadId`または`runId`単位で単調増加する`sequence`を持つ。UIは古いイベントや重複イベントを適用せず、欠番を検出した場合は`request-thread-snapshot`で正本を再取得する。Extension HostからのイベントはUIを直接操作せず、検証済みの状態更新としてUIのReducerに渡す。
+
+上記の`*Summary`型は表示に必要なメタデータだけを含む。APIキー、Authorizationヘッダー、生の環境変数、秘密情報、不要なファイル内容、非公開推論内容をメッセージへ含めない。ファイル変更はChangeSetのID・ファイル名・差分要約を基本とし、詳細は権限確認済みのExtension Host処理から必要最小限だけ公開する。
+
+### 14.3.4 型定義と受信検証
+
+Zodスキーマをメッセージプロトコルの単一の正本とし、`z.infer`からTypeScript型を導出する。手書きの型だけを信頼してはならない。
+
+```ts
+const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
+  uiReadySchema,
+  sendMessageSchema,
+  cancelRunSchema,
+  approveToolSchema,
+  rejectToolSchema,
+  applyChangeSetSchema,
+  discardChangeSetSchema,
+  selectModelSchema,
+  setPermissionSchema,
+  requestThreadSnapshotSchema,
+]);
+
+type UiToExtensionMessage = z.infer<typeof uiToExtensionMessageSchema>;
+```
+
+実装時は次の2つの境界で必ず`safeParse`を実行する。
+
+1. Extension Hostの`onDidReceiveMessage`で、Webviewから届いた`unknown`を検証してからDispatcherへ渡す。
+2. Webview側の`window`メッセージ受信処理で、Extension Hostから届いた値を検証してからReducerへ渡す。
+
+検証では、エンベロープ、プロトコルバージョン、`type`、payloadの型、文字列長、ID形式、列挙値、配列上限を確認する。JSON以外の値、未知の`type`、未対応バージョン、必須フィールド欠損、過大なペイロードは拒否する。受信した値を検証前にDOM、ログ、ファイル操作、権限判定へ渡してはならない。拒否理由はユーザー入力やファイル内容を反射せず、診断に必要な最小限の情報だけを`protocol-error`として返す。
+
+### 14.3.5 送受信・ライフサイクル
+
+```text
+Webview起動
+  └─ ui-ready(protocolVersion: "1.0")
+       └─ Extension Hostが検証・接続状態を確立
+            ├─ host-ready
+            ├─ thread-snapshot / model-list / permission-updated
+            └─ 以後、thread-event / run-state / approval-requested を配信
+
+UI操作
+  └─ UIメッセージ(messageId, correlationId)
+       └─ Hostで検証 → 権限・状態を再評価 → 正本を更新
+            └─ 応答イベントまたは error(correlationId) を配信
+```
+
+Webviewの破棄・再生成は通信セッションの再接続として扱う。古い`clientInstanceId`からの操作を新しいUIセッションへ引き継がず、再生成後は`ui-ready`からスナップショットを再取得する。実行中のAgentをUIの破棄だけでキャンセルせず、キャンセルは明示的な`cancel-run`と権限・ライフサイクル上の安全な停止処理で行う。
+
+送信処理は、JSONシリアライズ可能な検証済みメッセージだけを渡す共通`MessageTransport`へ集約する。送信失敗、破棄済みWebview、サイズ超過は呼び出し元へ返し、黙って捨てない。初期実装では要求の再送を自動化せず、重複排除は`messageId`、状態の整合は`sequence`とスナップショットで行う。
+
+### 14.3.6 設計上の制約と完了条件
+
+- UI→Extension、Extension→UIの全メッセージが共通エンベロープと判別共用体を持つ。
+- 両方向の受信境界でZodの実行時検証を通過した値だけを内部処理へ渡す。
+- `protocolVersion: "1.0"`、`messageId`、必要な`correlationId`、イベントの`sequence`をテストで検証する。
+- 未知のメッセージ、異なるメジャーバージョン、必須フィールド欠損、誤った型、過大ペイロードを安全に拒否する。
+- UI再生成後に`ui-ready`→スナップショット取得で正本と表示を再同期できる。
+- 操作要求と状態通知を相関付け、重複イベントや欠番をUIが安全に処理できる。
+- メッセージを経由して秘密情報や不要なワークスペース情報がWebviewへ渡らない。
+
+```ts
+interface MessageTransport {
+  sendToHost(message: UiToExtensionMessage): Promise<void>;
+  sendToUi(message: ExtensionToUiMessage): Promise<void>;
+  dispose(): void;
+}
+```
 
 ## 14.4 Webview状態の保持と再表示
 

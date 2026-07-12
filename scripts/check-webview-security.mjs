@@ -16,12 +16,25 @@ const allowedNamespaceUrls = new Set([
   "http://www.w3.org/1998/Math/MathML",
   "http://www.w3.org/1999/xhtml",
 ]);
+const allowedValidationMetadataUrls = new Set([
+  "https://json-schema.org/draft/2020-12/schema",
+  "http://json-schema.org/draft-07/schema#",
+  "http://json-schema.org/draft-04/schema#",
+]);
+const allowedValidationTemplates = [/^http:\/\/\[\$\{(?:payload\.value|address)\}\]$/];
 const externalUrls = [...bundle.matchAll(/https?:\/\/[^\s"'`]+/gi)].map(([url]) => url);
 const violations = forbiddenPatterns
   .filter(({ pattern }) => pattern.test(bundle))
   .map(({ name }) => name);
 
-if (externalUrls.some((url) => !allowedNamespaceUrls.has(url))) {
+if (
+  externalUrls.some(
+    (url) =>
+      !allowedNamespaceUrls.has(url) &&
+      !allowedValidationMetadataUrls.has(url) &&
+      !allowedValidationTemplates.some((pattern) => pattern.test(url)),
+  )
+) {
   violations.push("外部HTTP URL");
 }
 
