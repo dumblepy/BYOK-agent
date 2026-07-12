@@ -334,8 +334,6 @@ function App() {
         onPermissionConfirm={handlePermissionConfirm}
         onPermissionCancel={() => dispatchPermissionSelector({ type: "confirmation-cancelled" })}
       />
-
-      <p class="hint">BYOK設定は後続の設定画面で追加できます。</p>
     </main>
   );
 }
