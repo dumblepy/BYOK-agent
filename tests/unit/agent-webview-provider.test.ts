@@ -65,7 +65,7 @@ describe("AgentWebviewProvider", () => {
     expect(view.webview.options?.localResourceRoots?.[0]).toMatchObject({
       path: "/extension/out/webview",
     });
-    expect(view.webview.asWebviewUri).toHaveBeenCalledTimes(2);
+    expect(view.webview.asWebviewUri).toHaveBeenCalledTimes(3);
 
     const csp = view.webview.html.match(
       /http-equiv="Content-Security-Policy"\s+content="([^"]+)"/,
@@ -78,7 +78,7 @@ describe("AgentWebviewProvider", () => {
     expect(csp).toContain("script-src 'nonce-");
     expect(csp).toContain("connect-src 'none'");
     expect(csp).toContain("img-src 'none'");
-    expect(csp).toContain("font-src 'none'");
+    expect(csp).toContain("font-src vscode-webview://test");
     expect(csp).not.toContain("unsafe-inline");
     expect(csp).not.toContain("unsafe-eval");
     expect(csp).not.toMatch(/script-src[^;]*vscode-webview/);
@@ -88,6 +88,9 @@ describe("AgentWebviewProvider", () => {
     expect(csp).toContain(`script-src 'nonce-${script?.[1]}'`);
     expect(script?.[2]).toBe("vscode-resource:/extension/out/webview/main.js");
     expect(view.webview.html).toContain('href="vscode-resource:/extension/out/webview/main.css"');
+    expect(view.webview.html).toContain(
+      'href="vscode-resource:/extension/out/webview/codicon.css"',
+    );
     expect(view.webview.html).not.toContain("<script>");
   });
 

@@ -88,22 +88,10 @@ export function ModelSelector({
         <span class="model-selector-button-label">
           {selectedModel ? selectedModel.label : "モデル未選択"}
         </span>
-        <svg
-          class={`model-selector-chevron ${isOpen ? "model-selector-chevron-open" : ""}`}
-          width="12"
-          height="12"
-          viewBox="0 0 12 12"
-          fill="none"
+        <i
+          class={`codicon codicon-chevron-down model-selector-chevron ${isOpen ? "model-selector-chevron-open" : ""}`}
           aria-hidden="true"
-        >
-          <path
-            d="M3 4.5L6 7.5L9 4.5"
-            stroke="currentColor"
-            strokeWidth="1.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
+        />
       </button>
 
       {isOpen ? (
@@ -117,7 +105,7 @@ export function ModelSelector({
               onClick={() => handleSelect("low")}
             >
               <span>低</span>
-              <span class="model-selector-menu-check">✓</span>
+              <i class="codicon codicon-check model-selector-menu-check" aria-label="選択中" />
             </button>
             <button
               type="button"
@@ -162,7 +150,7 @@ export function ModelSelector({
               >
                 <span>{model.label}</span>
                 {model.id === state.selectedModelId ? (
-                  <span class="model-selector-menu-check">✓</span>
+                  <i class="codicon codicon-check model-selector-menu-check" aria-label="選択中" />
                 ) : null}
               </button>
             ))}
@@ -177,15 +165,10 @@ export function ModelSelector({
               role="menuitem"
             >
               <span>速度</span>
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" aria-hidden="true">
-                <path
-                  d="M4.5 3L7.5 6L4.5 9"
-                  stroke="currentColor"
-                  strokeWidth="1.5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
+              <i
+                class="codicon codicon-chevron-right model-selector-menu-item-submenu"
+                aria-hidden="true"
+              />
             </button>
           </div>
         </div>

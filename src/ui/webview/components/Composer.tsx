@@ -92,14 +92,7 @@ export function Composer({
       <div class="composer-toolbar">
         <div class="composer-toolbar-left">
           <button type="button" class="composer-toolbar-button" aria-label="添付ファイルを追加">
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path
-                d="M8 3V13M3 8H13"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-              />
-            </svg>
+            <i class="codicon codicon-attach" aria-hidden="true" />
           </button>
           <PermissionProfileSelector
             state={permissionSelectorState}
@@ -132,15 +125,7 @@ export function Composer({
             aria-label="メッセージを送信"
             onClick={onSubmit}
           >
-            <svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
-              <path
-                d="M8 13V3M8 3L4 7M8 3L12 7"
-                stroke="currentColor"
-                strokeWidth="1.5"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
+            <i class="codicon codicon-send" aria-hidden="true" />
           </button>
         </div>
       </div>

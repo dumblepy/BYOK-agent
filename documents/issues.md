@@ -85,9 +85,9 @@
 
 - [UI] VS Codeテーマ対応を実装する
 
-  - VS CodeのCSS変数を使用する
-  - Light、Dark、High Contrastで表示を確認する
-  - Codiconを使用し、独自画像依存を減らす
+  - VS CodeのCSS変数を使用する（✅ 実装済み）
+  - Light、Dark、High Contrastで表示を確認する（⚠️ High Contrast未対応）
+  - Codiconを使用し、独自画像依存を減らす（❌ 未着手）
   - 完了条件: 主要テーマで視認性が維持される
 
 ---

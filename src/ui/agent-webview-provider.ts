@@ -41,7 +41,7 @@ function createContentSecurityPolicy(webview: vscode.Webview, nonce: string): st
     "form-action 'none'",
     "connect-src 'none'",
     "img-src 'none'",
-    "font-src 'none'",
+    `font-src ${webview.cspSource}`,
     `style-src ${webview.cspSource}`,
     `script-src 'nonce-${nonce}'`,
   ].join("; ");
@@ -405,6 +405,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const styleUri = escapeHtmlAttribute(
       webview.asWebviewUri(vscode.Uri.joinPath(webviewRoot, "main.css")).toString(),
     );
+    const codiconStyleUri = escapeHtmlAttribute(
+      webview.asWebviewUri(vscode.Uri.joinPath(webviewRoot, "codicon.css")).toString(),
+    );
     const contentSecurityPolicy = escapeHtmlAttribute(createContentSecurityPolicy(webview, nonce));
 
     return `<!DOCTYPE html>
@@ -417,6 +420,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       content="${contentSecurityPolicy};"
     />
     <link rel="stylesheet" href="${styleUri}" />
+    <link rel="stylesheet" href="${codiconStyleUri}" />
     <title>BYOK Agent</title>
   </head>
   <body>

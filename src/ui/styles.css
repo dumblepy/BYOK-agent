@@ -795,3 +795,84 @@ textarea:focus {
   cursor: pointer;
   opacity: 1;
 }
+
+/* ── Codicon ── */
+
+.composer-toolbar-button .codicon,
+.model-selector-button .codicon,
+.model-selector-inline-button .codicon {
+  font-size: 16px;
+}
+
+.composer-send-button .codicon {
+  font-size: 18px;
+}
+
+.composer-stop-button .codicon {
+  font-size: 16px;
+}
+
+.welcome-mark .codicon {
+  font-size: 18px;
+}
+
+/* ── High Contrast ── */
+
+@media (forced-colors: active) {
+  .model-selector-menu,
+  .model-selector-inline-menu,
+  .permission-selector-menu,
+  .permission-confirmation-panel,
+  .composer,
+  .welcome-card,
+  .thread-message,
+  .thread-code-block {
+    border-color: CanvasText;
+    box-shadow: none;
+  }
+
+  .composer-input {
+    border-color: CanvasText;
+  }
+
+  .composer-input:focus,
+  .model-selector-button:focus-visible,
+  .model-selector-inline-button:focus-visible,
+  .composer-toolbar-button:focus-visible,
+  .permission-confirm-button:focus-visible {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+
+  .composer-send-button {
+    border: 1px solid ButtonText;
+  }
+
+  .permission-confirmation {
+    background: Canvas;
+  }
+
+  .model-selector-menu-item:hover,
+  .model-selector-menu-item:focus-visible,
+  .model-selector-inline-menu-item:hover,
+  .model-selector-inline-menu-item:focus-visible,
+  .permission-selector-menu-item:hover,
+  .permission-selector-menu-item:focus-visible {
+    background: Highlight;
+    color: HighlightText;
+    outline: none;
+  }
+
+  .model-selector-menu-item-selected,
+  .model-selector-inline-menu-item-selected,
+  .permission-selector-menu-item-selected {
+    background: Highlight;
+    color: HighlightText;
+  }
+
+  .model-selector-menu-check,
+  .model-selector-inline-menu-check,
+  .permission-selector-check {
+    color: HighlightText;
+  }
+}

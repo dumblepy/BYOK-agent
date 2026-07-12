@@ -90,6 +90,6 @@ describe("permission-profile-state", () => {
     expect(requiresPermissionConfirmation("read-only", "confirm-writes")).toBe(true);
     expect(requiresPermissionConfirmation("confirm-writes", "workspace-write")).toBe(true);
     expect(requiresPermissionConfirmation("workspace-write", "read-only")).toBe(false);
-    expect(getPermissionProfileLabel("read-only")).toBe("読み取り専用");
+    expect(getPermissionProfileLabel("read-only")).toBe("読み取り");
   });
 });

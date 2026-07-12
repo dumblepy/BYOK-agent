@@ -1,127 +1,135 @@
 ---
-description: 6-ui-webviewのcontent-security-policyを実装する
+description: 6-ui-webviewのcontent-security-policyを実装するブランチでの開発時に読み込む
 alwaysApply: false
 ---
-# 権限プロファイル選択UI
+# VS Codeテーマ対応とCodicon移行
 
-このブランチでは、Agent Sidebar Webviewに権限プロファイルの選択UIを追加する。UIは`read-only`、`confirm-writes`、`workspace-write`だけを選択肢として表示し、現在の要求プロファイルと実効権限を常時表示する。権限判定、Workspace Trustの評価、保存、Agent実行への反映はExtension Hostを正本とする。
+このブランチでは、Agent Sidebar WebviewのUIがVS CodeのLight、Dark、High Contrastの各テーマで正しく表示されるよう、CSS変数の整備とCodiconへのアイコン移行を行う。VS Code標準テーマトークンとCodiconを使用し、独自画像依存を排除する。
 
 ## 実装方針
 
-- Webviewは、Hostから受け取った権限要約を表示し、選択要求を送る投影層に限定する。Permission Policy、Thread Store、Workspace Trust、Agent RuntimeはExtension Host側に置く。
-- `autonomous`は型として存在しても、このUIの選択肢、既定値、説明文、ショートカットには含めない。明示的な別途有効化がない限り利用不可とする。
-- 権限状態はHostからの`permission-updated`を正本として表示する。UIの楽観的更新やWebview状態への永続化は行わず、Hostの確定通知を受けてから表示を更新する。
-- プロファイル変更は現在のスレッドの`permissionProfile`を更新する操作とし、`threadId`と`expectedThreadRevision`を付けてHostへ送る。Hostはセッション、スレッド、revision、実行状態、Workspace Trustを再検証する。
-- `confirm-writes`または`workspace-write`への切り替えなど、書き込み能力を広げる変更は、変更内容と影響範囲を説明する確認UIを表示してから要求を送る。確認前に選択状態を変更しない。
-- Workspace TrustがRestrictedのときは、コマンド実行、自動ファイル変更、ワークスペース由来の外部モデルURL・MCPを有効化しない。要求プロファイルと実効権限が異なる場合は、両方をUIに表示する。
-- Agent実行開始時にHostがスレッド正本からプロファイルを解決し、`AgentRunRequest`へ渡す。Agent実行中の各Tool CallでもPermission PolicyとWorkspace Trustを再評価し、UIから渡されたプロファイルを認可の根拠にしない。
-- 既存のバージョン付きEnvelope、Zodの受信検証、messageIdの重複排除、correlationIdを使用する。権限の状態通知にAPIキー、認証ヘッダー、ファイル内容、Provider設定を含めない。
-- 表示はVS Code標準テーマトークンとCodiconを使い、状態を色だけで区別しない。キーボード操作、フォーカス、`aria-live`、確認ダイアログのフォーカストラップを設計する。
+### 1. VS Code CSS変数の使用（確認済み）
 
-## 実装対象（次の実装フェーズ）
+`src/ui/styles.css` では既に `--vscode-*` 変数が広く使用されている。この状態を維持し、新たに追加するスタイルでもVS Code標準テーマトークンを使用する。
 
-- `src/ui/webview/components/PermissionProfileSelector.tsx`
-- `src/ui/webview/permission-profile-state.ts`
-- `src/ui/main.tsx`
-- `src/ui/styles.css`
-- `src/ui/webview-protocol.ts`
-- Extension Hostの権限ルーティング、Permission Policy、Thread Store、Agent実行準備境界
-- `tests/unit/`、`tests/extension-integration/`、`tests/agent-simulation/`の権限選択・通信・永続化・Agent反映テスト
+### 2. High Contrastモード対応
 
-## 状態と操作契約
+VS CodeのHigh Contrastテーマでは、`forced-colors` メディアクエリが有効になる。WindowsのHigh Contrastモードでは `--vscode-*` CSS変数が一部上書きされるため、次の対応を行う。
+
+- `@media (forced-colors: active)` および `@media (forced-colors: none)` のメディアクエリを追加する
+- High Contrastモードでは `Canvas`、`CanvasText`、`ButtonFace`、`ButtonText`、`Highlight`、`HighlightText` などのシステム色を使用する
+- ボーダー、背景、テキスト色がシステム設定で上書きされた場合も、操作可能なUI要素の識別が維持されるよう、`border` や `outline` を明示する
+- アイコンや状態表示が色だけに依存しないよう、`aria-label` やテキストラベルを併用する（設計書のアクセシビリティ方針を維持）
+- `box-shadow` はHigh Contrastモードで無効化されるため、境界の識別には `border` を使用する
+
+### 3. Codiconへの移行
+
+VS Codeに標準搭載されているCodicon（`codicon.css`）を使用し、現在のインラインSVGを置き換える。
+
+#### 3.1 Codiconの読み込み方法
+
+WebviewのHTML生成時に、VS Codeが提供する `codicon.css` を `<link>` で読み込む。パスはVS Codeの `vscode-codicon` パッケージから解決する。
 
 ```ts
-type PermissionSelectorPhase =
-  | "loading"
-  | "ready"
-  | "confirming"
-  | "updating"
-  | "error";
-
-type WorkspaceTrustState = "trusted" | "restricted";
-
-interface PermissionSummary {
-  threadId: string;
-  threadRevision: number;
-  requestedProfile: "read-only" | "confirm-writes" | "workspace-write";
-  effectiveProfile: "read-only" | "confirm-writes" | "workspace-write";
-  workspaceTrust: WorkspaceTrustState;
-  restrictions: readonly ("commands-disabled" | "automatic-writes-disabled")[];
-}
-
-interface PermissionSelectorState {
-  phase: PermissionSelectorPhase;
-  summary?: PermissionSummary;
-  pendingProfile?: PermissionSummary["requestedProfile"];
-  errorMessage?: string;
-}
+// agent-webview-provider.ts での読み込み例
+const codiconUri = webview.asWebviewUri(
+  Uri.joinPath(extensionUri, "node_modules", "@vscode/codicon", "dist", "codicon.css")
+);
 ```
 
-- `loading`: 初期スナップショット待ち。選択UIは操作不可。
-- `ready`: 現在の要求プロファイル、実効プロファイル、Workspace Trust、制限を常時表示する。
-- `confirming`: 書き込み能力を広げる変更の説明を表示し、承認またはキャンセルを待つ。
-- `updating`: `set-permission`を一度だけ送信し、確定通知まで操作を無効化する。
-- `error`: 確定済みの権限状態を維持し、安全なエラー文を表示して再試行可能にする。
-- 現在表示中の`threadId`と異なる通知、古い`threadRevision`、未対応のプロファイルはReducerへ適用しない。
-- 選択確定後の次の`send-message`は、HostがThread Storeから最新の`permissionProfile`を解決する。Webviewは`send-message`へプロファイルを追加しない。
+または、ビルド時にCodiconのCSSをバンドルに含める方法も検討する。
+
+#### 3.2 置き換え対象のアイコン
+
+| 現在の実装 | Codicon | 場所 |
+|---|---|---|
+| 添付ファイルSVG（`<svg>...path...</svg>`） | `codicon-attach` | `Composer.tsx` |
+| モデル選択のチェブロンSVG（上下） | `codicon-chevron-up` / `codicon-chevron-down` | `ModelSelector.tsx` |
+| インラインモデル選択のチェブロンSVG | `codicon-chevron-up` / `codicon-chevron-down` | `ModelSelectorInline.tsx` |
+| 送信ボタン（円形+矢印） | `codicon-send` | `Composer.tsx` |
+| 停止ボタン | `codicon-stop` | `Composer.tsx` |
+| チェックマーク（選択状態） | `codicon-check` | `ModelSelector.tsx`、`ModelSelectorInline.tsx`、`PermissionProfileSelector.tsx` |
+| ウェルカムマーク（星/スパークル） | `codicon-sparkle` | `styles.css`（`.welcome-mark`） |
+
+#### 3.3 実装手順
+
+1. `@vscode/codicon` パッケージを依存関係に追加する（`pnpm add @vscode/codicon`）
+2. Webview HTML生成時にCodicon CSSを読み込む（`agent-webview-provider.ts`）
+3. 各コンポーネントのインラインSVGを `<i class="codicon codicon-xxx"></i>` に置き換える
+4. アイコンサイズや色の調整が必要な場合、CSSクラスで `codicon` のスタイルを上書きする
+5. アクセシビリティ：アイコンのみのボタンには `aria-label` を維持する
+
+### 4. 主要テーマでの視認性確認
+
+完了条件として、次のテーマでUIの全要素が視認可能であることを確認する。
+
+- **Light系**: `Default Light+`、`Light Modern`
+- **Dark系**: `Default Dark+`、`Dark Modern`
+- **High Contrast系**: `Default High Contrast`、`Default High Contrast Light`
+
+確認対象のUI要素：
+- ヘッダー（モデル選択、権限選択）
+- メッセージスレッド（ユーザー/エージェント発言）
+- Composer（入力欄、送信ボタン、停止ボタン）
+- 権限確認ダイアログ
+- モデル選択メニュー
+- 空状態・エラー状態の表示
 
 ## 進捗
 
-- [x] `AGENTS.md`、`project.mdc`、`branch.mdc`、旧ブランチルール、権限・UI・通信・保存設計を確認する
-- [x] `documents/design.md`へ権限プロファイル選択UIの実装方針と詳細設計を記録する
-- [x] 要求プロファイル、実効プロファイル、Workspace Trust、危険モード確認、Agent実行反映の契約を定義する
-- [x] 権限プロファイルUIと状態Reducerを実装する
-- [x] `set-permission`／`permission-updated`の通信スキーマとHostルーティングを実装する
-- [x] Thread Storeへの原子的な保存とAgentRunRequestへの反映を実装する
-- [x] UI、通信、競合、Restricted Mode、Agent実行反映のテストを追加する
-- [x] 型チェック、Lint、フォーマット、テスト、Webviewセキュリティ検査を実行する
+- [ ] `@vscode/codicon` パッケージを依存関係に追加する
+- [ ] Webview HTMLでCodicon CSSを読み込む
+- [ ] 各コンポーネントのインラインSVGをCodiconに置き換える
+- [ ] High Contrastモード対応のCSSを追加する
+- [ ] Light/Dark/High Contrastテーマで視認性を確認する
+- [ ] 型チェック、Lint、フォーマット、テスト、Webviewセキュリティ検査を実行する
 
 ## 完了条件
 
-1. `read-only`、`confirm-writes`、`workspace-write`を選択でき、現在の要求プロファイルと実効権限を常時確認できる。
-2. 書き込み能力を広げる切り替え前に、変更内容、許可される操作、常時確認対象を説明し、承認なしではHostへ要求を送らない。
-3. 選択結果が現在のスレッドの`meta.json.permissionProfile`へ安全に保存される。
-4. 選択確定後の次回Agent実行で、Hostがスレッド正本から解決したプロファイルが`AgentRunRequest`と各Tool Callの権限判定へ反映される。
-5. 未知プロファイル、別スレッド、古いrevision、実行中の変更、重複要求、Restricted Modeによる制限が安全に処理される。
-6. Webviewへ秘密情報や不要なワークスペース情報を渡さず、Light、Dark、High Contrastで状態と操作可否を識別できる。
+1. すべてのアイコンがCodiconに置き換わり、インラインSVGが残っていない
+2. High Contrastテーマ（`forced-colors: active`）で全UI要素が識別可能
+3. Light、Dark、High Contrastの主要テーマで視認性が維持される
+4. アイコンのみのボタンに適切な `aria-label` が設定されている
+5. `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、`pnpm check:webview-security` が成功する
 
 ## 対象外
 
-- `autonomous`をユーザー向けUIから有効化する機能
-- Permission Policyそのものの全Tool Category定義、承認ダイアログ、ChangeSet適用、コマンド実行機構の実装
-- Agent Runtime、Provider、Context、Prompt、Tool Calling Loopの新規実装
-- Workspace Trust機構自体の変更、ワークスペース外操作の許可
-- モデル選択UI、Composer、ThreadView、CSPの再設計
-- APIキー、認証ヘッダー、環境変数、ファイル内容、非公開推論内容のWebview表示・保存
+- 新規アイコンの追加やUIレイアウトの変更
+- モデル選択、権限選択、Composer、ThreadViewの機能変更
+- WebviewのHTML、CSP、nonce、`localResourceRoots` の基本設計変更
 - `git add`、`git commit`、既存の未コミット変更の整理・上書き
-
-## 検証方針（実装フェーズ）
-
-- 状態テストで、初期スナップショット、現在状態表示、危険モード確認、キャンセル、更新中の二重操作抑止、成功、失敗、再試行、古い通知の無視を検証する。
-- 通信テストで、Envelope、`threadId`、`expectedThreadRevision`、`correlationId`、列挙値検証、messageId重複排除を検証する。
-- Hostテストで、スレッド境界、revision競合、Run中拒否、Workspace Trustによる実効権限制限、`meta.json`の原子的更新を検証する。
-- Agentシミュレーションで、選択確定後の次回RunがThread Storeのプロファイルを使い、各Tool Callで再評価されることを検証する。
-- 実APIテストは追加せず、明示的な環境変数がある場合だけ既存方針に従って実行する。
 
 ## 参考資料
 
 - `AGENTS.md`
-- `.cursor/rules/project.mdc`
+- `.cursor/rules/project.mdc`（`SYW-UI-001`: VS Code標準テーマトークンとCodiconを使用）
 - `.cursor/rules/branch.mdc`
-- `documents/design.md` §11、§14.2、§14.3、§15、§16、§17
-- `documents/issues.md`のMilestone 1「権限プロファイル選択UI」およびMilestone 10「権限と承認」
-- `src/ui/webview-protocol.ts`
-- `src/ui/webview-protocol-client.ts`
-- `src/ui/extension-webview-protocol.ts`
-- `src/storage/`
-- `src/permissions/`
-- `src/agent/`
+- `documents/issues.md`「[UI] VS Codeテーマ対応を実装する」
+- `documents/design.md`「14. UI設計」
+- `src/ui/styles.css`
+- `src/ui/webview/components/Composer.tsx`
+- `src/ui/webview/components/ModelSelector.tsx`
+- `src/ui/webview/components/ModelSelectorInline.tsx`
+- `src/ui/webview/components/PermissionProfileSelector.tsx`
+- `src/ui/agent-webview-provider.ts`
+- VS Code Codicon: https://code.visualstudio.com/api/references/icons-in-labels
+- `@vscode/codicon` npm: https://www.npmjs.com/package/@vscode/codicon
 
 ## 調査結果・設計まとめ
 
-- `documents/design.md`には4種のPermission Profile、スレッドメタデータの`permissionProfile`、`set-permission`、`permission-updated`の既存契約がある。今回のUIでは`autonomous`を公開選択肢にしない。
-- 現行契約の`set-permission`はプロファイルだけを持つため、モデル選択UIと同じく、対象スレッドと楽観的競合検査を明示できるよう`threadId`と`expectedThreadRevision`を追加する設計とする。
-- Restricted Modeでは要求プロファイルと実際に利用可能な権限が一致しない可能性があるため、`requestedProfile`と`effectiveProfile`、制限理由を分離して表示する。
-- 選択結果の正本はWebview状態ではなく`globalStorage/threads/<thread-id>/meta.json`とする。Hostは保存成功後にだけ`permission-updated`を発行する。
-- Agent実行時は`send-message`の値を認可の根拠にせず、Hostが送信時点のThread StoreとWorkspace Trustから権限コンテキストを再構築する。Tool実行前にも再評価する。
-- UIは権限を付与する主体ではなく、Hostの確定状態を表示する主体である。これにより、古いWebview、改ざんされたメッセージ、複数クライアントの競合が権限昇格に直結しない。
+### 現状の確認結果
+
+1. **VS Code CSS変数**: `src/ui/styles.css` 全体で `--vscode-foreground`、`--vscode-sideBar-background`、`--vscode-editorWidget-background` などが広く使用されており、Light/Darkテーマでの表示は問題ない。
+
+2. **High Contrast対応**: `@media (forced-colors: active)` の記述が一切なく、未対応。`box-shadow` に依存した境界表現（`.model-selector-menu`、`.permission-selector-menu` など）はHigh Contrastモードで機能しない。
+
+3. **Codicon**: コードベース内に `codicon` の参照がなく、すべてインラインSVGで実装されている。VS Code標準のCodiconを使用することで、テーマ一貫性の向上とバンドルサイズ削減が期待できる。
+
+4. **`:root { color-scheme: light dark; }`**: 設定済みで、OSのテーマ検出に対応している。
+
+### 実装の優先順位
+
+1. `@vscode/codicon` の追加とCSS読み込み（基盤）
+2. インラインSVG → Codicon の置き換え（コンポーネントごと）
+3. High Contrastモード対応CSSの追加
+4. テーマ別の視認性確認

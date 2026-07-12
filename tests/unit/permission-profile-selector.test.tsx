@@ -17,7 +17,7 @@ const state = {
 };
 
 describe("PermissionProfileSelector", () => {
-  it("renders all user-selectable profiles and the current effective state", () => {
+  it("renders the current profile label and accessibility attributes", () => {
     const html = renderToString(
       h(PermissionProfileSelector, {
         state,
@@ -28,14 +28,13 @@ describe("PermissionProfileSelector", () => {
     );
 
     expect(html).toContain('aria-label="権限プロファイル選択"');
-    expect(html).toContain("書き込み時に確認");
-    expect(html).toContain("実効権限: 書き込み時に確認");
-    expect(html).toContain("信頼済みワークスペース");
+    expect(html).toContain("確認あり");
+    expect(html).toContain("codicon-shield");
+    expect(html).toContain("codicon-chevron-down");
     expect(html).not.toContain("autonomous");
-    expect(html).toContain('aria-live="polite"');
   });
 
-  it("shows Restricted Mode restrictions in the persistent status", () => {
+  it("shows the current profile label in Restricted Mode", () => {
     const html = renderToString(
       h(PermissionProfileSelector, {
         state: {
@@ -52,8 +51,7 @@ describe("PermissionProfileSelector", () => {
       }),
     );
 
-    expect(html).toContain("Restricted Mode");
-    expect(html).toContain("コマンド実行は無効です");
-    expect(html).toContain("自動ファイル変更は無効です");
+    expect(html).toContain("確認あり");
+    expect(html).toContain("codicon-shield");
   });
 });

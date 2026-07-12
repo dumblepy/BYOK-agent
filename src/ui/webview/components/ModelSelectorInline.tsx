@@ -82,22 +82,10 @@ export function ModelSelectorInline({
         onClick={handleToggle}
       >
         <span class="model-selector-inline-label">{modelLabel}</span>
-        <svg
-          class={`model-selector-inline-chevron ${isOpen ? "model-selector-inline-chevron-open" : ""}`}
-          width="10"
-          height="10"
-          viewBox="0 0 10 10"
-          fill="none"
+        <i
+          class={`codicon codicon-chevron-down model-selector-inline-chevron ${isOpen ? "model-selector-inline-chevron-open" : ""}`}
           aria-hidden="true"
-        >
-          <path
-            d="M2.5 4L5 6.5L7.5 4"
-            stroke="currentColor"
-            strokeWidth="1.2"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-          />
-        </svg>
+        />
       </button>
 
       {isOpen ? (
@@ -111,7 +99,10 @@ export function ModelSelectorInline({
               onClick={() => handleSelect("low")}
             >
               <span>低</span>
-              <span class="model-selector-inline-menu-check">✓</span>
+              <i
+                class="codicon codicon-check model-selector-inline-menu-check"
+                aria-label="選択中"
+              />
             </button>
             <button
               type="button"
@@ -156,7 +147,10 @@ export function ModelSelectorInline({
               >
                 <span>{model.label}</span>
                 {model.id === state.selectedModelId ? (
-                  <span class="model-selector-inline-menu-check">✓</span>
+                  <i
+                    class="codicon codicon-check model-selector-inline-menu-check"
+                    aria-label="選択中"
+                  />
                 ) : null}
               </button>
             ))}
@@ -171,15 +165,10 @@ export function ModelSelectorInline({
               role="menuitem"
             >
               <span>速度</span>
-              <svg width="10" height="10" viewBox="0 0 10 10" fill="none" aria-hidden="true">
-                <path
-                  d="M3.5 2.5L6.5 5L3.5 7.5"
-                  stroke="currentColor"
-                  strokeWidth="1.2"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
+              <i
+                class="codicon codicon-chevron-right model-selector-inline-menu-item-submenu"
+                aria-hidden="true"
+              />
             </button>
           </div>
         </div>

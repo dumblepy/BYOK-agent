@@ -4,8 +4,6 @@ import type { JSX } from "preact";
 import {
   getPermissionProfileDescription,
   getPermissionProfileLabel,
-  getPermissionRestrictionLabel,
-  getPermissionStatusLabel,
   type PermissionSelectorState,
 } from "../permission-profile-state";
 import type { UserSelectablePermissionProfile } from "../../../permissions/permission-profile";
@@ -99,9 +97,9 @@ export function PermissionProfileSelector({
         aria-describedby="permission-selector-status permission-selector-error"
         onClick={handleToggle}
       >
-        <span aria-hidden="true">◉</span>
+        <i class="codicon codicon-shield" aria-hidden="true" />
         <span>{currentLabel}</span>
-        <span aria-hidden="true">⌄</span>
+        <i class="codicon codicon-chevron-down" aria-hidden="true" />
       </button>
 
       {isOpen ? (
@@ -121,9 +119,7 @@ export function PermissionProfileSelector({
                 <small>{getPermissionProfileDescription(profile)}</small>
               </span>
               {profile === summary?.requestedProfile ? (
-                <span aria-label="選択中" class="permission-selector-check">
-                  ✓
-                </span>
+                <i class="codicon codicon-check permission-selector-check" aria-label="選択中" />
               ) : null}
             </button>
           ))}
@@ -146,7 +142,8 @@ export function PermissionProfileSelector({
           <div class="permission-confirmation-panel">
             <h2 id="permission-confirmation-title">権限を変更しますか？</h2>
             <p>
-              {getPermissionProfileLabel(state.pendingProfile)}: {getPermissionProfileDescription(state.pendingProfile)}
+              {getPermissionProfileLabel(state.pendingProfile)}:{" "}
+              {getPermissionProfileDescription(state.pendingProfile)}
             </p>
             <div class="permission-confirmation-actions">
               <button type="button" class="composer-toolbar-button" onClick={onCancel}>
