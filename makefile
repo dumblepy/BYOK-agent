@@ -3,4 +3,4 @@ exec:
 	docker compose exec app bash
 
 diff:
-	git diff --cached >> .diff
+	git diff --cached > .diff
