@@ -1,0 +1,135 @@
+---
+description: 6-ui-webviewのcontent-security-policyを実装するブランチでの開発時に読み込む
+alwaysApply: false
+---
+# VS Codeテーマ対応とCodicon移行
+
+このブランチでは、Agent Sidebar WebviewのUIがVS CodeのLight、Dark、High Contrastの各テーマで正しく表示されるよう、CSS変数の整備とCodiconへのアイコン移行を行う。VS Code標準テーマトークンとCodiconを使用し、独自画像依存を排除する。
+
+## 実装方針
+
+### 1. VS Code CSS変数の使用（確認済み）
+
+`src/ui/styles.css` では既に `--vscode-*` 変数が広く使用されている。この状態を維持し、新たに追加するスタイルでもVS Code標準テーマトークンを使用する。
+
+### 2. High Contrastモード対応
+
+VS CodeのHigh Contrastテーマでは、`forced-colors` メディアクエリが有効になる。WindowsのHigh Contrastモードでは `--vscode-*` CSS変数が一部上書きされるため、次の対応を行う。
+
+- `@media (forced-colors: active)` および `@media (forced-colors: none)` のメディアクエリを追加する
+- High Contrastモードでは `Canvas`、`CanvasText`、`ButtonFace`、`ButtonText`、`Highlight`、`HighlightText` などのシステム色を使用する
+- ボーダー、背景、テキスト色がシステム設定で上書きされた場合も、操作可能なUI要素の識別が維持されるよう、`border` や `outline` を明示する
+- アイコンや状態表示が色だけに依存しないよう、`aria-label` やテキストラベルを併用する（設計書のアクセシビリティ方針を維持）
+- `box-shadow` はHigh Contrastモードで無効化されるため、境界の識別には `border` を使用する
+
+### 3. Codiconへの移行
+
+VS Codeに標準搭載されているCodicon（`codicon.css`）を使用し、現在のインラインSVGを置き換える。
+
+#### 3.1 Codiconの読み込み方法
+
+WebviewのHTML生成時に、VS Codeが提供する `codicon.css` を `<link>` で読み込む。パスはVS Codeの `vscode-codicon` パッケージから解決する。
+
+```ts
+// agent-webview-provider.ts での読み込み例
+const codiconUri = webview.asWebviewUri(
+  Uri.joinPath(extensionUri, "node_modules", "@vscode/codicon", "dist", "codicon.css")
+);
+```
+
+または、ビルド時にCodiconのCSSをバンドルに含める方法も検討する。
+
+#### 3.2 置き換え対象のアイコン
+
+| 現在の実装 | Codicon | 場所 |
+|---|---|---|
+| 添付ファイルSVG（`<svg>...path...</svg>`） | `codicon-attach` | `Composer.tsx` |
+| モデル選択のチェブロンSVG（上下） | `codicon-chevron-up` / `codicon-chevron-down` | `ModelSelector.tsx` |
+| インラインモデル選択のチェブロンSVG | `codicon-chevron-up` / `codicon-chevron-down` | `ModelSelectorInline.tsx` |
+| 送信ボタン（円形+矢印） | `codicon-send` | `Composer.tsx` |
+| 停止ボタン | `codicon-stop` | `Composer.tsx` |
+| チェックマーク（選択状態） | `codicon-check` | `ModelSelector.tsx`、`ModelSelectorInline.tsx`、`PermissionProfileSelector.tsx` |
+| ウェルカムマーク（星/スパークル） | `codicon-sparkle` | `styles.css`（`.welcome-mark`） |
+
+#### 3.3 実装手順
+
+1. `@vscode/codicon` パッケージを依存関係に追加する（`pnpm add @vscode/codicon`）
+2. Webview HTML生成時にCodicon CSSを読み込む（`agent-webview-provider.ts`）
+3. 各コンポーネントのインラインSVGを `<i class="codicon codicon-xxx"></i>` に置き換える
+4. アイコンサイズや色の調整が必要な場合、CSSクラスで `codicon` のスタイルを上書きする
+5. アクセシビリティ：アイコンのみのボタンには `aria-label` を維持する
+
+### 4. 主要テーマでの視認性確認
+
+完了条件として、次のテーマでUIの全要素が視認可能であることを確認する。
+
+- **Light系**: `Default Light+`、`Light Modern`
+- **Dark系**: `Default Dark+`、`Dark Modern`
+- **High Contrast系**: `Default High Contrast`、`Default High Contrast Light`
+
+確認対象のUI要素：
+- ヘッダー（モデル選択、権限選択）
+- メッセージスレッド（ユーザー/エージェント発言）
+- Composer（入力欄、送信ボタン、停止ボタン）
+- 権限確認ダイアログ
+- モデル選択メニュー
+- 空状態・エラー状態の表示
+
+## 進捗
+
+- [ ] `@vscode/codicon` パッケージを依存関係に追加する
+- [ ] Webview HTMLでCodicon CSSを読み込む
+- [ ] 各コンポーネントのインラインSVGをCodiconに置き換える
+- [ ] High Contrastモード対応のCSSを追加する
+- [ ] Light/Dark/High Contrastテーマで視認性を確認する
+- [ ] 型チェック、Lint、フォーマット、テスト、Webviewセキュリティ検査を実行する
+
+## 完了条件
+
+1. すべてのアイコンがCodiconに置き換わり、インラインSVGが残っていない
+2. High Contrastテーマ（`forced-colors: active`）で全UI要素が識別可能
+3. Light、Dark、High Contrastの主要テーマで視認性が維持される
+4. アイコンのみのボタンに適切な `aria-label` が設定されている
+5. `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、`pnpm check:webview-security` が成功する
+
+## 対象外
+
+- 新規アイコンの追加やUIレイアウトの変更
+- モデル選択、権限選択、Composer、ThreadViewの機能変更
+- WebviewのHTML、CSP、nonce、`localResourceRoots` の基本設計変更
+- `git add`、`git commit`、既存の未コミット変更の整理・上書き
+
+## 参考資料
+
+- `AGENTS.md`
+- `.cursor/rules/project.mdc`（`SYW-UI-001`: VS Code標準テーマトークンとCodiconを使用）
+- `.cursor/rules/branch.mdc`
+- `documents/issues.md`「[UI] VS Codeテーマ対応を実装する」
+- `documents/design.md`「14. UI設計」
+- `src/ui/styles.css`
+- `src/ui/webview/components/Composer.tsx`
+- `src/ui/webview/components/ModelSelector.tsx`
+- `src/ui/webview/components/ModelSelectorInline.tsx`
+- `src/ui/webview/components/PermissionProfileSelector.tsx`
+- `src/ui/agent-webview-provider.ts`
+- VS Code Codicon: https://code.visualstudio.com/api/references/icons-in-labels
+- `@vscode/codicon` npm: https://www.npmjs.com/package/@vscode/codicon
+
+## 調査結果・設計まとめ
+
+### 現状の確認結果
+
+1. **VS Code CSS変数**: `src/ui/styles.css` 全体で `--vscode-foreground`、`--vscode-sideBar-background`、`--vscode-editorWidget-background` などが広く使用されており、Light/Darkテーマでの表示は問題ない。
+
+2. **High Contrast対応**: `@media (forced-colors: active)` の記述が一切なく、未対応。`box-shadow` に依存した境界表現（`.model-selector-menu`、`.permission-selector-menu` など）はHigh Contrastモードで機能しない。
+
+3. **Codicon**: コードベース内に `codicon` の参照がなく、すべてインラインSVGで実装されている。VS Code標準のCodiconを使用することで、テーマ一貫性の向上とバンドルサイズ削減が期待できる。
+
+4. **`:root { color-scheme: light dark; }`**: 設定済みで、OSのテーマ検出に対応している。
+
+### 実装の優先順位
+
+1. `@vscode/codicon` の追加とCSS読み込み（基盤）
+2. インラインSVG → Codicon の置き換え（コンポーネントごと）
+3. High Contrastモード対応CSSの追加
+4. テーマ別の視認性確認

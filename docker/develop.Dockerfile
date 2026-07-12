@@ -13,6 +13,11 @@ RUN apt autoremove -y
 
 WORKDIR /root
 
+# bashで日本語が表示されるようにする
+RUN apt install -y locales
+RUN localedef -f UTF-8 -i ja_JP ja_JP
+RUN echo "export LANG=ja_JP.UTF-8" >> ~/.bashrc
+
 # nodejs
 WORKDIR /root
 # https://nodejs.org/en/download/prebuilt-binaries

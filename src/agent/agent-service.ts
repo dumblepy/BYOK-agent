@@ -1,9 +1,19 @@
 import { DisposableStore, ManagedService } from "../extension/service-lifecycle";
 import type { ProviderService } from "../providers/provider-service";
+import type { PermissionContext } from "../permissions/permission-profile";
 import type { StorageService } from "../storage/storage-service";
+
+export interface AgentRunRequest {
+  readonly threadId: string;
+  readonly text: string;
+  readonly modelId: string;
+  readonly permissionContext: PermissionContext;
+}
 
 export interface AgentService extends ManagedService {
   readonly serviceName: "agent";
+  hasActiveRun(threadId: string): boolean;
+  prepareRunRequest(request: AgentRunRequest): Promise<AgentRunRequest>;
 }
 
 export interface AgentServiceDependencies {
@@ -45,6 +55,18 @@ export class DefaultAgentService extends ManagedService implements AgentService 
     void Promise.resolve(completion)
       .catch(() => undefined)
       .finally(() => this.activeRuns.delete(run));
+  }
+
+  public hasActiveRun(_threadId: string): boolean {
+    return this.activeRuns.size > 0;
+  }
+
+  public prepareRunRequest(request: AgentRunRequest): Promise<AgentRunRequest> {
+    if (!this.acceptingRuns) {
+      return Promise.reject(new Error("Agent service is not accepting runs"));
+    }
+
+    return Promise.resolve(request);
   }
 
   protected override async onDispose(): Promise<void> {

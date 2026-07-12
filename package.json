@@ -41,8 +41,9 @@
   },
   "scripts": {
     "_compile": "pnpm run _compile:extension && pnpm run _bundle:webview",
-    "_compile:extension": "tsc -p tsconfig.extension.json",
+    "_compile:extension": "tsc -p tsconfig.extension.json --noEmit && node scripts/build-extension.mjs",
     "_bundle:webview": "node scripts/build-webview.mjs",
+    "check:webview-security": "pnpm _bundle:webview && node scripts/check-webview-security.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.webview.json --noEmit",
     "watch": "tsc -p tsconfig.json --watch",
     "lint": "eslint .",
@@ -50,12 +51,14 @@
     "format:check": "prettier --check .vscode package.json tsconfig.json tsconfig.extension.json tsconfig.webview.json tsconfig.eslint.json eslint.config.mjs vitest.config.ts pnpm-workspace.yaml scripts src tests resources .prettierrc.json",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
-    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test",
+    "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test && pnpm check:webview-security",
     "vscode:prepublish": "pnpm _compile",
     "build": "pnpm run _compile && vsce package --no-dependencies"
   },
   "dependencies": {
-    "preact": "10.29.7"
+    "@vscode/codicons": "^0.0.45",
+    "preact": "10.29.7",
+    "zod": "4.1.12"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
@@ -65,6 +68,7 @@
     "esbuild": "0.28.1",
     "eslint": "10.7.0",
     "eslint-config-prettier": "10.1.8",
+    "preact-render-to-string": "^6.7.0",
     "prettier": "3.9.5",
     "typescript": "5.9.3",
     "typescript-eslint": "8.63.0",

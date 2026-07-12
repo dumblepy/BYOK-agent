@@ -1282,23 +1282,765 @@ interface ToolActivityView {
 
 引数全文や巨大なTool Resultを初期表示しない。折りたたみ表示とする。
 
+### 14.2.1 スレッド表示コンポーネント詳細設計
+
+`ThreadView`は、Extension Hostが保持する会話のうち、ユーザー発言とエージェント発言を時系列に表示するWebview専用の投影コンポーネントとする。会話の正本、Agent実行、Provider通信、保存、権限判定は担当しない。`ThreadView`へは検証済みの表示モデルだけを渡し、Webview APIや生の通信メッセージをコンポーネント内部から直接参照しない。
+
+#### 責務と境界
+
+担当する責務は次のとおりとする。
+
+* 複数メッセージを入力順に表示する
+* `user`と`assistant`を視覚・アクセシビリティ上区別する
+* Markdownを安全な表示ノードへ変換し、コードブロックを専用レイアウトで表示する
+* ストリーミング中のテキスト差分を同一メッセージへ反映する
+* 新しい内容が増えたときのスクロール位置を、ユーザーの閲覧を妨げない範囲で更新する
+* 空状態、ストリーミング状態、完了状態、失敗状態を表示する
+
+次の責務は持たせない。
+
+* Extension Hostへの直接`postMessage`
+* Providerイベントの解釈、Agent状態機械、会話永続化
+* Markdown内HTMLの実行、任意URIの実行、外部スクリプトの読み込み
+* Tool Activity、ChangeSet、Approval、Composerの操作本体（それぞれ別コンポーネントの責務）
+
+#### 表示モデル
+
+通信イベントをそのままJSXへ渡さず、UI専用の正規化モデルへ変換する。`id`はストリーム中も変化しないメッセージ単位の識別子であり、時刻だけで並び替えない。配列順はHostから受け取ったスナップショットおよびイベントの順序を正本とする。
+
+```ts
+type ThreadMessageRole = "user" | "assistant";
+type ThreadMessagePhase = "streaming" | "complete" | "failed";
+
+interface ThreadMessageViewModel {
+  id: string;
+  role: ThreadMessageRole;
+  text: string;
+  phase: ThreadMessagePhase;
+  createdAt: number;
+  errorMessage?: string;
+}
+
+interface ThreadViewProps {
+  messages: readonly ThreadMessageViewModel[];
+  isRestoring?: boolean;
+}
+```
+
+ユーザー発言は受信した本文を一つの`complete`メッセージとして追加する。エージェント発言は開始時に空文字または初回差分で一つだけ作成し、後続差分を同じ`id`へ連結する。`failed`へ遷移したメッセージは本文を保持したまま、エラー表示を付加する。表示モデルの文字列上限は通信スキーマの上限を超えないよう、Host側とWebview側の両方で検査する。
+
+#### ストリーミング更新とReducer
+
+Extension HostからWebviewへ渡すストリーミングイベントは、安定した`messageId`、単調増加する`sequence`、本文差分`delta`、終端フラグ`done`を持つ正規化イベントとする。スナップショットには差分適用済みの全文を含め、再接続時に同じ表示結果を再構成できるようにする。
+
+```ts
+type ThreadViewEvent =
+  | {
+      kind: "message-added";
+      message: ThreadMessageViewModel;
+    }
+  | {
+      kind: "assistant-text-delta";
+      messageId: string;
+      delta: string;
+      done: boolean;
+      sequence: number;
+    }
+  | {
+      kind: "message-failed";
+      messageId: string;
+      errorMessage: string;
+      sequence: number;
+    };
+```
+
+Reducerの規則は次のとおりとする。
+
+1. スナップショット受信時は表示モデルを置き換え、保持中のストリーム差分を再適用しない。
+2. `message-added`は未知の`id`だけを追加し、同じ`id`の再送は無視する。
+3. `assistant-text-delta`は存在する`assistant`メッセージにだけ適用し、`delta`を既存本文の末尾へ一度だけ追加する。
+4. `done: true`で`phase`を`complete`へ変更する。完了後の差分やroleが異なる差分は適用せず、スナップショット再取得を要求する。
+5. `message-failed`は対象本文を維持して`failed`へ変更し、ユーザー向けの安全なエラー文だけを表示する。
+6. 欠番、古い`sequence`、未知のメッセージIDはReducerで黙って補完せず、通信クライアントへ正本再同期を通知する。
+
+これにより、1ターン中のエージェント本文だけが更新され、過去のメッセージのDOMキーやスクロール位置が不必要に変化しない。差分を受信するたびに全文を再構成するため、UIは常に現在の本文をMarkdownとして描画できる。MVPでは仮想スクロールを導入せず、メッセージ数・本文長の上限は通信およびStorageの上限に従う。
+
+#### Markdownとコードブロック
+
+Markdownは文字列を直接`innerHTML`へ渡さず、Markdown ASTまたは同等の安全な中間表現からPreactノードへ変換する。次の設定を必須とする。
+
+* raw HTMLノードを無効化または破棄する
+* `javascript:`、`data:`、`command:`などの実行可能なURIをリンクにしない
+* URLは表示テキストとリンク先を検証し、許可しないURIはプレーンテキストで表示する
+* ユーザー入力、モデル出力、Tool ResultをHTML属性、CSS、スクリプトとして解釈しない
+* Markdownの解析失敗時は本文をエスケープ済みプレーンテキストとして表示する
+
+コードフェンスは`<pre><code>`相当の専用ノードとして描画し、言語指定は表示用のクラス名へ検査済みの値だけを渡す。未指定または未知の言語はプレーンコードとして表示し、初期実装では動的な外部シンタックスハイライトを読み込まない。コード本文は空白と改行を保持し、横方向のオーバーフローを許容する。コピー操作は別Issueとし、本タスクの完了条件に含めない。
+
+#### レイアウト、スクロール、アクセシビリティ
+
+メッセージ一覧は`role="log"`相当の読み上げ領域とし、各メッセージを`article`として、roleと連番または時刻をアクセシブルなラベルに含める。ストリーミング中のエージェントメッセージだけに`aria-busy="true"`を設定し、全文の再読み上げを避ける。色だけでuser/assistantや状態を区別しない。
+
+末尾から一定距離以内を閲覧している場合だけ新しい差分で末尾へ追従する。ユーザーが上へスクロールしている場合は位置を保持し、新着状態を表示する。初回スナップショットの復元中はローディング表示を出し、空のスレッドはComposerとは独立した空状態を表示する。テーマカラーはVS Code標準トークンを使い、固定色や独自画像に依存しない。
+
+#### 実装単位
+
+実装時は次の単位へ分割する。
+
+* `src/ui/webview/components/ThreadView.tsx`: メッセージ一覧、空状態、ストリーミング表示、スクロール境界
+* `src/ui/webview/thread-view-model.ts`: 表示モデル、イベント型、Reducer、スナップショット再同期判断
+* `src/ui/webview/markdown/MarkdownRenderer.tsx`: 安全なMarkdownノードとコードブロックの描画
+* `src/ui/styles.css`: VS Codeテーマトークンに基づくメッセージ・コードブロック・状態表示（既存Webviewスタイルへ統合）
+
+`ThreadView`は`thread-view-model.ts`のReducer結果だけを受け取り、通信クライアント・Extension Host・Storageをimportしない。既存のWebviewプロトコルを拡張する場合も、差分イベントの検証は通信境界で完了させ、コンポーネントへ`unknown`を渡さない。
+
+#### 完了条件
+
+1. ユーザー発言とエージェント発言を含む3件以上のメッセージを、受信順のまま表示できる。
+2. 見出し、段落、箇条書き、インラインコード、コードフェンスを安全に表示できる。
+3. エージェント本文の複数の差分を同じメッセージへ順序どおりに反映し、終端後に`complete`表示へ遷移できる。
+4. スナップショット再同期後も、ストリーミング中・完了済みを含む表示結果が正本と一致する。
+5. raw HTML、危険なURI、過大な本文、未知のイベントを実行せず、安全なフォールバックまたは再同期へ移行できる。
+6. Light、Dark、High Contrastテーマで本文とコードブロックの視認性を維持できる。
+7. ユニットテストでReducerとMarkdown変換を、コンポーネントテストで複数メッセージ・ストリーミング・空状態を検証できる。
+
+### 14.2.2 メッセージ入力Composer詳細設計
+
+`Composer`は、ユーザーのテキスト入力を検証済みのUIメッセージへ変換し、Extension Hostへ送信するWebview専用コンポーネントとする。下書きの一時保存、入力欄の操作、送信・停止操作、操作可能状態の表示だけを担当し、会話の正本、Agentの開始・停止判断、Provider通信、権限判定、添付コンテキストの収集は担当しない。
+
+#### 責務と境界
+
+Composerが担当する責務は次のとおりとする。
+
+* 複数行のプレーンテキストを入力できる`textarea`を提供する
+* 下書きをWebview状態へ保存し、Webview再生成時に復元する
+* 入力内容を送信可能性と文字数上限に照らして検査する
+* Enterおよび修飾キーの操作を決定的に処理する
+* 送信中、Agent実行中、停止要求中、入力エラーを表示する
+* 既存の検証済み`send-message`および`cancel-run`通信を呼び出す
+
+Composerが担当しない責務は次のとおりとする。
+
+* WebviewからExtension Hostへ直接`postMessage`すること（`WebviewProtocolClient`へ集約する）
+* `threadId`、`runId`、現在の実行状態を推測すること
+* ユーザー入力をMarkdown、HTML、CSS、コマンド、プロンプトとして解釈すること
+* Agent Runtime、Provider、Storage、Permission Profileの実装
+* ファイル添付、選択範囲、診断、画像、`/`コマンド、`@`検索の実装（後続Issue）
+
+#### 状態モデル
+
+表示状態とAgent実行状態を混在させず、Composerのローカル状態とHost由来の状態を分けて保持する。
+
+```ts
+type ComposerPhase =
+  | "idle"
+  | "inputting"
+  | "submitting"
+  | "running"
+  | "stopping"
+  | "error";
+
+interface ComposerState {
+  phase: ComposerPhase;
+  draft: string;
+  activeRunId?: string;
+  errorMessage?: string;
+  pendingMessageId?: string;
+}
+```
+
+各状態の意味と操作可否は次のとおりとする。
+
+| 状態 | 意味 | 入力欄 | 送信 | 停止 |
+|---|---|---:|---:|---:|
+| `idle` | 下書きが空で、実行もない | 可 | 不可 | 非表示 |
+| `inputting` | 下書きが空白だけではなく、送信可能 | 可 | 可 | 非表示 |
+| `submitting` | `send-message`を送信済みでHostの状態通知待ち | 不可 | 不可 | 非表示 |
+| `running` | Hostが実行中であることを通知済み | 不可 | 不可 | 可 |
+| `stopping` | `cancel-run`を送信済みで停止完了待ち | 不可 | 不可 | 不可 |
+| `error` | 直前の操作が失敗し、再試行可能 | 可 | 入力が有効なら可 | 実行中なら可 |
+
+`inputting`は入力イベントを受けたことだけでなく、正規化後の下書きに非空白文字があることを条件とする。フォーカスの有無やキー入力速度を状態の根拠にしない。`submitting`から`running`、`completed`、`cancelled`、`failed`への遷移は`run-state`または相関した`error`を検証して決定する。Hostから実行状態を受け取る前にUIが`running`を推測してはならない。
+
+MVPでは1つのComposerから同時に複数の送信を行わない。実行中に別メッセージをキューへ積まず、Agentが完了またはキャンセルされるまで入力と送信を無効化する。入力欄を再度有効化した際、送信済み本文を下書きとして復元しない。
+
+#### 入力値の検査と下書き
+
+入力値は次の順序で扱う。
+
+1. `textarea`の値を取得し、CRLFおよびCRをLFへ正規化する。
+2. `MAX_COMPOSER_DRAFT_LENGTH`（現在の設計値は100,000文字）を超える値を入力状態へ採用しない。UIでは上限到達を表示し、Host側でも同じ上限を再検証する。
+3. 送信可否は`draft.trim().length > 0`で判定する。ただし送信する本文から前後の空白や改行を自動削除せず、ユーザーが入力した改行と本文を保持する。
+4. 下書き保存は検証済みの`{ version: 1, composerDraft }`だけを`setState`へ渡す。APIキー、Thread、Run、送信履歴、ファイル内容、エラー詳細は保存しない。
+5. 送信要求の作成に成功した時点で下書きを空にする。送信失敗時は、ユーザーが新しい入力を開始していない場合に限り、保留していた本文を復元できるようにする。
+
+下書きの復元は`acquireVsCodeApi().getState()`を初期化時に一度だけ呼び出し、既存の`parseAgentWebviewState`で検証する。`composerDraft`以外の値、未知のバージョン、上限超過値は破棄する。送信済み本文や`activeRunId`をWebview状態へ保存しないため、Webview再生成時はHostから取得したスレッド状態を正本とする。
+
+#### Enterと修飾キー
+
+`keydown`でEnterを処理する。ただし`event.isComposing === true`またはIMEの変換中はComposerが送信を抑止し、ブラウザとIMEの確定処理へ委譲する。
+
+| 操作 | 動作 |
+|---|---|
+| Enter | 下書きが送信可能なら送信する。送信不可なら何もしない |
+| Shift+Enter | 改行を挿入する |
+| Ctrl+Enter（Windows/Linux） | 送信する |
+| Cmd+Enter（macOS） | 送信する |
+| Alt+Enter | 改行を挿入する |
+| Ctrl/Cmd+Shift+Enter、その他の未定義組み合わせ | 送信せず、textareaの通常の改行動作へ委譲する |
+
+Shiftを含む組み合わせは改行を優先し、Ctrl/Cmd単独の送信ショートカットより先に判定する。Enter以外のキー、IME確定キー、貼り付け、ドラッグ＆ドロップは入力値の検査と下書き保存だけを行う。フォーム送信の既定動作は抑止し、送信処理が二重に実行されないようにする。
+
+#### 送信・停止フロー
+
+送信は次のフローとする。
+
+```text
+入力イベント
+  └─ 正規化・上限検査・下書き保存
+       └─ Enter / 送信ボタン
+            └─ 空白判定・phase判定
+                           └─ 検証済み send-message(threadId, text)
+                      └─ phase=submitting
+                           ├─ thread-event(user-message, correlationId) → idle
+                           ├─ run-state(requesting-model以降) → running
+                           ├─ run-state(completed) → idle
+                           ├─ run-state(cancelled) → idle
+                           └─ error → error（再試行可能）
+```
+
+`send-message`のEnvelopeが持つ`messageId`を要求の重複排除キーとして扱い、Composer側で同じ送信操作を再発行しない。`threadId`は現在のHostスナップショットまたは画面状態から与えられた値を使い、Composerが固定値や履歴から推測しない。送信ボタンとEnterは同じ`submit`コマンドへ接続し、片方だけに特別な処理を持たせない。
+
+Agent Runtimeがまだ接続されていないMVPでは、HostのComposerルーティングが受け付けたユーザー本文を`thread-event`の`user-message`として返し、Envelopeの`correlationId`へ元の`send-message.messageId`を設定する。Webviewはこの相関付きイベントを送信受付として扱い、ThreadViewへ同じイベントを渡してからComposerを`idle`へ戻す。Agent Runtime接続後も、受付イベントの相関契約は維持し、実行状態は別の`run-state`で通知する。
+
+Agent実行中は、Hostが通知した有効な`activeRunId`を表示状態へ保持する。停止ボタンは`activeRunId`がある`running`状態でだけ有効とし、押下時に`cancel-run`を一度だけ送信して`stopping`へ遷移する。停止はベストエフォートであり、UIの非表示・再生成だけではキャンセルしない。Hostから`cancelled`または終了エラーを受け取るまで停止中表示を維持し、二重クリックや古い`runId`の停止要求は送信しない。
+
+Host側では、受信メッセージをZodスキーマで検証し、現在のThread、client session、Agent実行、権限状態を再確認してから処理する。ComposerはHostからの受付成否を推測せず、相関ID付きの状態通知またはエラーだけで状態を更新する。ユーザー本文をログ、HTML属性、URL、例外文へ反射しない。
+
+#### UIとアクセシビリティ
+
+* `textarea`には可視ラベルまたは`aria-label`、文字数上限とキー操作を説明する`aria-describedby`を付ける。
+* 送信・停止ボタンはテキストまたはVS Code標準Codiconを使い、アイコンだけの場合も固有の`aria-label`を付ける。独自画像や製品固有の外観は使用しない。
+* `inputting`、`submitting`、`running`、`stopping`、`error`の状態は色だけで表現せず、ラベルと`aria-live="polite"`で伝える。
+* `submitting`、`running`、`stopping`では、入力欄と送信ボタンの無効状態を視覚・アクセシビリティAPIの両方へ反映する。
+* エラー表示はユーザー向けの固定文言または安全に分類した短い文言とし、Providerの生レスポンス、秘密情報、内部スタックを表示しない。
+* スタイルはVS Code標準テーマトークンを使用し、Light、Dark、High Contrastでフォーカス表示と無効状態のコントラストを維持する。
+
+#### 実装単位
+
+実装時は次の単位へ分割する。
+
+* `src/ui/webview/components/Composer.tsx`: textarea、送信・停止ボタン、状態ラベル、キー操作、アクセシビリティ属性
+* `src/ui/webview/composer-state.ts`: `ComposerState`、状態遷移、入力正規化、送信可否、Enter判定の純粋ロジック
+* `src/ui/main.tsx`: Composerと既存`WebviewProtocolClient`、Thread状態、Webview状態Storeの接続
+* `src/ui/styles.css`: Composerのレイアウト、フォーカス、上限表示、状態表示、テーマ対応
+* `src/ui/extension-webview-protocol.ts`およびUIサービス境界: 検証済み`send-message`／`cancel-run`のHost側ルーティング（Agent実行そのものは別Issue）
+
+既存の`webview-protocol.ts`にある`send-message`、`cancel-run`、`run-state`、`error`の型とZod検証を再利用する。Composerコンポーネントへ`Webview API`や`unknown`を渡さず、型付けしたコールバックまたはComposer用Controllerを通して通信する。`ThreadView`、Provider、Agent Runtime、StorageへComposerから直接依存しない。
+
+#### テストと完了条件
+
+実装時は次を検証する。
+
+* 入力値のCRLF正規化、空白のみ、上限境界、上限超過、改行保持をユニットテストする。
+* Enter、Shift+Enter、Ctrl/Cmd+Enter、Alt+Enter、IME変換中、未定義の修飾キー組み合わせをユニットテストする。
+* `idle`→`inputting`→`submitting`→`running`→`idle`の正常系、停止、エラー、再試行、重複送信抑止をReducerまたは状態ロジックで検証する。
+* 下書きが初期化時に一度だけ復元され、入力ごとに検証済みの最小状態だけが保存されることを検証する。
+* UIテストで送信ボタン、Enter送信、停止ボタン、状態ラベル、無効状態、エラー表示を検証する。
+* 通信テストで`send-message`と`cancel-run`のEnvelope、相関ID、Host側の受信検証、重複排除を検証する。
+* `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、`pnpm check:webview-security`を実行する。実APIへ接続するテストは明示的な環境変数がある場合だけ許可する。
+
+完了条件は、空白だけの入力を送信せず、複数行本文を保持したユーザーメッセージをComposerから検証済み`send-message`としてHostへ一度だけ送信できること、実行中に停止要求を検証済み`cancel-run`として一度だけ送信できること、入力中・送信中・実行中・停止中・失敗時の状態がユーザーと支援技術へ明確に伝わることとする。Composer以外のThreadView、Provider、AgentLoop、Storage、添付機能の完了を本Issueの条件に含めない。
+
+### 14.2.3 モデル選択UI詳細設計
+
+モデル選択UIは、現在表示しているスレッドに紐づくモデルを確認・変更するWebview専用のUIとする。モデル一覧の正本、モデル設定の解決、利用可能性の判定、スレッドメタデータの更新、次回リクエストへの適用はExtension Hostが担当する。WebviewはHostから受け取った検証済みの要約を表示し、選択要求を送るだけにする。
+
+#### 目的と責務境界
+
+モデル選択UIの責務は次のとおりとする。
+
+* Hostから受け取った利用可能なモデル一覧を表示する
+* 現在のスレッドの`selectedModelId`を表示する
+* モデルの表示名とProvider名を区別して表示する
+* 選択中、成功、失敗、利用可能なモデルがない状態を表示する
+* 選択要求を現在の`threadId`と既知のスレッドrevision付きでHostへ送る
+* Hostからの確定通知を受けて表示を更新する
+
+次の責務はWebviewへ持たせない。
+
+* JSONモデル設定、Provider URL、APIキー、SecretStorage、Provider接続の読み込み
+* モデル名からの能力推測や、モデルが利用可能かどうかの独自判定
+* `threadId`、選択済みモデル、スレッドrevisionの履歴からの推測
+* 選択モデルを`send-message`へ直接埋め込むこと
+* Webview状態、`localStorage`、URL、Cookieへのモデル設定の永続化
+
+#### モデル一覧の情報源と表示契約
+
+Extension HostはModel CatalogとModel Configuration Loaderで設定優先順位を解決し、構成が有効で、ProviderとSecretStorageの利用条件を満たし、Agent実行に利用できるモデルだけを`models`へ含める。APIキー本体、認証ヘッダー、外部URLの詳細、モデル能力の不要な内部設定はWebviewへ渡さない。モデル要約は次の最小情報とする。
+
+```ts
+interface ModelSummary {
+  id: string;
+  label: string;
+  provider: string;
+}
+
+interface ModelListState {
+  threadId: string;
+  threadRevision: number;
+  models: readonly ModelSummary[];
+  selectedModelId?: string;
+}
+```
+
+`models`の順序はHost側で決定的に並べる。既定では表示名、同名の場合はモデルIDの昇順とし、Webview側で並べ替えない。`selectedModelId`は現在のスレッドメタデータに保存されたモデルが利用可能な場合だけ設定し、常に`models`内のIDと一致させる。利用可能なモデルがない、または保存済みモデルが解決不能な場合は`selectedModelId`を省略し、UIは安全な空状態を表示して送信操作を許可しない。この状態でWebviewが任意のモデルIDを補ってはならない。
+
+モデル要約を受け取ったUIは、モデルIDを表示用ラベルとして扱わず、必ず`label`を表示する。ただし同じ`label`が複数ある場合は、識別可能性のためProvider名を併記する。Provider名は設定内の識別子であり、認証情報や接続先を意味しない。
+
+#### UI状態と表示
+
+モデル選択の状態はComposerの状態へ混在させず、`ModelSelectorState`として管理する。
+
+```ts
+type ModelSelectorPhase = "loading" | "ready" | "selecting" | "error";
+
+interface ModelSelectorState {
+  phase: ModelSelectorPhase;
+  threadId?: string;
+  threadRevision?: number;
+  models: readonly ModelSummary[];
+  selectedModelId?: string;
+  pendingModelId?: string;
+  errorMessage?: string;
+}
+```
+
+ヘッダーでは現在のモデル名を常時表示し、選択UIはネイティブ`select`または同等のキーボード操作可能な単一選択UIとする。選択肢にはモデル名を表示し、必要な場合だけProvider名を補助情報として表示する。`loading`ではプレースホルダー、`ready`では現在のモデルと選択肢、`selecting`では選択中のモデルと操作不能状態、`error`では以前に確定していたモデルを維持した上で安全なエラー文を表示する。選択確定前にUIだけを新しいモデルへ切り替えない。
+
+利用可能なモデルが空の場合は「利用可能なモデルがありません」と表示し、選択UIを無効化する。現在のモデルが未選択の場合は「モデル未選択」と表示する。固定色や独自画像を使わず、VS Code標準テーマトークンとCodiconを必要最小限使用する。現在のモデル、選択中、エラー、無効状態は色だけで区別せず、可視ラベルとアクセシブルな状態通知を併用する。
+
+#### スレッド単位の変更と適用タイミング
+
+モデル変更はスレッドメタデータの`modelId`を更新する操作であり、Webview全体の既定値やユーザー設定を書き換えない。Hostは選択要求を受信した時点で、次を順番に検証する。
+
+1. 通信Envelope、`threadId`、`modelId`、`expectedThreadRevision`を検証する。
+2. 現在のWebviewセッションと、操作対象スレッドが一致することを確認する。
+3. Model Catalog上に同じモデルIDが一つだけ存在し、利用可能なモデルであることを確認する。
+4. `expectedThreadRevision`が現在のスレッドrevisionと一致することを確認する。不一致なら保存せず、最新のモデル一覧を再送する。
+5. 実行中のRunがないことを確認し、Thread Storeの`meta.json`へ`modelId`を原子的に保存する。
+6. 保存成功後にrevisionを進め、更新後の`model-list`を要求の`messageId`に対応する`correlationId`付きでWebviewへ送る。
+
+選択要求が成功するまで、現在のモデル表示は変更しない。失敗時もスレッドの保存値を変更せず、Hostが返す安全なエラーを表示して最新状態を再取得する。実行中の変更はUIで無効化し、Host側でも拒否する。これにより、実行中のRunが使用するモデルと、次回リクエストに使用するモデルが混在しない。
+
+Composerの`send-message`にはモデルIDを含めない。Hostは送信要求の`threadId`から最新の`meta.json.modelId`を取得し、その時点で解決したModel Definitionを`AgentRunRequest`へ渡す。したがって、選択成功通知を受けた後の次の`send-message`だけでなく、UIが古い表示を持っていても、実際のリクエストはHostのスレッド正本に従う。保存済みモデルが解決できない場合はRunを開始せず、モデル選択を促す安全なエラーを返す。
+
+#### 通信契約
+
+既存のバージョン付きEnvelopeとZod検証を再利用し、モデル選択の要求と応答を次の形へ揃える。
+
+```ts
+type SelectModelPayload = {
+  threadId: string;
+  modelId: string;
+  expectedThreadRevision: number;
+};
+
+type ModelListPayload = {
+  threadId: string;
+  threadRevision: number;
+  models: readonly ModelSummary[];
+  selectedModelId?: string;
+};
+```
+
+`select-model`はUIからHostへの要求、`model-list`はHostからUIへの一覧・確定状態の通知とする。`model-list`は`ui-ready`後、スレッドスナップショットの復元後、スレッド切り替え後、モデル変更の成功または競合後に送信する。UIは現在表示中の`threadId`と異なる`model-list`を適用せず、スレッド切り替え処理へ委譲する。
+
+`model-list`は現在のモデルの確定通知を兼ねるため、モデル変更専用の楽観的なUIイベントは追加しない。要求の`messageId`は`correlationId`として使用し、重複した`select-model`は既存のHostセッションの重複排除規則で一度だけ処理する。`select-model`の検証失敗、モデル不在、revision競合、実行中拒否は、既存の`error`またはプロトコルエラーの安全な分類で返し、Providerの生レスポンスや設定内容を表示しない。
+
+#### 永続化とセキュリティ
+
+選択結果は`globalStorage/threads/<thread-id>/meta.json`の`modelId`へ保存する。保存対象はモデルID、更新時刻、revisionなどスレッドメタデータに必要な値だけとし、APIキー、Authorizationヘッダー、Provider応答、プロンプト、ファイル内容を保存しない。保存は現在値との競合検査後に原子的に行い、失敗時に部分的な`meta.json`を残さない。
+
+Webviewへ渡すのは`ModelSummary`とスレッド識別・revisionだけである。モデル選択UIはSecretStorage、ファイルシステム、Provider Adapter、Storage実装へ直接依存しない。受信値は通信境界で検証してから状態Reducerへ渡し、モデルラベルやエラー文をHTML、URL、ログ、スクリプトとして解釈しない。
+
+#### 実装単位と検証方針
+
+実装時は次の単位へ分割する。
+
+* `src/ui/webview/components/ModelSelector.tsx`: モデル名、Provider補助情報、選択UI、状態表示、アクセシビリティ
+* `src/ui/webview/model-selector-state.ts`: 一覧適用、選択要求、確定通知、競合・エラーの純粋な状態遷移
+* `src/ui/main.tsx`: 現在のスレッド状態とModel Selector、`WebviewProtocolClient`の接続
+* `src/ui/styles.css`: ヘッダー内のレイアウト、フォーカス、無効状態、Light/Dark/High Contrast対応
+* `src/ui/webview-protocol.ts`: `select-model`と`model-list`のスレッドID・revisionを含むスキーマ更新
+* Extension HostのUIルーティング、Model Catalog、Thread Store境界: 検証、利用可能性判定、原子的な保存、確定通知
+
+テストでは、モデル一覧の決定的表示、現在モデルの反映、空一覧、選択中の二重操作抑止、未知モデルの拒否、スレッドID不一致、revision競合、実行中拒否、保存成功後の確定通知、次の`send-message`でThread Storeのモデルが使われることを検証する。通信テストでは、Envelope、payload上限、相関ID、重複排除、古い`model-list`の無視を検証する。実APIを呼ぶテストは追加せず、明示的な環境変数がある場合だけ既存の実APIテスト方針に従う。
+
+完了条件は、利用可能なモデル一覧と現在のモデルを表示でき、現在のスレッドに対する選択を安全に保存でき、選択確定後の次回`send-message`がHostのスレッドメタデータから選択モデルを解決して`AgentService.prepareRunRequest`へ渡すこととする。Provider呼び出しと実行ループへの接続はAgent Runtimeの責務とする。
+
+### 14.2.4 権限プロファイル選択UI詳細設計
+
+権限プロファイル選択UIは、現在のスレッドでAgentが利用できる権限プロファイルを確認・変更するWebview専用のUIとする。権限判定、Workspace Trustの評価、スレッドメタデータの更新、Agent実行への反映はExtension Hostが担当する。WebviewはHostから受け取った権限要約を表示し、検証済みの選択要求を送るだけにする。
+
+#### 目的と責務境界
+
+UIの選択肢は`read-only`、`confirm-writes`、`workspace-write`の3つに限定する。`autonomous`は内部の`PermissionProfile`型に残るが、このUIの一覧、既定値、説明、ショートカットには含めず、明示的な別設定がない限り利用できない。
+
+Webviewが担当するのは次の表示・操作だけとする。
+
+* 現在の要求プロファイル、実効プロファイル、Workspace Trust、適用中の制限を常時表示する
+* 3つの選択肢の名称、許可される代表的な操作、常時確認対象を表示する
+* 書き込み能力を広げる切り替え前に説明と確認を表示する
+* 確認済みの選択要求を現在のスレッドとrevision付きでHostへ送る
+* Hostの確定通知、競合、拒否、エラーを表示する
+
+次の責務はWebviewへ持たせない。
+
+* Permission Policy、Tool Category、Workspace Trust、Thread Storeの独自判定
+* APIキー、認証ヘッダー、Provider URL、ファイルシステム、環境変数へのアクセス
+* UI状態や`localStorage`への権限の永続化
+* `send-message`へプロファイルを埋め込むこと、またはUI表示だけでAgent実行を許可すること
+* ワークスペース内の指示ファイルやユーザー入力を理由に安全制約を緩和すること
+
+#### 状態モデルと表示契約
+
+HostからUIへ渡す権限情報は、表示に必要な最小要約とする。
+
+```ts
+type PermissionProfile =
+  | "read-only"
+  | "confirm-writes"
+  | "workspace-write"
+  | "autonomous";
+
+type UserSelectablePermissionProfile = Exclude<PermissionProfile, "autonomous">;
+type WorkspaceTrustState = "trusted" | "restricted";
+type PermissionRestriction =
+  | "commands-disabled"
+  | "automatic-writes-disabled"
+  | "workspace-provider-disabled"
+  | "workspace-mcp-disabled";
+
+interface PermissionSummary {
+  threadId: string;
+  threadRevision: number;
+  requestedProfile: UserSelectablePermissionProfile;
+  effectiveProfile: UserSelectablePermissionProfile;
+  workspaceTrust: WorkspaceTrustState;
+  restrictions: readonly PermissionRestriction[];
+}
+
+type PermissionSelectorPhase =
+  | "loading"
+  | "ready"
+  | "confirming"
+  | "updating"
+  | "error";
+
+interface PermissionSelectorState {
+  phase: PermissionSelectorPhase;
+  summary?: PermissionSummary;
+  pendingProfile?: UserSelectablePermissionProfile;
+  errorMessage?: string;
+}
+```
+
+`requestedProfile`はスレッドに保存されたユーザーの選択、`effectiveProfile`はWorkspace Trustと安全制約を加味して実際に利用可能な権限を表す。両者が異なる場合は「選択中」と「実効」のラベルを分け、理由となる`restrictions`を説明する。これにより、表示上は`workspace-write`でもRestricted Modeにより自動書き込みやコマンドが使えない状態を、権限昇格と誤認させない。
+
+`loading`では選択操作を無効化し、`ready`では確定状態を表示する。`confirming`では危険モードの説明と承認・キャンセルを表示し、`updating`では要求を一度だけ送信する。`error`では最後にHostが確定した状態を維持し、安全なエラー文だけを表示して再試行可能にする。UIは通知を受ける前に要求プロファイルを確定状態として表示してはならない。
+
+#### プロファイルの説明と危険モード確認
+
+選択肢には、権限名だけでなく、許可される代表操作と制限を併記する。
+
+| プロファイル | UIで説明する内容 | 危険度の扱い |
+|---|---|---|
+| `read-only` | 読み取り、検索、診断取得。編集とコマンドは不可 | 基準となる安全側の状態 |
+| `confirm-writes` | 読み取りとChangeSet作成。ディスク反映とコマンドは毎回確認 | 書き込み操作を伴うため確認を表示 |
+| `workspace-write` | ワークスペース内の変更をChangeSetへ追加。ディスク反映は確認。安全なテストは事前ルールにより自動実行可能 | より広い書き込み・実行能力のため確認を表示 |
+
+現在のプロファイルより書き込み・実行能力を広げる選択では、次の情報を確認UIに表示する。
+
+* 変更前後のプロファイル
+* 新たに可能になる操作（ChangeSet作成、ワークスペース内変更、許可されたテスト実行など）
+* 引き続き常に確認が必要な操作（削除、大量変更、Git書き込み、外部通信、秘密情報操作、破壊的コマンド、設定変更など）
+* Workspace Trustが制限する操作
+* 実行中のAgentには適用されず、次回Runから適用されること
+
+`read-only`への切り替えなど、権限を狭める変更もHostの検証と確定通知を必要とする。確認ダイアログを閉じた場合やキャンセルした場合は、現在の確定状態を維持する。確認UIはWebview内のキーボード操作可能なダイアログとし、初期フォーカス、Escape、承認・キャンセル、`aria-describedby`、`aria-live`を定義する。ブラウザの任意コードを実行する確認や、確認文にユーザー入力・ファイル内容をそのまま反射することは禁止する。
+
+#### 選択要求、保存、競合
+
+選択要求は次の契約でHostへ送る。
+
+```ts
+interface SetPermissionPayload {
+  threadId: string;
+  profile: UserSelectablePermissionProfile;
+  expectedThreadRevision: number;
+}
+```
+
+Hostは次の順序で検証する。
+
+1. Envelope、プロトコルバージョン、プロファイル列挙値、`threadId`、`expectedThreadRevision`を検証する。
+2. 現在のWebviewセッション、表示中のスレッド、Thread Store上のスレッドが一致することを確認する。
+3. Agent Runが実行中でないことを確認する。実行中はプロファイルを変更せず、安全なエラーを返す。
+4. Workspace TrustとPermission Policyを評価し、要求プロファイルを許可できるか確認する。Restricted Modeで無効になる能力を要求プロファイル自体に混ぜない。
+5. `expectedThreadRevision`と現在のrevisionを比較する。不一致なら保存せず、最新の`permission-updated`を返す。
+6. `meta.json.permissionProfile`とrevisionを一時ファイル経由で原子的に保存する。
+7. 保存成功後にだけ、再計算した`PermissionSummary`を`permission-updated`として送る。
+
+保存失敗、競合、Workspace Trustによる拒否、未知のプロファイルでは、UIの確定表示を変更しない。複数のWebview要求や同じ`messageId`の再送はHostの重複排除規則で一度だけ処理し、古い通知や別スレッドの通知をReducerへ適用しない。
+
+#### Workspace Trustと実効権限
+
+`workspace.isTrusted`の変化はHostが監視し、変化時に現在のスレッドの`PermissionSummary`を再計算してUIへ通知する。Restricted Modeでは、少なくともコマンド実行、自動ファイル変更、ワークスペース定義の外部モデルURL、ワークスペース定義のMCPサーバー、リポジトリ内スクリプト実行を無効化する。要求プロファイルの保存値を勝手に書き換えず、`effectiveProfile`と`restrictions`で実効状態を表す。
+
+実行中にWorkspace Trustが変化した場合、現在のRunが持つ権限コンテキストを次のTool Callから再評価する。既に開始した危険操作をUIの表示だけで取り消したことにはせず、必要なキャンセルや承認の扱いはAgent RuntimeとPermission Policyの責務とする。UIはHostから通知された実効状態を表示する。
+
+#### Agent実行への反映
+
+`send-message`にはプロファイルを含めない。Hostは送信要求を受けた時点で、次の情報から`PermissionContext`を構築して`AgentRunRequest`へ渡す。
+
+```ts
+interface PermissionContext {
+  requestedProfile: UserSelectablePermissionProfile;
+  effectiveProfile: UserSelectablePermissionProfile;
+  workspaceTrust: WorkspaceTrustState;
+  restrictions: readonly PermissionRestriction[];
+  threadRevision: number;
+}
+```
+
+Agent RuntimeはRun開始時にこのContextを保持し、Tool Callごとに現在のWorkspace Trust、Threadの権限revision、Permission Policyを再評価する。`read-only`では編集・コマンドToolを候補から除外または拒否し、`confirm-writes`ではChangeSet作成とコマンドを確認経由にし、`workspace-write`では設計済みのワークスペース内自動処理だけを許可する。常に確認する操作はプロファイルで上書きしない。
+
+選択確定後の次回Agent実行で、Thread Storeの`permissionProfile`が`AgentRunRequest`の権限Contextへ反映されることを完了条件とする。Webviewの表示値、古い`set-permission`要求、ユーザー入力、ワークスペース指示ファイルを権限の根拠にしない。
+
+#### 通信契約
+
+既存の判別共用体へ次の形で組み込む。
+
+```ts
+type UiToExtensionPermissionMessage = MessageEnvelope<"set-permission", SetPermissionPayload>;
+
+type ExtensionToUiPermissionMessage = MessageEnvelope<"permission-updated", {
+  summary: PermissionSummary;
+}>;
+```
+
+実際のプロトコルでは、既存の`permission-updated`のpayloadを`PermissionSummary`へ拡張し、`set-permission`を`threadId`、`profile`、`expectedThreadRevision`付きへ更新する。`ui-ready`後、スレッド切り替え後、Workspace Trust変更後、選択成功または競合後にHostが現在の要約を送る。両方向の受信境界でZodの`safeParse`を実行し、検証前の値をDOM、ログ、永続化、権限判定へ渡さない。
+
+#### 実装単位と検証方針
+
+実装時は次の単位へ分割する。
+
+* `src/ui/webview/components/PermissionProfileSelector.tsx`: 選択肢、現在状態、制限、危険モード確認、アクセシビリティ
+* `src/ui/webview/permission-profile-state.ts`: 状態、確認、更新中、確定通知、競合・エラーの純粋な状態遷移
+* `src/ui/main.tsx`: Permission Selectorと既存`WebviewProtocolClient`、現在のスレッド状態の接続
+* `src/ui/styles.css`: 権限表示、確認ダイアログ、フォーカス、無効状態、Light/Dark/High Contrast対応
+* `src/ui/webview-protocol.ts`: `set-permission`と`permission-updated`のpayload、Zodスキーマ、型定義
+* Extension HostのUIルーティング、Permission Policy、Thread Store、Agent Service境界: 再検証、原子的保存、実効権限計算、次回Runへの反映
+
+テストでは、3選択肢の表示、`autonomous`の非表示、現在状態の常時表示、危険モードの説明・承認・キャンセル、更新中の二重操作抑止、未知プロファイル、別スレッド、revision競合、Run中拒否、Restricted Mode、Workspace Trust変更、原子的保存、次回Agent実行への反映を検証する。通信テストではEnvelope、payload上限、列挙値、相関ID、重複排除、古い通知の無視を検証する。実APIを呼ぶテストは追加せず、明示的な環境変数がある場合だけ既存の実APIテスト方針に従う。
+
+完了条件は、3つのプロファイルを安全に選択でき、現在の要求・実効権限を常時表示し、書き込み能力を広げる前に説明と確認を行い、選択確定後の次回Agent実行がHostのThread Storeから解決した権限Contextを用いてToolごとの権限判定を行うこととする。`autonomous`の有効化、承認ダイアログそのものの一般化、Permission Policyの全操作定義は本UI設計の完了条件に含めない。
+
 ## 14.3 Webview通信
 
-すべてのメッセージを判別共用体で定義する。
+Extension HostとWebviewの通信は、VS Code Webview APIの`postMessage`を搬送路とし、その上に本拡張専用のバージョン付きメッセージプロトコルを定義する。WebviewはUI状態の投影とユーザー操作を担当し、会話・Agent実行・権限・変更の正本はExtension Hostが保持する。
+
+### 14.3.1 共通エンベロープ
+
+すべてのメッセージは、方向に関係なく同じエンベロープを持つ。`type`が判別子であり、`payload`は`type`ごとに異なる判別共用体の要素である。
+
+```ts
+type ProtocolVersion = "1.0";
+
+interface MessageEnvelope<TType extends string, TPayload> {
+  protocolVersion: ProtocolVersion;
+  messageId: string;       // UUID。送信側が生成する一意なID
+  type: TType;
+  sentAt: number;           // Unix epoch milliseconds
+  correlationId?: string;  // 要求と応答・イベントを関連付けるID
+  payload: TPayload;
+}
+```
+
+`protocolVersion`は互換性のあるメジャー・マイナー表記とする。MVPでは`"1.0"`だけを受け付け、メジャー番号が異なるメッセージは処理せず、プロトコルエラーとして扱う。後方互換なマイナー更新を行う場合は、受信側が未知の任意フィールドを無視できるようにし、既存の必須フィールドや既存の`type`の意味を変更しない。互換性を壊す変更はメジャー番号を上げる。
+
+`messageId`は再送・重複排除とログ相関に使う。`correlationId`は要求に対する状態通知やエラーを関連付けるために使い、UI入力の`messageId`をそのまま実行IDとして扱わない。時刻は表示・診断用途に限り、認証や認可の根拠にしない。
+
+### 14.3.2 UIからExtension Hostへのメッセージ
 
 ```ts
 type UiToExtensionMessage =
-  | { type: "send-message"; threadId: string; text: string }
-  | { type: "cancel-run"; runId: string }
-  | { type: "approve-tool"; approvalId: string }
-  | { type: "reject-tool"; approvalId: string }
-  | { type: "apply-change-set"; changeSetId: string }
-  | { type: "discard-change-set"; changeSetId: string }
-  | { type: "select-model"; modelId: string }
-  | { type: "set-permission"; profile: PermissionProfile };
+  | MessageEnvelope<"ui-ready", {
+      clientInstanceId: string;
+      supportedProtocolVersions: readonly ProtocolVersion[];
+    }>
+  | MessageEnvelope<"send-message", {
+      threadId: string;
+      text: string;
+    }>
+  | MessageEnvelope<"cancel-run", {
+      runId: string;
+    }>
+  | MessageEnvelope<"approve-tool", {
+      approvalId: string;
+    }>
+  | MessageEnvelope<"reject-tool", {
+      approvalId: string;
+      reason?: string;
+    }>
+  | MessageEnvelope<"apply-change-set", {
+      changeSetId: string;
+    }>
+  | MessageEnvelope<"discard-change-set", {
+      changeSetId: string;
+    }>
+  | MessageEnvelope<"select-model", {
+      threadId: string;
+      modelId: string;
+      expectedThreadRevision: number;
+    }>
+  | MessageEnvelope<"set-permission", {
+      threadId: string;
+      profile: Exclude<PermissionProfile, "autonomous">;
+      expectedThreadRevision: number;
+    }>
+  | MessageEnvelope<"request-thread-snapshot", {
+      threadId: string;
+    }>;
 ```
 
-受信内容はZodまたはJSON Schemaで必ず検証する。
+`ui-ready`はWebviewの初期化完了時に一度だけ送信する。Extension Hostはこれを契機に現在のUI向けスナップショットを返す。`send-message`、承認、ChangeSet適用などの操作は、Extension Host側で現在のスレッド・実行・権限・`baseHash`を再確認する。メッセージに含まれるIDの存在だけを根拠に操作を許可してはならない。
+
+### 14.3.3 Extension HostからUIへのメッセージ
+
+```ts
+type ExtensionToUiMessage =
+  | MessageEnvelope<"host-ready", {
+      clientInstanceId: string;
+      protocolVersion: ProtocolVersion;
+    }>
+  | MessageEnvelope<"thread-snapshot", {
+      threadId: string;
+      revision: number;
+      events: readonly ThreadEvent[];
+    }>
+  | MessageEnvelope<"thread-event", {
+      threadId: string;
+      sequence: number;
+      event: ThreadEvent;
+    }>
+  | MessageEnvelope<"run-state", {
+      runId: string;
+      threadId: string;
+      state: AgentRuntimeState;
+      sequence: number;
+    }>
+  | MessageEnvelope<"approval-requested", {
+      approvalId: string;
+      action: ProposedActionSummary;
+      expiresAt?: number;
+    }>
+  | MessageEnvelope<"change-set-updated", {
+      changeSetId: string;
+      status: ChangeSetStatus;
+      files: readonly ChangeFileSummary[];
+    }>
+  | MessageEnvelope<"model-list", {
+      threadId: string;
+      threadRevision: number;
+      models: readonly ModelSummary[];
+      selectedModelId?: string;
+    }>
+  | MessageEnvelope<"permission-updated", {
+      summary: PermissionSummary;
+    }>
+  | MessageEnvelope<"protocol-error", {
+      code: "UNSUPPORTED_VERSION" | "INVALID_MESSAGE" | "MESSAGE_TOO_LARGE";
+      message: string;
+      rejectedMessageId?: string;
+    }>
+  | MessageEnvelope<"error", {
+      code: AgentErrorCode;
+      message: string;
+      retryable: boolean;
+    }>;
+```
+
+`thread-event`と`run-state`は、それぞれの`threadId`または`runId`単位で単調増加する`sequence`を持つ。UIは古いイベントや重複イベントを適用せず、欠番を検出した場合は`request-thread-snapshot`で正本を再取得する。Extension HostからのイベントはUIを直接操作せず、検証済みの状態更新としてUIのReducerに渡す。
+
+上記の`*Summary`型は表示に必要なメタデータだけを含む。APIキー、Authorizationヘッダー、生の環境変数、秘密情報、不要なファイル内容、非公開推論内容をメッセージへ含めない。ファイル変更はChangeSetのID・ファイル名・差分要約を基本とし、詳細は権限確認済みのExtension Host処理から必要最小限だけ公開する。
+
+### 14.3.4 型定義と受信検証
+
+Zodスキーマをメッセージプロトコルの単一の正本とし、`z.infer`からTypeScript型を導出する。手書きの型だけを信頼してはならない。
+
+```ts
+const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
+  uiReadySchema,
+  sendMessageSchema,
+  cancelRunSchema,
+  approveToolSchema,
+  rejectToolSchema,
+  applyChangeSetSchema,
+  discardChangeSetSchema,
+  selectModelSchema,
+  setPermissionSchema,
+  requestThreadSnapshotSchema,
+]);
+
+type UiToExtensionMessage = z.infer<typeof uiToExtensionMessageSchema>;
+```
+
+実装時は次の2つの境界で必ず`safeParse`を実行する。
+
+1. Extension Hostの`onDidReceiveMessage`で、Webviewから届いた`unknown`を検証してからDispatcherへ渡す。
+2. Webview側の`window`メッセージ受信処理で、Extension Hostから届いた値を検証してからReducerへ渡す。
+
+検証では、エンベロープ、プロトコルバージョン、`type`、payloadの型、文字列長、ID形式、列挙値、配列上限を確認する。JSON以外の値、未知の`type`、未対応バージョン、必須フィールド欠損、過大なペイロードは拒否する。受信した値を検証前にDOM、ログ、ファイル操作、権限判定へ渡してはならない。拒否理由はユーザー入力やファイル内容を反射せず、診断に必要な最小限の情報だけを`protocol-error`として返す。
+
+### 14.3.5 送受信・ライフサイクル
+
+```text
+Webview起動
+  └─ ui-ready(protocolVersion: "1.0")
+       └─ Extension Hostが検証・接続状態を確立
+            ├─ host-ready
+            ├─ thread-snapshot / model-list / permission-updated
+            └─ 以後、thread-event / run-state / approval-requested を配信
+
+UI操作
+  └─ UIメッセージ(messageId, correlationId)
+       └─ Hostで検証 → 権限・状態を再評価 → 正本を更新
+            └─ 応答イベントまたは error(correlationId) を配信
+```
+
+Webviewの破棄・再生成は通信セッションの再接続として扱う。古い`clientInstanceId`からの操作を新しいUIセッションへ引き継がず、再生成後は`ui-ready`からスナップショットを再取得する。実行中のAgentをUIの破棄だけでキャンセルせず、キャンセルは明示的な`cancel-run`と権限・ライフサイクル上の安全な停止処理で行う。
+
+送信処理は、JSONシリアライズ可能な検証済みメッセージだけを渡す共通`MessageTransport`へ集約する。送信失敗、破棄済みWebview、サイズ超過は呼び出し元へ返し、黙って捨てない。初期実装では要求の再送を自動化せず、重複排除は`messageId`、状態の整合は`sequence`とスナップショットで行う。
+
+### 14.3.6 設計上の制約と完了条件
+
+- UI→Extension、Extension→UIの全メッセージが共通エンベロープと判別共用体を持つ。
+- 両方向の受信境界でZodの実行時検証を通過した値だけを内部処理へ渡す。
+- `protocolVersion: "1.0"`、`messageId`、必要な`correlationId`、イベントの`sequence`をテストで検証する。
+- 未知のメッセージ、異なるメジャーバージョン、必須フィールド欠損、誤った型、過大ペイロードを安全に拒否する。
+- UI再生成後に`ui-ready`→スナップショット取得で正本と表示を再同期できる。
+- 操作要求と状態通知を相関付け、重複イベントや欠番をUIが安全に処理できる。
+- メッセージを経由して秘密情報や不要なワークスペース情報がWebviewへ渡らない。
+
+```ts
+interface MessageTransport {
+  sendToHost(message: UiToExtensionMessage): Promise<void>;
+  sendToUi(message: ExtensionToUiMessage): Promise<void>;
+  dispose(): void;
+}
+```
 
 ## 14.4 Webview状態の保持と再表示
 
@@ -1362,6 +2104,245 @@ Webview状態はJSONにシリアライズできる最小のデータだけに限
 5. `setState()`へ秘密情報、ファイル内容、会話の正本が渡されない。
 6. `retainContextWhenHidden: false`と既存のWebviewセキュリティ設定が維持される。
 
+### 14.5 Webview資産読み込みとContent Security Policy
+
+Webviewは表示とユーザー操作だけを担当するサンドボックスであり、実行可能な資産と読み込み元を最小限に限定する。CSPはHTMLの`meta`要素で設定し、HTML生成時に作成したnonceをスクリプト実行の唯一の許可根拠とする。nonceはWebviewのHTMLを生成するたびに暗号学的に安全な乱数から新しく生成し、他の状態やメッセージへ公開しない。
+
+#### 14.5.1 許可する資産
+
+初期UIで許可するローカル資産は、拡張機能の`out/webview`配下にあるビルド済みの`main.js`と`main.css`だけとする。URIは既知の相対パスから`webview.asWebviewUri`で生成し、外部URL、CDN、ワークスペースの資産、ユーザー入力から組み立てたURIは使用しない。
+
+```text
+ExtensionContext.extensionUri
+└── out/
+    └── webview/
+        ├── main.js
+        └── main.css
+```
+
+`webview.options.localResourceRoots`には`extensionUri/out/webview`の単一URIだけを設定する。拡張機能全体、ワークスペース、ホームディレクトリをルートにしない。これにより、`asWebviewUri`を使用する場合でもWebviewが参照できるローカルファイルの範囲を資産ディレクトリに閉じ込める。
+
+#### 14.5.2 CSPポリシー
+
+現行UIの最小ポリシーは次のとおりとする。`${webview.cspSource}`は`main.css`の読み込みに必要なWebviewのリソース元だけに使用し、`script-src`には含めない。
+
+```text
+default-src 'none';
+base-uri 'none';
+object-src 'none';
+frame-src 'none';
+form-action 'none';
+connect-src 'none';
+img-src 'none';
+font-src 'none';
+style-src ${webview.cspSource};
+script-src 'nonce-${nonce}';
+```
+
+次を明示的に禁止する。
+
+* `unsafe-inline`および`unsafe-eval`
+* インライン`<script>`、インラインイベントハンドラー、`javascript:` URI
+* nonceのないスクリプト、外部スクリプト、CDN読み込み
+* `eval`、`new Function`、実行時コード生成
+* 現行UIで不要なネットワーク接続、画像、フォント、フレーム、フォーム送信
+
+スクリプト要素はnonce付きの`main.js`一つだけとする。CSSは外部の`main.css`へ置き、スタイル属性や`<style>`要素を追加するためにインライン許可を緩和しない。画像、フォント、通信などを将来追加する場合は、用途・取得元・サイズ・権限を設計書へ記録し、必要な最小のCSPディレクティブだけを追加する。
+
+#### 14.5.3 HTML生成と境界
+
+```text
+WebviewViewProvider.resolveWebviewView
+  ├─ webview.options
+  │    ├─ enableScripts: true
+  │    └─ localResourceRoots: [extensionUri/out/webview]
+  └─ webview.html
+       ├─ CSP meta（nonceを含む）
+       ├─ asWebviewUri(out/webview/main.css)
+       └─ nonce付き asWebviewUri(out/webview/main.js)
+```
+
+HTML属性へ値を埋め込む場合は、nonceと資産URIが属性境界を壊さないことを保証する。ユーザー入力、APIキー、Authorizationヘッダー、ファイル内容、プロンプト、Tool ResultなどをHTMLや資産URIへ埋め込まない。WebviewとExtension Host間のメッセージはHTML生成と別の境界で扱い、後続の通信実装で受信検証を必須とする。
+
+#### 14.5.4 検証と完了条件
+
+自動検証では、HTMLに必須CSPディレクティブがあること、`unsafe-inline`と`unsafe-eval`がないこと、CSPのnonceとscript要素のnonceが一致すること、既知の`main.js`と`main.css`だけが参照されること、`localResourceRoots`が`out/webview`の単一URIであることを確認する。ビルド済み`main.js`には`eval`、`new Function`、外部リソースを示すHTTP(S) URL、インライン実行コードを混入させない。ただし、DOM名前空間判定に必要な固定の`www.w3.org`名前空間URIは通信先ではないため、静的検査で明示的に許可する。
+
+Extension Development Hostでは、初回表示、入力操作、Webview再生成を確認し、開発者ツールのコンソールにCSP違反がないことを確認する。CSP違反を無視する設定や、違反発生時だけポリシーを緩める分岐は認めない。初回表示から再生成までUIがCSP違反なしで動作し、自動検証と静的検査が成功することを本タスクの完了条件とする。
+
+### 14.6 VS Codeテーマ対応とCodicon移行
+
+WebviewのUIはVS Code標準テーマトークンとCodiconを使用し、独自画像依存を排除する。Light、Dark、High Contrastの各テーマで視認性を維持する。
+
+#### 14.6.1 現状と対応方針
+
+`src/ui/styles.css` では既に `--vscode-*` CSS変数が広く使用されており、Light/Darkテーマでの表示は問題ない。不足している対応は次の2点である。
+
+1. **High Contrastモード未対応**: `@media (forced-colors: active)` の記述がない。`box-shadow` に依存した境界表現はHigh Contrastモードで機能しない。
+2. **Codicon未使用**: すべてのアイコンがインラインSVGで実装されており、VS Code標準のCodiconが使われていない。
+
+#### 14.6.2 High Contrastモード対応
+
+VS CodeのHigh Contrastテーマでは `forced-colors` メディアクエリが有効になる。WindowsのHigh Contrastモードでは `--vscode-*` CSS変数がシステム色で上書きされるため、次の対応を行う。
+
+```css
+/* High Contrastモードではシステム色を使用 */
+@media (forced-colors: active) {
+  .model-selector-menu,
+  .model-selector-inline-menu,
+  .permission-selector-menu,
+  .permission-confirmation-panel,
+  .composer,
+  .welcome-card,
+  .thread-message {
+    border: 1px solid CanvasText;
+    box-shadow: none;
+  }
+
+  .composer-input {
+    border: 1px solid CanvasText;
+  }
+
+  .composer-input:focus,
+  .model-selector-button:focus,
+  .model-selector-inline-button:focus,
+  .composer-toolbar-button:focus {
+    outline: 2px solid Highlight;
+    outline-offset: -2px;
+  }
+
+  .composer-send-button {
+    border: 1px solid ButtonText;
+  }
+
+  .permission-confirmation {
+    background: Canvas;
+  }
+
+  .model-selector-menu-item:hover,
+  .model-selector-inline-menu-item:hover,
+  .permission-selector-menu-item:hover {
+    background: Highlight;
+    color: HighlightText;
+  }
+
+  .model-selector-menu-item-selected,
+  .model-selector-inline-menu-item-selected,
+  .permission-selector-menu-item-selected {
+    background: Highlight;
+    color: HighlightText;
+  }
+}
+```
+
+対応方針：
+
+* `box-shadow` を `none` にし、代わりに `border` で境界を明示する
+* フォーカス表示は `outline: 2px solid Highlight` でシステムのフォーカス色を使用する
+* ホバー・選択状態は `Highlight`/`HighlightText` のシステム色を使用する
+* 背景のオーバーレイ（権限確認ダイアログ）は `Canvas` を使用する
+* アイコンや状態表示が色だけに依存しないよう、`aria-label` やテキストラベルを併用する
+
+#### 14.6.3 Codiconへの移行
+
+VS Codeに標準搭載されているCodicon（`@vscode/codicon` パッケージ）を使用し、現在のインラインSVGを置き換える。
+
+##### 14.6.3.1 Codiconの読み込み
+
+Webview HTMLの生成時に、CodiconのCSSを `<link>` 要素で読み込む。CSPの `style-src` にCodiconのURIを追加する必要がある。
+
+```ts
+// agent-webview-provider.ts
+const codiconUri = webview.asWebviewUri(
+  Uri.joinPath(extensionUri, "node_modules", "@vscode/codicon", "dist", "codicon.css")
+);
+```
+
+CSPの更新：
+
+```text
+style-src ${webview.cspSource} ${codiconUri};
+font-src ${webview.cspSource} ${codiconUri};
+```
+
+Codiconはフォントファイル（`woff2`）を同梱するため、`font-src` の追加が必要になる。フォントの読み込み元は `localResourceRoots` で許可された `out/webview` 配下にバンドルするか、`node_modules/@vscode/codicon/dist/` を `localResourceRoots` へ追加する。
+
+推奨方式：ビルド時にCodiconのCSSとフォントを `out/webview/` 配下へコピーし、`localResourceRoots` を拡張しない。
+
+##### 14.6.3.2 アイコン置き換え対応表
+
+| 現在の実装 | Codiconクラス | コンポーネント |
+|---|---|---|
+| 添付ファイルSVGパス | `codicon codicon-attach` | `Composer.tsx` |
+| モデル選択チェブロン（下向き） | `codicon codicon-chevron-down` | `ModelSelector.tsx` |
+| モデル選択チェブロン（上向き） | `codicon codicon-chevron-up` | `ModelSelector.tsx` |
+| インラインモデル選択チェブロン（下向き） | `codicon codicon-chevron-down` | `ModelSelectorInline.tsx` |
+| インラインモデル選択チェブロン（上向き） | `codicon codicon-chevron-up` | `ModelSelectorInline.tsx` |
+| 送信ボタン（円形+矢印） | `codicon codicon-send` | `Composer.tsx` |
+| 停止ボタン | `codicon codicon-stop` | `Composer.tsx` |
+| チェックマーク（選択状態） | `codicon codicon-check` | `ModelSelector.tsx`、`ModelSelectorInline.tsx`、`PermissionProfileSelector.tsx` |
+| ウェルカムマーク（星） | `codicon codicon-sparkle` | `styles.css`（`.welcome-mark`） |
+
+##### 14.6.3.3 実装パターン
+
+置き換え前（インラインSVG）：
+
+```tsx
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">
+  <path d="M8 3V13M3 8H13" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+</svg>
+```
+
+置き換え後（Codicon）：
+
+```tsx
+<i class="codicon codicon-add" aria-hidden="true" />
+```
+
+アイコンのみのボタン：
+
+```tsx
+<button type="button" class="composer-toolbar-button" aria-label="添付ファイルを追加">
+  <i class="codicon codicon-attach" aria-hidden="true" />
+</button>
+```
+
+Codiconのサイズ調整が必要な場合、CSSで `font-size` を指定する：
+
+```css
+.composer-toolbar-button .codicon {
+  font-size: 16px;
+}
+```
+
+#### 14.6.4 テーマ別視認性の確認
+
+完了条件として、次のテーマで全UI要素が視認可能であることを確認する。
+
+| テーマカテゴリ | 確認するテーマ |
+|---|---|
+| Light | `Default Light+`、`Light Modern` |
+| Dark | `Default Dark+`、`Dark Modern` |
+| High Contrast | `Default High Contrast`、`Default High Contrast Light` |
+
+確認対象のUI要素：
+
+* ヘッダー（モデル選択ボタン、権限選択ボタン、ステータス表示）
+* メッセージスレッド（ユーザー発言、エージェント発言、コードブロック）
+* Composer（入力欄、送信ボタン、停止ボタン、状態ラベル）
+* 権限確認ダイアログ（説明文、承認ボタン、キャンセルボタン）
+* モデル選択メニュー（一覧、選択状態、ホバー状態）
+* 空状態・エラー状態の表示
+
+#### 14.6.5 完了条件
+
+1. すべてのアイコンがCodiconに置き換わり、インラインSVGが残っていない
+2. High Contrastテーマ（`forced-colors: active`）で全UI要素が識別可能
+3. Light、Dark、High Contrastの主要テーマで視認性が維持される
+4. アイコンのみのボタンに適切な `aria-label` が設定されている
+5. Codiconのフォント読み込みがCSP違反を発生させない
+6. `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`、`pnpm check:webview-security` が成功する
+
 ---
 
 ## 15. 会話・イベント保存
@@ -1389,6 +2370,7 @@ interface ThreadMetadata {
   title: string;
   workspaceId?: string;
   modelId: string;
+  revision: number;
   permissionProfile: PermissionProfile;
   createdAt: number;
   updatedAt: number;
