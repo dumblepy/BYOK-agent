@@ -4,3 +4,8 @@ exec:
 
 diff:
 	git diff --cached > .diff
+
+main:
+	git switch main
+	git pull
+	git pull -p
