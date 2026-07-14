@@ -38,6 +38,7 @@ export interface ModelConfigProvider {
   vendor: string;
   apiKey?: string;
   apiType: ApiType;
+  headers?: Record<string, string>;
   models: ModelConfigModel[];
 }
 
@@ -99,6 +100,82 @@ function isProviderUrl(value: string): boolean {
   }
 }
 
+const FORBIDDEN_HEADER_NAMES = new Set([
+  "authorization",
+  "proxy-authorization",
+  "cookie",
+  "set-cookie",
+  "host",
+  "content-length",
+  "transfer-encoding",
+  "connection",
+  "keep-alive",
+  "proxy-authenticate",
+  "te",
+  "trailer",
+  "upgrade",
+  "origin",
+  "referer",
+  "forwarded",
+  "via",
+]);
+
+function headerNameIssue(name: string): string | undefined {
+  const normalized = name.toLowerCase();
+  if (FORBIDDEN_HEADER_NAMES.has(normalized) || normalized.startsWith("proxy-")) {
+    return "認証・転送・接続を制御するHTTPヘッダーは上書きできません。";
+  }
+  if (normalized.startsWith("x-forwarded-")) {
+    return "転送元を示すHTTPヘッダーは上書きできません。";
+  }
+  if (name !== name.trim()) return "HTTPヘッダー名の前後空白は許可されません。";
+  if (hasHeaderControlCharacter(name)) {
+    return "HTTPヘッダー名に制御文字を含めることはできません。";
+  }
+  return undefined;
+}
+
+function headerIssues(headers: Record<string, string>, basePath: string) {
+  const issues: ModelConfigValidationIssue[] = [];
+  const normalizedNames = new Set<string>();
+  for (const [name, value] of Object.entries(headers)) {
+    const path = `${basePath}/${name.replaceAll("~", "~0").replaceAll("/", "~1")}`;
+    const nameIssue = headerNameIssue(name);
+    if (nameIssue) {
+      issues.push({
+        code: "CONFIG_SEMANTIC_INVALID",
+        path,
+        message: nameIssue,
+      });
+    }
+    const normalized = name.trim().toLowerCase();
+    if (normalizedNames.has(normalized)) {
+      issues.push({
+        code: "CONFIG_SEMANTIC_INVALID",
+        path,
+        message: "大文字小文字を無視したHTTPヘッダー名の重複は許可されません。",
+      });
+    }
+    normalizedNames.add(normalized);
+    if (hasHeaderControlCharacter(value)) {
+      issues.push({
+        code: "CONFIG_SEMANTIC_INVALID",
+        path,
+        message: "HTTPヘッダー値に改行または制御文字を含めることはできません。",
+      });
+    }
+  }
+  return issues;
+}
+
+function hasHeaderControlCharacter(value: string): boolean {
+  for (const character of value) {
+    const code = character.charCodeAt(0);
+    if (code < 0x20 || code === 0x7f) return true;
+  }
+  return false;
+}
+
 function valueAtPointer(value: unknown, path: string): unknown {
   if (path === "/") return value;
   return path
@@ -158,6 +235,9 @@ function semanticIssues(config: ModelConfig): ModelConfigValidationIssue[] {
       });
     }
     providerNames.add(provider.name);
+    if (provider.headers !== undefined) {
+      issues.push(...headerIssues(provider.headers, `/${providerIndex}/headers`));
+    }
     provider.models.forEach((model, modelIndex) => {
       const path = `/${providerIndex}/models/${modelIndex}`;
       if (modelIds.has(model.id)) {

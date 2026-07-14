@@ -22,7 +22,7 @@ export interface ModelConfigLoaderOptions {
   readonly userCommonPath?: string;
   readonly workspacePath?: string;
   readonly userSettings?: () => unknown;
-  readonly workspaceTrusted?: boolean;
+  readonly workspaceTrusted?: boolean | (() => boolean);
   readonly debounceMs?: number;
   readonly onDidChange?: (snapshot: ModelConfigSnapshot) => void;
   readonly onDiagnostic?: (diagnostic: ModelConfigDiagnostic) => void;
@@ -208,7 +208,7 @@ export class ModelConfigLoader {
         return [];
       }
     }
-    return this.options.workspaceTrusted === false
+    return this.isWorkspaceTrusted() === false
       ? sources.map((source) =>
           source.kind === "workspace" ? { ...source, value: undefined } : source,
         )
@@ -232,7 +232,7 @@ export class ModelConfigLoader {
     value: unknown,
     lowerSources: unknown[],
   ): ModelConfigValidationIssue[] {
-    if (this.options.workspaceTrusted === false) return [];
+    if (this.isWorkspaceTrusted() === false) return [];
     const issues: ModelConfigValidationIssue[] = [];
     if (!Array.isArray(value)) return issues;
     const baseline = flattenModels([lowerSources]);
@@ -244,6 +244,18 @@ export class ModelConfigLoader {
           path: `/${providerIndex}/apiKey`,
           message: "ワークスペース設定からSecret参照を変更できません。",
         });
+      }
+      if ("headers" in provider) {
+        const headers = provider.headers;
+        if (isRecord(headers)) {
+          for (const headerName of Object.keys(headers)) {
+            issues.push({
+              code: "CONFIG_WORKSPACE_POLICY_VIOLATION",
+              path: `/${providerIndex}/headers/${escapeJsonPointer(headerName)}`,
+              message: "ワークスペース設定から任意HTTPヘッダーを追加・変更できません。",
+            });
+          }
+        }
       }
       const models = provider.models;
       if (!Array.isArray(models)) return;
@@ -277,6 +289,11 @@ export class ModelConfigLoader {
 
   private report(diagnostic: ModelConfigDiagnostic): void {
     this.options.onDiagnostic?.(diagnostic);
+  }
+
+  private isWorkspaceTrusted(): boolean {
+    const value = this.options.workspaceTrusted;
+    return typeof value === "function" ? value() : (value ?? true);
   }
 
   private assertActive(): void {
@@ -363,6 +380,10 @@ function flattenModels(sources: unknown[]): Map<string, { url: unknown }> {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function escapeJsonPointer(value: string): string {
+  return value.replaceAll("~", "~0").replaceAll("/", "~1");
 }
 
 function clone<T>(value: T): T {

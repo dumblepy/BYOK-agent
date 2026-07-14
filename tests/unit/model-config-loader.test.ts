@@ -109,4 +109,84 @@ describe("ModelConfigLoader", () => {
     expect(snapshot?.config[0]?.name).toBe("Default");
     loader.dispose();
   });
+
+  it("ワークスペースのAPIキーと任意ヘッダーを原子的に拒否する", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const userPath = join(directory, "user.json");
+    const workspacePath = join(directory, "workspace.json");
+    await writeFile(
+      userPath,
+      JSON.stringify([
+        {
+          name: "Provider",
+          vendor: "user",
+          apiType: "responses",
+          headers: { "X-Client-Version": "1" },
+          models: [model("one")],
+        },
+      ]),
+    );
+    await writeFile(
+      workspacePath,
+      JSON.stringify([{ name: "Provider", models: [{ id: "one", name: "Workspace" }] }]),
+    );
+    const diagnostics: unknown[] = [];
+    const loader = new ModelConfigLoader({
+      defaultPath: join(directory, "missing-default.json"),
+      userCommonPath: userPath,
+      workspacePath,
+      workspaceTrusted: true,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+
+    const first = await loader.load();
+    expect(first?.config[0]?.models[0]?.name).toBe("Workspace");
+
+    await writeFile(
+      workspacePath,
+      JSON.stringify([
+        {
+          name: "Provider",
+          apiKey: "secret://attacker",
+          headers: { Authorization: "Bearer attacker" },
+          models: [{ id: "one", name: "Malicious" }],
+        },
+      ]),
+    );
+    const second = await loader.refresh();
+    expect(second).toBe(first);
+    expect(first?.config[0]).not.toHaveProperty("apiKey");
+    expect(first?.config[0]?.headers).toEqual({ "X-Client-Version": "1" });
+    expect(diagnostics).toHaveLength(1);
+    loader.dispose();
+  });
+
+  it("Workspace Trustの変更時に設定を再評価できる", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const defaultPath = join(directory, "default.json");
+    const workspacePath = join(directory, "workspace.json");
+    await writeFile(
+      defaultPath,
+      JSON.stringify([
+        { name: "Provider", vendor: "default", apiType: "responses", models: [model("one")] },
+      ]),
+    );
+    await writeFile(
+      workspacePath,
+      JSON.stringify([{ name: "Provider", models: [{ id: "one", name: "Trusted label" }] }]),
+    );
+    let trusted = false;
+    const loader = new ModelConfigLoader({
+      defaultPath,
+      workspacePath,
+      workspaceTrusted: () => trusted,
+    });
+
+    expect((await loader.load())?.config[0]?.models[0]?.name).toBe("one");
+    trusted = true;
+    expect((await loader.refresh())?.config[0]?.models[0]?.name).toBe("Trusted label");
+    loader.dispose();
+  });
 });

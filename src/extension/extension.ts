@@ -72,7 +72,7 @@ async function initializeModelConfig(context: ExtensionContext): Promise<void> {
   modelConfigLoader = new ModelConfigLoader({
     userCommonPath: defaultUserCommonPath(),
     workspacePath: workspaceConfigPath,
-    workspaceTrusted: vscode.workspace.isTrusted,
+    workspaceTrusted: () => vscode.workspace.isTrusted,
     userSettings: () => vscode.workspace.getConfiguration("byokAgent").get("models"),
     onDidChange: (snapshot) => {
       modelConfigOutput?.appendLine(
@@ -91,6 +91,10 @@ async function initializeModelConfig(context: ExtensionContext): Promise<void> {
   const snapshot = await modelConfigLoader.load();
   if (!snapshot) modelConfigOutput.appendLine("[models] 有効なモデル設定を読み込めませんでした。");
   modelConfigLoader.watch();
+  const trustSubscription = vscode.workspace.onDidGrantWorkspaceTrust?.(
+    () => void modelConfigLoader?.refresh(),
+  );
+  if (trustSubscription) context.subscriptions?.push(trustSubscription);
   context.subscriptions?.push(modelConfigLoader, modelConfigOutput);
 }
 

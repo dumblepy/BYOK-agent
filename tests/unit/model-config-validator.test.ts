@@ -96,4 +96,42 @@ describe("model config validator", () => {
       "/0/models/0/supportsReasoningEffort",
     );
   });
+
+  it("安全な追加ヘッダーだけを受理し、予約ヘッダーと改行を拒否する", () => {
+    const valid = validateModelConfig([{ ...minimal[0], headers: { "X-Client-Version": "1" } }]);
+    expect(valid.valid).toBe(true);
+
+    const invalid = validateModelConfig([
+      {
+        ...minimal[0],
+        headers: {
+          Authorization: "secret-value",
+          "X-Forwarded-For": "127.0.0.1",
+          "X-Trace": "ok\r\nInjected: yes",
+        },
+      },
+    ]);
+    expect(invalid.valid).toBe(false);
+    expect(invalid.issues.map((issue) => issue.path)).toEqual(
+      expect.arrayContaining([
+        "/0/headers/Authorization",
+        "/0/headers/X-Forwarded-For",
+        "/0/headers/X-Trace",
+      ]),
+    );
+    expect(JSON.stringify(invalid.issues)).not.toContain("secret-value");
+  });
+
+  it("大文字小文字を無視したヘッダー重複を拒否する", () => {
+    const result = validateModelConfig([
+      {
+        ...minimal[0],
+        headers: { "X-Trace": "one", "x-trace": "two" },
+      },
+    ]);
+    expect(result.valid).toBe(false);
+    expect(result.issues.map((issue) => issue.message)).toContain(
+      "大文字小文字を無視したHTTPヘッダー名の重複は許可されません。",
+    );
+  });
 });
