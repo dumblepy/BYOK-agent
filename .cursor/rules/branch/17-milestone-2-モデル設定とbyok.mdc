@@ -1,122 +1,65 @@
 ---
-description: 17-milestone-2-モデル設定とbyokブランチでモデル設定JSON Schemaを設計するときに読み込む
+description: 17-milestone-2-モデル設定とbyokブランチでモデル設定ローダーの設計を行うときに読み込む
 alwaysApply: false
 ---
-# モデル設定JSON Schemaの定義
+# モデル設定ローダーの設計
 
-このブランチでは、BYOKモデル設定ファイルをSchema検証可能にするための実装方針と設計を確定する。
+このブランチでは、組み込み・ユーザー・ワークスペースの設定ソースを安全に統合するモデル設定ローダーを実装する。設計書に定めたソース優先順位、マージ規則、Workspace安全制約、再読み込み契約を実装の正本とする。
 
 ## 実装方針
 
-- 設定ファイルは提示されたCopilot系のモデル設定JSONに合わせ、Provider配列をルートにし、Provider内にModel配列を持つ構造にする。Copilot固有のキー、認証方式、エンドポイント、プロンプトは流用しない。
-- Providerは`name`、`vendor`、`apiKey`、`apiType`、`models`を持ち、Modelは`id`、`name`、`url`、能力項目、Token上限を持つ。Agent設定はModel内の任意の`agent`拡張として定義する。
-- SchemaはJSON Schema Draft 2020-12で設計し、`additionalProperties: false`を基本とする。未知の項目を黙って無視せず、Schema versionの更新と明示的な移行で拡張する。
-- Providerの`apiType`は`chat-completions`、`responses`、`messages`に限定する。Gemini等の第2段階ProviderはこのSchema versionへ追加しない。
-- APIキー本体はSchemaのプロパティとして定義しない。`apiKey`は`${input:<secret-id>}`または`secret://<secret-id>`の参照だけを受け付け、値は`ExtensionContext.secrets`から解決する。
-- CapabilitiesはModel直下の`toolCalling`、`vision`、`thinking`、`supportsReasoningEffort`で表現し、モデル名からの能力推測をSchemaの代替情報源にしない。
-- Agent設定はProfileと実行上限を持ち、`maxIterations`、`maxToolCalls`、`maxConsecutiveFailures`に上限を設ける。`autonomous`を既定のAgent設定やPermission Profileの列挙値に含めない。
-- JSON Schemaで表現できる型・必須・列挙・範囲・未知項目を先に検証し、その後に参照整合性、ID重複、能力間の関係、Workspace由来設定の安全ポリシーを意味検証する。
-- エラーは単一の曖昧な文字列ではなく、エラーコード、JSON Pointer形式のパス、Schema keyword、期待値、実際値を持つ構造化Issueとして返す。秘密情報は実際値・ログ・UIへ出さない。
-- 設定に違反が一つでもある場合は設定全体を無効にし、不完全なProviderやModelを実行経路へ渡さない。
+- 設定ソースは組み込みデフォルト、ユーザー共通ファイル、ワークスペースファイル、VS Code User Settingsの順に扱い、後段を高優先とする。
+- Providerは`name`、Modelは`id`をマージキーとし、同一キーの定義を部分更新できるようにする。
+- オブジェクトは再帰的にマージし、スカラーは高優先ソースで置換する。配列は暗黙結合せず、Provider配列とModel配列はキー単位でマージする。
+- 高優先ソースで明示的に削除する仕組みを設ける場合も、通常のJSON Schemaにない暗黙記法は導入せず、将来のSchema拡張として別途定義する。
+- 各ソースを個別に構文・Schema・意味・スコープポリシー検証し、無効なソースは部分採用しない。最終設定は全ソースの検証済みスナップショットから生成する。
+- ワークスペース設定はAPIキー参照、任意ヘッダー、外部URL、認証方式を変更できない。Workspace Trustがない場合は外部接続を含むワークスペース由来の変更を採用しない。
+- ファイル変更は監視イベントをデバウンスして再読込し、読み込み途中の状態を公開しない。直近の有効なスナップショットを維持し、無効化時は診断イベントだけを通知する。
+- APIキー本体は設定ファイル、最終設定、ログ、診断、再読み込みイベントに出力せず、解決は後続のSecretStorage責務とする。
 - `git add`および`git commit`は実行しない。既存の作業ツリー変更を整理、上書き、ステージングしない。
 
-## Schema対象
+## 設計対象
 
-### トップレベル
-
-- Provider配列をルートとし、空配列を許可しない
-- Provider必須項目は`name`、`vendor`、`apiType`、`models`
-- `apiType`は`chat-completions`、`responses`、`messages`
-- ProviderとModelの未知プロパティは拒否する
-
-### Provider
-
-- 必須: `name`、`vendor`、`apiType`、`models`
-- `name`、`vendor`: 1〜128文字の非空文字列
-- `apiKey`: 任意の`${input:<secret-id>}`または`secret://<secret-id>`参照。APIキー本体は禁止
-- `models`: 1件以上のModel配列
-- Modelごとの接続先を`url`で指定し、HTTPSを既定とする。HTTPはlocalhost／ループバックに限定
-
-### Model
-
-- 必須: `id`、`name`、`url`、`toolCalling`、`vision`、`maxInputTokens`、`maxOutputTokens`
-- `id`、`name`、`vendor`: 1〜128文字。IDは`^[a-z0-9][a-z0-9._-]*$`
-- `maxInputTokens`: 1,024〜10,000,000の整数
-- `maxOutputTokens`: 1〜1,000,000の整数、`maxInputTokens`以下
-- `toolCalling`、`vision`、`thinking`: boolean
-- `supportsReasoningEffort`: `none`／`low`／`medium`／`high`／`xhigh`の重複なし配列。`thinking`がtrueの場合だけ指定可能
-
-### Capabilities
-
-`toolCalling`と`vision`を必須のboolean、`thinking`と`supportsReasoningEffort`を任意項目とする。`supportsReasoningEffort`は`thinking`が有効な場合だけ許可する。
-
-### Agent設定
-
-- `agent`: 任意オブジェクト。提示例にないため省略可能
-- `promptProfile`: 1〜64文字のProfile ID
-- `contextProfile`: `compact`、`balanced`、`extended`
-- `toolProfile`: `read-only`、`workspace`、`full`
-- `maxIterations`: 1〜100の整数
-- `maxToolCalls`: 1〜500の整数
-- `maxConsecutiveFailures`: 1〜10の整数
-
-`toolProfile`はTool集合の選択であり、権限確認を省略しない。実際の権限はPermission ProfileとWorkspace Trustで判定する。
-
-## 検証エラー契約
-
-検証段階は次の順に固定する。
-
-1. UTF-8 JSONの構文解析
-2. JSON Schema Draft 2020-12による配列・型・必須・列挙・範囲・形式・未知項目の検証
-3. Provider／Model構造、Model ID重複、Capabilities相互関係、Token上限の意味検証
-4. User／共通／ワークスペースのスコープ別セキュリティポリシー検証
-
-エラーコードは`CONFIG_INVALID_JSON`、`CONFIG_SCHEMA_INVALID`、`CONFIG_UNKNOWN_PROPERTY`、`CONFIG_INVALID_REFERENCE`、`CONFIG_SEMANTIC_INVALID`、`CONFIG_WORKSPACE_POLICY_VIOLATION`を基本とし、エラーにはJSON Pointer、期待値、実際値を含める。APIキー、Authorization、ヘッダー値、秘密情報をエラー出力に含めない。
+- `documents/design.md` §5への設定ソース、優先順位、マージ、再読み込み、障害時動作の追記
+- `.cursor/rules/branch/17-milestone-2-モデル設定とbyok.mdc`の新規ルール化
 
 ## 進捗
 
 - [x] `AGENTS.md`、プロジェクトルール、ブランチルールを確認する
-- [x] 現在のブランチ名に一致するブランチルールの配置先を確定する
-- [x] 既存の`documents/design.md`、`documents/issues.md`、モデル設定例を調査する
-- [x] Copilot系設定JSONの構造と、プロジェクト固有Schemaへ適用する範囲を整理する
-- [x] Provider、Model、Capabilities、Agent設定の必須項目・列挙値・数値範囲を設計する
-- [x] 構文検証、Schema検証、意味検証、Workspaceポリシー検証の責務を分離する
-- [x] 不正設定に対する構造化エラー契約を設計書へ追記する
-- [x] 設計書とブランチルールのみを作成し、実装へ進まないことを確認する
-- [x] `resources/model-config.schema.json`を実装する
-- [x] Schemaバリデーターと構造化エラーを実装する
-- [x] Schema検証の単体テストを実装する
+- [x] 現在のブランチ名と対応するルールファイルを確認する
+- [x] 既存のモデル設定Schema設計、設定ファイル名、Milestone 2の完了条件を調査する
+- [x] 既存のブランチルールを削除し、モデル設定ローダー向けに新規作成する
+- [x] 設定ソースの優先順位とマージ規則を設計する
+- [x] ファイル変更時の再読み込みと無効設定時の動作を設計する
+- [x] `documents/design.md`へ実装方針と設計を追記する
+- [x] モデル設定ローダーを実装する
+- [x] 組み込み設定、ユーザー共通設定、ワークスペース設定、VS Code User Settingsを読み込む
+- [x] Provider／Model単位のマージと優先順位を実装する
+- [x] Workspace Trust、安全制約、無効設定時の直前スナップショット維持を実装する
+- [x] ファイル変更時のデバウンス再読み込みと設定変更通知を実装する
+- [x] ローダーの単体テスト、型検査、Lint、フォーマット検査を完了する
 
 ## 完了条件
 
-この実装作業の完了条件は次のとおりとする。
-
-1. `documents/design.md`にCopilot系設定JSONの構造を踏まえたモデル設定Schemaの設計が記載されている。
-2. Provider、Model、Capabilities、Agent設定の必須項目、列挙値、数値範囲、参照関係が明記されている。
-3. JSON構文、JSON Schema、意味検証、Workspaceポリシーの検証段階と責務が分離されている。
-4. 不正設定のエラーコード、パス、期待値、実際値、秘密情報の非出力方針が定義されている。
-5. Schema、検証コード、構造化エラー、単体テストが実装されている。
-
-実装Issueの完了条件は、Schema検証を実行し、正常な設定を受理し、不正な設定にパス付きの明確なエラーを返せることである。
+1. 設計書に組み込み、ユーザー共通、ワークスペース、VS Code User Settingsの読み込み元と優先順位が明記されている。
+2. Provider／Modelのマージキー、スカラー・オブジェクト・配列のマージ規則、競合時の決定方法が明記されている。
+3. 構文・Schema・意味・ワークスペース安全性の検証境界と、無効ソースを部分採用しない方針が明記されている。
+4. ファイル変更のデバウンス、原子的なスナップショット公開、直近有効設定の維持、診断通知が明記されている。
+5. ローダー実装と単体テストが完了し、型検査・Lint・フォーマット検査・全単体テストが成功している。
 
 ## 対象外
 
-- 設定ローダー、マージ、Model Catalogの実装
-- 設定ソースの読み込み、マージ、ファイル監視、UI通知
 - SecretStorageによるAPIキーの登録・更新・削除
-- Provider Adapter、ネットワーク通信、接続確認、リトライ
-- Capabilitiesに応じたTool／UIの切り替え
+- UI通知、Provider接続確認、ネットワーク通信
+- JSON Schema、バリデーター、Model Catalog、Provider Adapterの実装変更
 - `git add`、`git commit`、既存変更の整理・上書き
 
 ## 調査結果・設計まとめ
 
-- 現在のブランチは`17-milestone-2-モデル設定とbyok`で、対応するルールファイルは未作成だったため、このファイルを新規作成した。
-- プロジェクトルールは、モデル設定をJSONの`model-config.schema.json`で定義し、初期ProviderをOpenAI Responses／OpenAI互換Chat Completions／Anthropic Messagesとすること、APIキーをJSONへ保存しないことを要求している。
-- 既存の`documents/design.md`の設定例は、Provider配列をルートにし、Provider内に`name`、`vendor`、`apiKey`、`apiType`、`models`を持ち、Model内に能力項目とToken上限を持つ構造である。この構造を今回のSchema設計の正本とした。
-- GitHub Copilot CLIの公式資料では、設定ファイルはJSONオブジェクトであり、ユーザー／リポジトリ／ローカル等のスコープと上書き順序を持つ。また、カスタムAgentはモデルやTool等を設定領域として持つ。これらの構造上の考え方だけを採用し、Copilot固有の実装や識別子は採用しない。
-- Schemaで表現しにくい参照整合性、ID重複、フィールド間制約、ワークスペース安全性は、Schema検証後の意味／ポリシー検証として設計した。
-- `additionalProperties: false`を基本方針にし、未知項目を無視しないことで設定ミスを早期に検出する。将来拡張はSchema versionを更新する。
-- `resources/model-config.schema.json`にDraft 2020-12 Schemaを配置し、`src/models/model-config-validator.ts`でAJV検証、意味検証、workspaceポリシー検証を固定順序で実行する。APIキー参照の不正値は構造化Issueへ秘密値を出力しない。
+- プロジェクトルールはJSON Schemaをモデル設定の正本とし、APIキー本体をJSONへ保存せず、ワークスペース設定から外部URLや認証情報を上書きさせないことを要求している。
+- `documents/design.md` §5は既にProvider配列、Provider内Model配列、推奨ファイル名、基本優先順位を定義しているため、今回の設計ではローダーの責務と統合規則を補完する。
+- 既存のブランチルールはSchema実装済みの内容を含んでおり、今回の依頼範囲と一致しないため削除して本ルールを新規作成した。その後、ユーザーの実装指示に合わせて本ルールの進捗を実装完了へ更新した。
+- ローダーの出力は検証済みの不変スナップショットとし、読み込み失敗時に有効な設定を中間状態へ置き換えない実装とした。
 
 ## 参考資料
 
@@ -125,6 +68,3 @@ alwaysApply: false
 - `.cursor/rules/branch.mdc`
 - `documents/issues.md`の「Milestone 2: モデル設定とBYOK」
 - `documents/design.md`の「5. モデル設定」
-- GitHub Docs: [GitHub Copilot CLI configuration directory](https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference)
-- GitHub Docs: [Custom agents configuration](https://docs.github.com/en/copilot/reference/custom-agents-configuration)
-- GitHub Docs: [Using your own LLM models in GitHub Copilot CLI](https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/use-byok-models)
