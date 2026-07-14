@@ -57,6 +57,7 @@
   },
   "dependencies": {
     "@vscode/codicons": "^0.0.45",
+    "ajv": "^8.20.0",
     "preact": "10.29.7",
     "zod": "4.1.12"
   },

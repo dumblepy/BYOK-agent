@@ -1,0 +1,99 @@
+import { describe, expect, it } from "vitest";
+import {
+  parseAndValidateModelConfig,
+  validateModelConfig,
+} from "../../src/models/model-config-validator";
+
+const minimal = [
+  {
+    name: "OpenAI",
+    vendor: "openai",
+    apiType: "responses",
+    models: [
+      {
+        id: "gpt-5",
+        name: "GPT 5",
+        url: "https://api.openai.com/v1/responses",
+        toolCalling: true,
+        vision: true,
+        maxInputTokens: 10000,
+        maxOutputTokens: 2000,
+      },
+    ],
+  },
+];
+
+describe("model config validator", () => {
+  it("最小の有効設定を受理する", () => {
+    const result = validateModelConfig(minimal);
+    expect(result.valid).toBe(true);
+    expect(result.config?.[0]?.models[0]?.id).toBe("gpt-5");
+  });
+
+  it("JSON構文エラーを構造化して返す", () => {
+    const result = parseAndValidateModelConfig("{");
+    expect(result.issues[0]).toMatchObject({ code: "CONFIG_INVALID_JSON", path: "/" });
+  });
+
+  it("未知プロパティをパス付きで拒否する", () => {
+    const result = validateModelConfig([{ ...minimal[0], unexpected: true }]);
+    expect(result.issues[0]).toMatchObject({
+      code: "CONFIG_UNKNOWN_PROPERTY",
+      path: "/0/unexpected",
+    });
+  });
+
+  it("秘密情報をエラー出力へ含めない", () => {
+    const result = validateModelConfig([{ ...minimal[0], apiKey: "plain-secret-value" }]);
+    expect(result.valid).toBe(false);
+    expect(JSON.stringify(result.issues)).not.toContain("plain-secret-value");
+    expect(result.issues[0]?.path).toBe("/0/apiKey");
+  });
+
+  it("意味制約とworkspace制約を検証する", () => {
+    const result = validateModelConfig(
+      [
+        {
+          ...minimal[0],
+          apiKey: "secret://openai",
+          models: [{ ...minimal[0].models[0], maxOutputTokens: 20000 }],
+        },
+      ],
+      "workspace",
+    );
+    expect(result.issues.map((issue) => issue.code)).toEqual(
+      expect.arrayContaining(["CONFIG_WORKSPACE_POLICY_VIOLATION", "CONFIG_SEMANTIC_INVALID"]),
+    );
+  });
+
+  it("HTTPはlocalhostだけを許可し、reasoningの関係を検証する", () => {
+    const invalidUrl = validateModelConfig([
+      {
+        ...minimal[0],
+        models: [
+          {
+            ...minimal[0].models[0],
+            url: "http://example.com/api",
+          },
+        ],
+      },
+    ]);
+    expect(invalidUrl.issues.map((issue) => issue.path)).toContain("/0/models/0/url");
+
+    const invalidReasoning = validateModelConfig([
+      {
+        ...minimal[0],
+        models: [
+          {
+            ...minimal[0].models[0],
+            url: "http://localhost:8080/api",
+            supportsReasoningEffort: ["low"],
+          },
+        ],
+      },
+    ]);
+    expect(invalidReasoning.issues.map((issue) => issue.path)).toContain(
+      "/0/models/0/supportsReasoningEffort",
+    );
+  });
+});

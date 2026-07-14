@@ -356,74 +356,181 @@ tests/
 ## 5.2 JSON例
 
 ```json
-{
-  "$schema": "./model-config.schema.json",
-  "version": 1,
-
-  "providers": {
-    "primary-openai": {
-      "type": "openai-responses",
-      "baseUrl": "https://api.example.com/v1",
-      "apiKeyRef": "secret://primary-openai",
-      "timeoutMs": 120000,
-      "headers": {}
-    },
-
-    "company-gateway": {
-      "type": "openai-compatible",
-      "baseUrl": "https://llm-gateway.example.net/v1",
-      "apiKeyRef": "secret://company-gateway",
-      "timeoutMs": 120000,
-      "headers": {
-        "X-Client-Name": "byok-vscode-agent"
-      }
-    }
-  },
-
-  "models": [
-    {
-      "id": "coding-primary",
-      "displayName": "Coding Primary",
-      "provider": "primary-openai",
-      "apiModel": "provider-model-id",
-      "family": "openai",
-      "contextWindow": 200000,
-      "maxOutputTokens": 16000,
-
-      "capabilities": {
-        "streaming": true,
+[
+  {
+    "name": "OpenRouter",
+    "vendor": "customendpoint",
+    "apiKey": "${input:chat.lm.secret.4d64c47c}",
+    "apiType": "chat-completions",
+    "models": [
+      {
+        "id": "grok-4.5",
+        "name": "Grok 4.5(1.6)",
+        "vendor": "xAI",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
         "toolCalling": true,
-        "parallelToolCalls": true,
         "vision": false,
-        "reasoning": true,
-        "systemMessage": true,
-        "promptCaching": false,
-        "strictJsonSchema": true
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 131072
       },
-
-      "request": {
-        "temperature": null,
-        "topP": null,
-        "reasoningEffort": "medium"
+      {
+        "id": "glm-5.2",
+        "name": "GLM 5.2(1.12)",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "supportsReasoningEffort": ["high", "xhigh"],
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 131072
       },
-
-      "agent": {
-        "promptProfile": "default-coding",
-        "contextProfile": "balanced",
-        "toolProfile": "workspace",
-        "maxIterations": 30,
-        "maxToolCalls": 80,
-        "maxConsecutiveFailures": 3
+      {
+        "id": "qwen3.7-plus",
+        "name": "Qwen3.7 Plus(0.32)",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "thinking": true,
+        "maxInputTokens": 991800,
+        "maxOutputTokens": 65500
       }
-    }
-  ],
-
-  "defaults": {
-    "model": "coding-primary",
-    "permissionProfile": "confirm-writes"
+    ]
   }
+]
+```
+
+### 5.2.1 モデル設定JSON Schemaの設計
+
+モデル設定ファイルは、提示されたCopilot系のモデル設定と同じく、ルートをProvider配列とし、Providerの中にModel配列を持つ構造にする。Provider固有の接続設定とModel固有の能力・Token上限を分離し、Modelの選択やAgent実行設定はModel IDを基準に解決する。Copilot固有の認証実装やサービスエンドポイントは流用しない。
+
+この構造上の互換性と、プロジェクト固有の意味を分離する。
+
+- ルートは`type: "array"`、ProviderとModelは`type: "object"`で定義し、設定項目を`properties`に列挙する。
+- Providerの識別子は`name`、Modelの識別子はModelオブジェクトの`id`を正本とする。IDはModel Catalogの解決とエラー表示に利用する。
+- 各オブジェクトは`additionalProperties: false`を基本とし、未知のキーを黙って無視しない。将来の拡張はSchemaのversion更新と明示的な移行で行う。
+- 配列は空を許可しない。Provider名とModel IDの重複、Model間のURL不整合はJSON Schema検証後の意味検証で確認する。
+- Agent設定は提示例に存在しないため、Model内の任意の`agent`拡張として定義する。省略時は組み込みの安全な既定値を使用し、提示例を有効な最小設定として扱う。
+
+#### Schemaのトップレベル契約
+
+```text
+ModelConfig = Provider[]
+Provider
+├─ name: string
+├─ vendor: string
+├─ apiKey?: SecretReference
+├─ apiType: chat-completions | responses | messages
+└─ models: Model[]
+Model
+├─ id: string
+├─ name: string
+├─ vendor?: string
+├─ url: URI
+├─ toolCalling: boolean
+├─ vision: boolean
+├─ thinking?: boolean
+├─ supportsReasoningEffort?: ReasoningEffort[]
+├─ maxInputTokens: integer
+├─ maxOutputTokens: integer
+└─ agent?: AgentSettings
+```
+
+#### Provider
+
+必須項目は`name`、`vendor`、`apiType`、`models`とする。`apiKey`は認証不要のProviderを許可するため任意とするが、指定する場合は提示例の`${input:...}`または`secret://...`の参照形式だけを許可する。APIキー本体、Authorization値、Cookie、環境変数の展開結果を設定ファイルに記述する形式は定義しない。
+
+- `name`、`vendor`: 1〜128文字の非空文字列
+- `apiType`: `chat-completions`、`responses`、`messages`のいずれか。`chat-completions`はOpenAI互換、`responses`はOpenAI Responses、`messages`はAnthropic Messagesを表す
+- `apiKey`: `${input:<secret-id>}`または`secret://<secret-id>`。値はSecretStorageから解決し、平文として扱わない
+- `models`: 1件以上のModel配列
+
+Providerの設定で許可するプロトコルは、プロジェクトルールの初期対応範囲と一致させる。Gemini等の第2段階プロトコルは、Schema version 1の列挙値へ追加しない。API URLはProviderではなくModelごとの`url`に置く。
+
+#### Model
+
+必須項目は`id`、`name`、`url`、`toolCalling`、`vision`、`maxInputTokens`、`maxOutputTokens`とする。提示例にない`vendor`、`thinking`、`supportsReasoningEffort`、`agent`は任意とする。
+
+- `id`、`name`、`vendor`: 1〜128文字の非空文字列。IDは`^[a-z0-9][a-z0-9._-]*$`に限定する
+- `url`: URI。`https`を既定とし、`http`は`localhost`またはループバックアドレスに限定する
+- `maxInputTokens`: 整数、`1,024`以上`10,000,000`以下
+- `maxOutputTokens`: 整数、`1`以上`1,000,000`以下。`maxInputTokens`以下であることは意味検証で確認する
+- `toolCalling`、`vision`、`thinking`: boolean
+- `supportsReasoningEffort`: `none`、`low`、`medium`、`high`、`xhigh`からなる重複なし配列。`thinking`がtrueの場合だけ指定を許可する
+
+Provider内のModel ID重複、URLの不正、`maxOutputTokens`と`maxInputTokens`の関係、`supportsReasoningEffort`と`thinking`の整合性は、JSON Schemaの型検証だけでは表現しにくいため、Schema検証後の意味検証エラーとして扱う。
+
+#### Capabilities
+
+Capabilitiesはモデル名から推測せず、設定値を正の情報源とする。提示例の能力項目をModel直下に置き、`toolCalling`と`vision`を必須、`thinking`と`supportsReasoningEffort`を任意とする。未指定時の暗黙の有効化は行わない。
+
+```text
+toolCalling        boolean
+vision             boolean
+thinking           boolean
+supportsReasoningEffort  ReasoningEffort[]
+```
+
+Providerの`apiType`が`chat-completions`でも、Modelごとに`toolCalling`や`vision`を指定できる。能力不足時のUI・Tool・Agent挙動は後続のModel Catalog／Provider実装で利用する。
+
+#### Agent設定
+
+Agent設定はModel単位の任意オブジェクトとし、指定された場合は実行上限をSchemaの数値範囲で制限する。提示例のように省略した場合は、組み込みの安全な既定値を使用する。
+
+- `promptProfile`: 1〜64文字のProfile ID
+- `contextProfile`: `compact`、`balanced`、`extended`のいずれか
+- `toolProfile`: `read-only`、`workspace`、`full`のいずれか。これは権限プロファイルではなく、利用可能Toolの集合を選ぶ設定とする
+- `maxIterations`: 整数、`1`以上`100`以下
+- `maxToolCalls`: 整数、`1`以上`500`以下
+- `maxConsecutiveFailures`: 整数、`1`以上`10`以下
+
+`toolProfile`で`full`を指定しても権限確認を省略できない。権限は`Permission Profile`とWorkspace Trustで別途判定し、`autonomous`は既定設定の列挙値に含めない。
+
+#### スコープとCopilot系設定構造の適用範囲
+
+設定ファイルの構造はCopilot系設定と同じく、グローバル設定とリポジトリ／ワークスペース設定を別ファイルに置き、同じキーを後のスコープで上書きできる形にする。ただし本プロジェクトの優先順位は既存ルールを優先し、次の順序を固定する。
+
+```text
+User Settings > ユーザー共通モデル設定 > ワークスペースモデル設定 > 組み込みデフォルト
+```
+
+JSON Schemaは設定ファイル全体の形を検証する。スコープごとの安全性は別のポリシーとして適用し、ワークスペース設定から`apiKey`、外部URL、認証情報を変更できないようにする。JSONの構文が正しくても、このポリシーに違反する設定は有効な最終設定に採用しない。
+
+#### 検証エラーの契約
+
+検証結果は例外文字列ではなく、すべての違反をパス付きの構造化エラーとして返す。エラーの順序はJSON Pointerのパス順で安定させ、複数エラーを一度に表示できるようにする。
+
+```ts
+interface ModelConfigValidationIssue {
+  code:
+    | "CONFIG_INVALID_JSON"
+    | "CONFIG_SCHEMA_INVALID"
+    | "CONFIG_UNKNOWN_PROPERTY"
+    | "CONFIG_INVALID_REFERENCE"
+    | "CONFIG_SEMANTIC_INVALID"
+    | "CONFIG_WORKSPACE_POLICY_VIOLATION";
+  path: string;
+  keyword?: string;
+  message: string;
+  expected?: string;
+  actual?: string;
 }
 ```
+
+メッセージには、例えば`/0/models/0/toolCalling`、期待値`boolean`、実際値`"yes"`のように、対象パス・期待値・実際値を含める。APIキーやAuthorization値などの秘密情報は`actual`、ログ、UI通知のいずれにも出力しない。ユーザー向け表示は安全な概要、開発者向け診断はSchema keywordと位置情報、ログは設定ファイルの種別とエラーコードだけに分離する。
+
+検証段階は次の順序とする。
+
+1. UTF-8 JSONとして解析する。解析不能なら`CONFIG_INVALID_JSON`を返す。
+2. JSON Schema Draft 2020-12で型、必須項目、列挙値、数値範囲、形式、未知プロパティを検証する。
+3. Provider／Modelの構造、ID重複、能力間の関係、Token上限を意味検証する。
+4. ファイルのスコープに応じたSecret、URL、ヘッダー、Workspace Trustのポリシーを検証する。
+5. 1〜4の違反があれば設定全体を無効とし、部分的なProviderやModelを実行経路へ渡さない。
+
+#### 実装時の検証とテスト方針
+
+Schemaは`resources/model-config.schema.json`として配置し、Draft 2020-12対応のAJVバリデーターで検証する。検証コードは`src/models/model-config-validator.ts`に置き、JSON構文、Schema、意味、スコープポリシーを順番に検証する。
+
+実装時は、正常な最小設定、全項目を含む設定、未知プロパティ、必須項目欠落、列挙値外、各数値範囲の境界値、URI不正、Provider／Model参照不整合、重複Model ID、秘密情報混入、ワークスペースポリシー違反を`tests/unit/`で検証する。完了条件は、設定ファイルをSchema検証し、失敗時に上記のパス付きエラーを取得できることである。
 
 ### 5.3 APIキー
 
@@ -447,14 +554,10 @@ interface SecretStore {
 
 ```ts
 interface ModelCapabilities {
-  streaming: boolean;
   toolCalling: boolean;
-  parallelToolCalls: boolean;
   vision: boolean;
-  reasoning: boolean;
-  systemMessage: boolean;
-  promptCaching: boolean;
-  strictJsonSchema: boolean;
+  thinking?: boolean;
+  supportsReasoningEffort?: readonly ("none" | "low" | "medium" | "high" | "xhigh")[];
 }
 ```
 

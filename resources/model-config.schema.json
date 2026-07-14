@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://byok-agent.dev/schemas/model-config.schema.json",
+  "title": "BYOK Agent model configuration",
+  "type": "array",
+  "minItems": 1,
+  "items": { "$ref": "#/$defs/provider" },
+  "$defs": {
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "vendor", "apiType", "models"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "vendor": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "apiKey": {
+          "type": "string",
+          "pattern": "^(\\$\\{input:[^}]+\\}|secret://[^\\s/][^\\s]*)$"
+        },
+        "apiType": { "enum": ["chat-completions", "responses", "messages"] },
+        "models": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/model" } }
+      }
+    },
+    "model": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "name",
+        "url",
+        "toolCalling",
+        "vision",
+        "maxInputTokens",
+        "maxOutputTokens"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*$",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "vendor": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "url": { "type": "string", "format": "provider-url" },
+        "toolCalling": { "type": "boolean" },
+        "vision": { "type": "boolean" },
+        "thinking": { "type": "boolean" },
+        "supportsReasoningEffort": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["none", "low", "medium", "high", "xhigh"] }
+        },
+        "maxInputTokens": { "type": "integer", "minimum": 1024, "maximum": 10000000 },
+        "maxOutputTokens": { "type": "integer", "minimum": 1, "maximum": 1000000 },
+        "agent": { "$ref": "#/$defs/agent" }
+      }
+    },
+    "agent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "promptProfile": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "contextProfile": { "enum": ["compact", "balanced", "extended"] },
+        "toolProfile": { "enum": ["read-only", "workspace", "full"] },
+        "maxIterations": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "maxToolCalls": { "type": "integer", "minimum": 1, "maximum": 500 },
+        "maxConsecutiveFailures": { "type": "integer", "minimum": 1, "maximum": 10 }
+      }
+    }
+  }
+}
