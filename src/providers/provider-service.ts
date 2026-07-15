@@ -6,6 +6,7 @@ import { ExtensionSecretStore, type SecretStore } from "./secret-store";
 export interface ProviderService extends ManagedService {
   readonly serviceName: "provider";
   getApiKey(providerId: string): Promise<string | undefined>;
+  getApiKeyStatus(providerId: string): Promise<"configured" | "not-configured" | "unavailable">;
   setApiKey(providerId: string, value: string): Promise<void>;
   deleteApiKey(providerId: string): Promise<void>;
 }
@@ -42,6 +43,17 @@ export class DefaultProviderService extends ManagedService implements ProviderSe
 
   public getApiKey(providerId: string): Promise<string | undefined> {
     return this.secretStore.get(providerId);
+  }
+
+  public async getApiKeyStatus(
+    providerId: string,
+  ): Promise<"configured" | "not-configured" | "unavailable"> {
+    try {
+      const value = await this.secretStore.get(providerId);
+      return value === undefined || value.length === 0 ? "not-configured" : "configured";
+    } catch {
+      return "unavailable";
+    }
   }
 
   public setApiKey(providerId: string, value: string): Promise<void> {

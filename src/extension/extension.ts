@@ -49,6 +49,25 @@ function registerApiKeyCommands(
   catalog: ConfiguredModelCatalog,
 ): void {
   context.subscriptions.push(
+    vscode.commands.registerCommand("byokAgent.manageProviderCredentials", async () => {
+      const selectedProvider = await selectProvider(catalog, undefined);
+      if (!selectedProvider) return;
+      const configured = await providerService.getApiKeyStatus(selectedProvider.id);
+      const action = await vscode.window.showQuickPick(
+        configured === "configured"
+          ? [
+              { label: "APIキーを更新", command: "set" as const },
+              { label: "APIキーを削除", command: "delete" as const },
+            ]
+          : [{ label: "APIキーを設定", command: "set" as const }],
+        { placeHolder: `${selectedProvider.label}の認証情報を管理` },
+      );
+      if (!action) return;
+      await vscode.commands.executeCommand(
+        action.command === "set" ? "byokAgent.setApiKey" : "byokAgent.deleteApiKey",
+        selectedProvider.id,
+      );
+    }),
     vscode.commands.registerCommand("byokAgent.setApiKey", async (providerId?: unknown) => {
       const selectedProvider = await selectProvider(catalog, providerId);
       if (!selectedProvider) return;

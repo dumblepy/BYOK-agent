@@ -50,6 +50,7 @@ describe("ExtensionWebviewProtocolSession", () => {
       "thread-snapshot",
       "model-list",
       "permission-updated",
+      "provider-credentials",
     ]);
     expect((webview.sent[0] as { correlationId: string }).correlationId).toBe(ready.messageId);
     session.dispose();
@@ -72,7 +73,7 @@ describe("ExtensionWebviewProtocolSession", () => {
     webview.emit(ready);
     webview.emit(ready);
     await flush();
-    expect(webview.sent).toHaveLength(4);
+    expect(webview.sent).toHaveLength(5);
     session.dispose();
   });
 

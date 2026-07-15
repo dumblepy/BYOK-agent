@@ -2289,6 +2289,100 @@ type ExtensionToUiPermissionMessage = MessageEnvelope<"permission-updated", {
 
 完了条件は、3つのプロファイルを安全に選択でき、現在の要求・実効権限を常時表示し、書き込み能力を広げる前に説明と確認を行い、選択確定後の次回Agent実行がHostのThread Storeから解決した権限Contextを用いてToolごとの権限判定を行うこととする。`autonomous`の有効化、承認ダイアログそのものの一般化、Permission Policyの全操作定義は本UI設計の完了条件に含めない。
 
+### 14.2.5 Provider認証設定UI詳細設計
+
+Provider認証設定UIは、検証済みModel Catalogに存在するProviderの認証状態を確認し、APIキーの登録・更新・削除を開始するためのWebview UIとする。APIキーの保存・取得・削除、入力UIの起動、Providerの存在確認、状態の正本管理はExtension Hostが担当する。Webviewは認証状態の表示と操作要求の送信だけを担当し、APIキー本体を扱わない。
+
+#### 責務と表示契約
+
+HostからUIへ渡すProvider認証要約は、次の情報に限定する。
+
+```ts
+type ProviderCredentialStatus =
+  | "configured"
+  | "not-configured"
+  | "unavailable";
+
+interface ProviderCredentialSummary {
+  providerId: string;
+  displayName: string;
+  vendor: string;
+  status: ProviderCredentialStatus;
+  canEdit: boolean;
+}
+```
+
+`configured`はSecretStorageに非空の値が存在することだけを表す。キーの一部、マスク値、長さ、更新日時、SecretStorageキー名は返さない。`unavailable`はProvider設定が不正、Providerが解決不能、またはSecretStorageの読み取りに失敗した場合の安全な表示状態であり、内部例外の詳細は含めない。UIはProvider URL、認証ヘッダー、Model設定JSONを直接読まない。
+
+Provider一覧はHostが表示名の昇順、同名の場合は正規化済みProvider IDの昇順で決定する。Webview側で任意のProviderを追加したり、受信したIDを表示ラベルへ変換したりしない。Providerが0件の場合は設定対象がない旨を表示し、操作を無効にする。
+
+#### 操作と状態遷移
+
+入力フォーム下のツールバー左端に`＋`ボタンを置き、クリックでメニューバーを開く。メニューバーには「Provider認証設定」ボタンを置き、このボタンからProvider認証パネルを開く。パネル上部右端には`✕`ボタンを置き、押下時はパネルだけを閉じる。パネルではProviderごとに状態ラベルと、登録・更新・削除の操作を表示する。未設定時は「APIキーを設定」、設定済み時は「APIキーを更新」「APIキーを削除」を表示する。キー本体を再表示する操作、コピー操作、マスク値の表示は提供しない。
+
+状態は`loading`、`ready`、`updating`、`error`で管理する。`updating`中は対象Providerの操作を無効にし、同一要求の二重送信を防ぐ。保存または削除が成功するまで確定表示を変更せず、成功後にHostから届いた新しい一覧で更新する。キャンセル、失敗、Webview再生成時はHostの最後の確定状態を表示する。
+
+設定・更新はHostがProviderを検証した後、VS Codeのパスワード入力UIを開き、非空の入力だけをSecretStorageへ保存する。更新操作も同じ保存経路を使う。削除はHostがProvider IDを再検証してSecretStorageから冪等に削除する。Webviewから送るのはProvider IDと操作種別だけであり、入力値をpayloadへ含めない。
+
+Command Paletteには次のコマンドを登録する。
+
+| コマンド | 動作 | 成功時の通知 |
+|---|---|---|
+| `byokAgent.manageProviderCredentials` | Provider一覧を選択し、設定済み状態を確認して設定・更新・削除を実行 | 保存・削除されたことだけを表示 |
+| `byokAgent.setProviderApiKey` | Providerを選択し、Hostのパスワード入力UIから設定・更新 | Provider表示名と完了状態だけを表示 |
+| `byokAgent.deleteProviderApiKey` | Providerを選択し、削除確認後に削除 | Provider表示名と完了状態だけを表示 |
+
+Command PaletteとWebviewから同時に要求が来た場合はHost側でProvider単位に直列化し、後から完了した操作の結果を新しい状態一覧として配信する。コマンド引数にProvider IDを受け付ける場合も、Catalogに存在するIDとの完全一致をHostで検証し、表示名や任意文字列から解決しない。
+
+#### Webview通信
+
+既存の共通エンベロープを使い、UIからHostへの要求を次のように追加する。
+
+```ts
+type UiToExtensionMessage =
+  // 既存のメンバー
+  | MessageEnvelope<"request-provider-credentials", {
+      providerId?: string;
+    }>
+  | MessageEnvelope<"set-provider-credential", {
+      providerId: string;
+    }>
+  | MessageEnvelope<"delete-provider-credential", {
+      providerId: string;
+    }>;
+```
+
+`request-provider-credentials`は全Providerまたは指定Providerの状態再取得要求、`set-provider-credential`はHostの入力UI起動要求、`delete-provider-credential`は削除確認を経た削除要求である。`set-provider-credential`の完了は、Hostが入力UIを閉じてSecretStorageへの保存結果を確定した後に返す。
+
+HostからUIへは次の通知を追加する。
+
+```ts
+type ExtensionToUiMessage =
+  // 既存のメンバー
+  | MessageEnvelope<"provider-credentials", {
+      providers: readonly ProviderCredentialSummary[];
+    }>
+  | MessageEnvelope<"provider-credential-operation", {
+      providerId: string;
+      operation: "set" | "delete";
+      status: "succeeded" | "cancelled" | "failed";
+    }>;
+```
+
+操作結果の`failed`には構造化エラーコードだけを含め、SecretStorageの例外、APIキー、入力値、Providerの生レスポンスは含めない。UIは操作結果を受け取った後に`provider-credentials`を正本として適用し、古い`messageId`や別セッションの通知を無視する。
+
+#### セキュリティ、アクセシビリティ、実装単位
+
+Webviewの通信受信時は既存のZod判別共用体へ追加したスキーマで検証し、検証前の値をDOM、ログ、コマンド実行、SecretStorageへ渡さない。Provider表示名やエラー文はテキストとして表示し、HTML、URL、Command URIとして解釈しない。UIはVS Code標準テーマトークンとCodiconを使用し、状態を色だけで表現しない。操作ボタンにはProvider名と操作内容を含むアクセシブルな名前を付け、更新中は`aria-busy`、成功・失敗は`aria-live`で通知する。削除はキーボード操作可能な確認ダイアログを必須とする。
+
+実装単位は、Host側の`ProviderCredentialService`、Command Paletteのコマンド登録、認証状態を返すUIルーター、Webview側の`ProviderCredentialPanel`、通信スキーマ・Reducerとする。`ProviderCredentialService`は`SecretStore`、`ModelCatalog`、入力UIを依存先とし、WebviewやThread StoreへSecretStorageを公開しない。
+
+#### テストと完了条件
+
+単体テストではProviderごとの状態判定、保存・更新・削除、未知Provider、空入力、キャンセル、SecretStorage障害、同時操作の直列化を検証する。UIテストでは未設定・設定済み・利用不能・更新中・失敗の表示、キー本体非表示、二重操作抑止、削除確認、キーボード操作、`aria-live`通知を検証する。通信テストではpayloadにAPIキー本体・マスク値・長さが存在しないこと、Zod検証、相関ID、古い通知の無視を検証する。Command Paletteの統合テストではWebviewを開かずに設定・更新・削除が完了することを検証する。
+
+完了条件は、UIまたはCommand PaletteからProviderを選び、登録状態を確認し、APIキーを設定・更新・削除できること、かつ操作後もAPIキー本体が再表示されずSecretStorage以外へ保存・送信・記録されないことである。Provider APIの有効性確認は本UIの完了条件に含めない。
+
 ## 14.3 Webview通信
 
 Extension HostとWebviewの通信は、VS Code Webview APIの`postMessage`を搬送路とし、その上に本拡張専用のバージョン付きメッセージプロトコルを定義する。WebviewはUI状態の投影とユーザー操作を担当し、会話・Agent実行・権限・変更の正本はExtension Hostが保持する。
@@ -2352,6 +2446,15 @@ type UiToExtensionMessage =
       profile: Exclude<PermissionProfile, "autonomous">;
       expectedThreadRevision: number;
     }>
+  | MessageEnvelope<"request-provider-credentials", {
+      providerId?: string;
+    }>
+  | MessageEnvelope<"set-provider-credential", {
+      providerId: string;
+    }>
+  | MessageEnvelope<"delete-provider-credential", {
+      providerId: string;
+    }>
   | MessageEnvelope<"request-thread-snapshot", {
       threadId: string;
     }>;
@@ -2402,6 +2505,14 @@ type ExtensionToUiMessage =
   | MessageEnvelope<"permission-updated", {
       summary: PermissionSummary;
     }>
+  | MessageEnvelope<"provider-credentials", {
+      providers: readonly ProviderCredentialSummary[];
+    }>
+  | MessageEnvelope<"provider-credential-operation", {
+      providerId: string;
+      operation: "set" | "delete";
+      status: "succeeded" | "cancelled" | "failed";
+    }>
   | MessageEnvelope<"protocol-error", {
       code: "UNSUPPORTED_VERSION" | "INVALID_MESSAGE" | "MESSAGE_TOO_LARGE";
       message: string;
@@ -2433,6 +2544,9 @@ const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
   discardChangeSetSchema,
   selectModelSchema,
   setPermissionSchema,
+  requestProviderCredentialsSchema,
+  setProviderCredentialSchema,
+  deleteProviderCredentialSchema,
   requestThreadSnapshotSchema,
 ]);
 
@@ -3120,6 +3234,7 @@ const scenario = [
 * Webview再表示時の一時UI状態復元
 * Model JSON
 * SecretStorage
+* Provider認証設定UI（Webview / Command Palette）
 * OpenAI互換Provider
 * ストリーミングチャット
 * スレッド保存
@@ -3129,6 +3244,7 @@ const scenario = [
 * BYOKキーで通常チャットが動作する
 * モデルをJSONで追加できる
 * APIキーが設定ファイルやログへ出ない
+* UIまたはCommand PaletteからProviderごとのAPIキーを設定・更新・削除できる
 
 ### Phase 2：読み取り専用エージェント
 

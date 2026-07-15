@@ -192,6 +192,16 @@ const modelCatalogDiagnosticSchema = z
     message: z.string().min(1).max(1_000),
   })
   .strict();
+const providerCredentialStatusSchema = z.enum(["configured", "not-configured", "unavailable"]);
+const providerCredentialSummarySchema = z
+  .object({
+    providerId: z.string().min(1).max(256),
+    displayName: z.string().min(1).max(256),
+    vendor: z.string().min(1).max(256),
+    status: providerCredentialStatusSchema,
+    canEdit: z.boolean(),
+  })
+  .strict();
 
 export const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
   messageSchema(
@@ -270,6 +280,30 @@ export const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
         threadId: identifierSchema,
         profile: userSelectablePermissionProfileSchema,
         expectedThreadRevision: z.number().int().nonnegative(),
+      })
+      .strict(),
+  ),
+  messageSchema(
+    "request-provider-credentials",
+    z
+      .object({
+        providerId: z.string().min(1).max(256).optional(),
+      })
+      .strict(),
+  ),
+  messageSchema(
+    "set-provider-credential",
+    z
+      .object({
+        providerId: z.string().min(1).max(256),
+      })
+      .strict(),
+  ),
+  messageSchema(
+    "delete-provider-credential",
+    z
+      .object({
+        providerId: z.string().min(1).max(256),
       })
       .strict(),
   ),
@@ -365,6 +399,24 @@ export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
       .strict(),
   ),
   messageSchema(
+    "provider-credentials",
+    z
+      .object({
+        providers: z.array(providerCredentialSummarySchema).max(256),
+      })
+      .strict(),
+  ),
+  messageSchema(
+    "provider-credential-operation",
+    z
+      .object({
+        providerId: z.string().min(1).max(256),
+        operation: z.enum(["set", "delete"]),
+        status: z.enum(["succeeded", "cancelled", "failed"]),
+      })
+      .strict(),
+  ),
+  messageSchema(
     "protocol-error",
     z
       .object({
@@ -398,6 +450,7 @@ export type ProposedActionSummary = z.infer<typeof proposedActionSummarySchema>;
 export type ChangeSetStatus = z.infer<typeof changeSetStatusSchema>;
 export type ChangeFileSummary = z.infer<typeof changeFileSummarySchema>;
 export type ModelSummary = z.infer<typeof modelSummarySchema>;
+export type ProviderCredentialSummary = z.infer<typeof providerCredentialSummarySchema>;
 export type UiToExtensionMessage = z.infer<typeof uiToExtensionMessageSchema>;
 export type ExtensionToUiMessage = z.infer<typeof extensionToUiMessageSchema>;
 export type ModelListPayload = Extract<ExtensionToUiMessage, { type: "model-list" }>["payload"];

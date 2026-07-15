@@ -10,6 +10,7 @@ import {
 } from "../extension/service-lifecycle";
 import type { AgentService } from "../agent/agent-service";
 import type { StorageService } from "../storage/storage-service";
+import type { ProviderService } from "../providers/provider-service";
 
 const AGENT_VIEW_ID = "byokAgent.view";
 type WebviewViewProviderRegistrationOptions = Parameters<
@@ -24,6 +25,7 @@ export interface UIServiceDependencies {
   readonly context: vscode.ExtensionContext;
   readonly agent: AgentService;
   readonly storage: StorageService;
+  readonly provider?: ProviderService;
   readonly modelCatalog?: ModelCatalog;
   readonly registerWebviewViewProvider: (
     viewId: string,
@@ -45,6 +47,7 @@ export class DefaultUIService extends ManagedService implements UIService {
   protected override onInitialize(): void {
     const provider = new AgentWebviewProvider(this.dependencies.context, {
       modelCatalog: this.dependencies.modelCatalog ?? new StaticModelCatalog(),
+      providerService: this.dependencies.provider,
       threadModelStore: this.dependencies.storage,
       isThreadRunActive: (threadId) => this.dependencies.agent.hasActiveRun(threadId),
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,

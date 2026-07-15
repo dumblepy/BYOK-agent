@@ -91,6 +91,7 @@ export async function createApplicationServices(
       context,
       agent,
       storage,
+      provider,
       modelCatalog,
       registerWebviewViewProvider: (viewId, provider, options) =>
         vscode.window.registerWebviewViewProvider(viewId, provider, options),

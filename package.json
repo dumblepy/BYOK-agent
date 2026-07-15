@@ -28,6 +28,10 @@
       {
         "command": "byokAgent.deleteApiKey",
         "title": "BYOK Agent: Delete API Key"
+      },
+      {
+        "command": "byokAgent.manageProviderCredentials",
+        "title": "BYOK Agent: Manage Provider Credentials"
       }
     ],
     "viewsContainers": {
