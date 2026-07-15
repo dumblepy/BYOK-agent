@@ -647,18 +647,81 @@ interface SecretStore {
 
 ### 5.4 モデル能力
 
-モデル名から能力を推測する実装は補助的なものに留める。
-
-正の情報源はJSON設定とする。
+モデル能力はModel Definitionに属する明示的な設定値であり、正の情報源は検証済みJSON設定とする。モデル名、Provider名、URL、APIレスポンスの名称規則から能力を推測して実行可否を決めてはならない。未指定・不正・不明な能力は利用不可として扱う。
 
 ```ts
+type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
+
 interface ModelCapabilities {
   toolCalling: boolean;
+  streaming: boolean;
   vision: boolean;
-  thinking?: boolean;
-  supportsReasoningEffort?: readonly ("none" | "low" | "medium" | "high" | "xhigh")[];
+  reasoning: boolean;
+  reasoningEfforts: readonly ("none" | "low" | "medium" | "high" | "xhigh")[];
 }
 ```
+
+`reasoning`は推論機能を利用できるか、`reasoningEfforts`は設定可能な強度の集合を表す。`reasoning=false`の場合、`reasoningEfforts`は空でなければならず、空でない設定は能力矛盾としてモデルを利用不可にする。`reasoning=true`でも強度が空の場合は、Provider既定の推論だけを許可し、UIに強度選択を表示しない。`none`は推論機能を無効化した明示値として扱う。
+
+既存設定の`thinking`は旧名称であり、Capabilitiesの正規化後に実行経路から参照しない。移行処理を導入する場合は、設定ファイルのバージョンと明示的な変換診断を追加し、`thinking`をモデル名推測の代替にしない。
+
+### 5.4.1 設定値から実効能力への解決
+
+設定値は能力の許可上限であり、実効能力は次の順でHost内に一度だけ解決する。
+
+```text
+configuredCapabilities
+  ∩ providerAdapterCapabilities
+  ∩ requestEnvironmentCapabilities
+  = effectiveCapabilities
+```
+
+ただし、明示的な`false`は常に`false`を維持する。Provider Adapterが能力を宣言していない場合も`false`とし、モデル名やAPIエラーから`true`へ昇格させない。設定値とAdapterの能力が矛盾する場合は診断を残し、そのモデルを利用可能一覧から除外するか、該当能力だけを無効化するかをエラー分類に従って決定する。少なくともTool CallingとStreamingのように実行プロトコルへ影響する能力は、矛盾時にRun開始を拒否する。
+
+解決済みスナップショットは次の境界を越えて共有する。
+
+```ts
+interface EffectiveCapabilities {
+  readonly toolCalling: boolean;
+  readonly streaming: boolean;
+  readonly vision: boolean;
+  readonly reasoning: boolean;
+  readonly reasoningEfforts: readonly ReasoningEffort[];
+  readonly revision: number;
+}
+
+interface CapabilityResolution {
+  readonly configured: ModelCapabilities;
+  readonly effective: EffectiveCapabilities;
+  readonly disabledReasons: Readonly<Record<string, string>>;
+}
+```
+
+`revision`はCatalogのスナップショットと同じ更新単位で採番する。Agent Run開始時に解決結果をコピーし、Run中は同じ値をProvider Request、Tool選定、Prompt構築、UIイベントへ使用する。
+
+### 5.4.2 能力不足時の機能切り替え
+
+| 能力 | `true`の場合 | `false`または不明の場合 |
+|---|---|---|
+| `toolCalling` | 利用可能かつ権限条件を満たすTool定義をリクエストへ含める | Tool定義を送らず、Tool Callを要求するAgent経路を開始しない |
+| `streaming` | `ProviderEvent`を受信するたびにUIへ逐次反映する | 完了応答を待って一括表示し、ストリーム専用の中断・進捗表示を無効にする |
+| `vision` | 画像入力をモデル入力へ変換し、添付UIを有効にする | 画像添付を無効にし、既存の画像入力は送信前に安全なエラーにする |
+| `reasoning` | 設定可能な`reasoningEfforts`だけを選択肢として表示・送信する | Reasoning設定UIとReasoning専用プロンプトを無効にする |
+
+能力不足を黙って別能力へ置き換えない。例えばTool Calling非対応モデルに対してテキスト内のTool記法を有効にするフォールバックはMVPでは提供しない。UIの無効状態は色だけに依存せず、理由を表示し、送信前にHostでも再検証する。Webviewから能力フラグを受け取っても正本とはせず、Hostの実効能力を再計算する。
+
+### 5.4.3 設定Schemaと診断
+
+将来のSchemaでは、Modelの`capabilities`オブジェクトに各能力を必須Booleanとして定義する。Reasoningの強度は`reasoningEfforts`配列で定義し、`reasoning=false`と非空配列の組み合わせを意味検証で拒否する。既存のフラットな`toolCalling`・`vision`から移行する場合は、読み込み時に新旧形式を混在させず、明示的なSchemaバージョンを用いる。
+
+診断には少なくとも次を含める。
+
+* `MODEL_CAPABILITY_MISSING`: 必須能力が未指定
+* `MODEL_CAPABILITY_CONFLICT`: 能力とReasoning設定が矛盾
+* `MODEL_CAPABILITY_ADAPTER_UNSUPPORTED`: 設定された能力をAdapterが提供できない
+* `MODEL_CAPABILITY_REQUEST_UNSUPPORTED`: 現在のリクエスト形式または環境で能力を利用できない
+
+診断はURL、ヘッダー、Secret、プロンプト本文を含めない。利用可能モデル一覧には実効能力を反映したモデルだけを含め、能力不足で無効化された機能は構造化診断とUIの安全な説明へ変換する。
 
 VS CodeのLanguage Model Chat Provider APIも、一つのプロバイダーから複数モデルを公開し、コンテキスト長、出力長、画像入力、Tool Callingなどのメタデータを提供する構造を採用している。
 
@@ -2909,6 +2972,10 @@ interface AgentError {
 ### 19.1 単体テスト
 
 * Model JSON Schema
+* Capabilitiesの設定値優先（モデル名・Provider名による推測が実行結果へ影響しないこと）
+* `false`・未指定・能力矛盾・Adapter非対応時の実効能力
+* Tool Calling、Streaming、Vision、Reasoningごとの機能無効化マトリクス
+* Run開始時のCapabilitiesスナップショット固定とCatalog revision更新
 * Provider設定マージ
 * コンテキスト優先順位
 * トークン予算配分

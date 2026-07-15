@@ -1,65 +1,54 @@
 ---
-description: 17-milestone-2-モデル設定とbyokブランチでModel Catalogの実装方針と設計を確認するときに読み込む
+description: 17-milestone-2-モデル設定とbyokブランチでModel Capabilities管理を設計するときに読み込む
 alwaysApply: false
 ---
-# Model Catalogの実装方針と設計
+# Model Capabilities管理の実装方針と設計
 
-このブランチでは、検証済みモデル設定を一元化し、モデルIDから実行に必要なProvider設定・能力を解決するModel Catalogを設計・実装する。
+このブランチでは、モデルの能力を設定値として明示的に管理し、モデル名の推測に依存せず、実行可能なツールとUIを能力に応じて安全に切り替える設計を確定する。
 
 ## 実装方針
 
-- Model CatalogはExtension Hostに置き、WebviewやAgent RuntimeがJSON設定を直接読むことを禁止する。
-- 設定ソースの読み込み、優先順位付きマージ、JSON Schema・意味・安全性検証はModel Configuration Loaderの責務とし、Catalogは検証済みの不変スナップショットだけを受け取る。
-- UIとThread Storeが保持するモデルIDはProvider APIへ渡すModel IDそのものとし、Provider名、URL、Secret参照、能力、Agent設定はCatalogで解決する。
-- 既定モデルは設定ソースの値として扱い、ユーザー設定・ワークスペース設定が勝手に既定値を切り替えないよう、既定値の変更権限と解決規則を明示する。
-- 無効な設定は部分採用せず、最後の有効スナップショットを維持する。UIには秘密情報を含まない構造化診断だけを通知する。
-- APIキー本体、Authorization、任意の認証ヘッダー、Provider内部設定をWebviewへ渡さない。Provider設定取得はHost内部の解決結果に限定する。
-- 同一論理モデルIDはCatalog内で一意にし、重複・参照不能・Provider不在・Secret未設定・能力矛盾を利用不可として扱う。
-- Model CatalogはProvider Adapterの選択・通信・リトライ・エージェント判断を実行しない。解決結果をAgent RuntimeとProvider Registryへ渡すだけにする。
+- CapabilitiesはModel Definitionに属する不変の設定値として扱い、Extension Hostでのみ解決する。
+- `false`または未指定の能力は利用不可とし、モデル名・Provider名・APIエンドポイントから補完しない。
+- 設定値が`true`でも、選択されたProvider Adapterがその能力を実行できない場合は実効能力を`false`として扱い、診断を記録する。
+- Tool Registry、Agent Runtime、Prompt Composer、Webview UIは、同じ`EffectiveCapabilities`スナップショットを参照する。各層が独自にモデル名を解析してはならない。
+- 能力不足は送信時に検出してからツール定義・入力UI・実行経路を無効化する。無効化した機能をモデルへ説明する必要がある場合は、安全な capability summary だけを渡す。
+- Run開始時に能力スナップショットを固定し、設定再読み込みやモデル変更で実行中の能力を変えない。
+- WebviewにはAPIキー、URL、ヘッダー、内部診断詳細を渡さず、表示に必要な能力フラグと利用可能機能だけを渡す。
 
 ## 進捗
 
 - [x] `AGENTS.md`、プロジェクトルール、共通ブランチルール、既存ブランチルールを確認する
-- [x] 既存のモデル設定、設定ローダー、モデル選択UIの設計境界を確認する
-- [x] 既存のブランチルールを削除し、Model Catalog向けに新規作成する
-- [x] モデルID、Provider設定、能力、既定値の解決契約を設計する
-- [x] 無効設定の診断とUI通知の契約を設計する
+- [x] 既存のモデル設定・Catalog・Provider・Tool・モデル選択UIの境界を調査する
+- [x] 既存のブランチルールを削除し、Capabilities管理向けに新規作成する
+- [x] Capabilitiesの定義、設定優先順位、実効能力の解決規則を設計する
+- [x] 能力不足時のTool・Agent・UIの無効化契約を設計する
 - [x] `documents/design.md`へ実装方針と詳細設計を追記する
-- [x] Model Catalogを実装する
-- [x] Model Catalogの単体・UI境界・Extension統合テストを実装する
-- [x] 型検査、Lint、フォーマット検査、テストを実行する
+- [x] Capabilities型と設定Schemaを実装する
+- [x] Tool・Agent・Provider・UIへ実効能力を接続する
+- [x] Capabilitiesの単体・Provider契約・Agentシミュレーション・Extension統合テストを実装する
 
 ## 完了条件
 
-1. UIまたはThread StoreのモデルIDから、一意なModel Definitionを解決できる。
-2. 解決結果から、Provider Adapterの識別子、Model ID、接続設定、Secret参照、能力、Agent設定を取得できる。
-3. 既定モデルの選択規則、ユーザー選択の優先順位、未設定・無効時のフォールバックが決まっている。
-4. 無効なモデル設定を原子的に除外し、UIへ安全な診断を通知できる。
-5. モデル選択後の次回実行が、Webviewの値ではなくHost側Catalogの解決結果を使う。
-6. UIのモデル選択のところにJSONで定義したモデルが表示されること。
+1. Tool Calling、Streaming、Vision、Reasoningを含む能力の意味と設定形式が定義されている。
+2. 設定値を最優先し、モデル名による推測を実行経路に使わないことが明記されている。
+3. 能力不足時に、ツール送信・画像添付・Reasoning設定・ストリーミング表示がどう無効化されるか決まっている。
+4. Host、Provider、Agent、Tool、Webview間で参照する実効能力の境界と固定タイミングが決まっている。
+5. 上記の切り替えを検証するテスト観点が定義されている。
 
 ## 対象外
 
-- Provider Adapterの通信実装、APIリクエスト送信、ストリーム変換
-- APIキー入力画面とSecretStorage自体の実装
-- モデル能力をモデル名から自動推測する機能
-- Agent Loop、Tool実行、権限判定の実装
-- `git add`、`git commit`、既存実装の置換
+- Capabilities管理の実装
+- Provider API通信やストリーム変換の実装
+- APIキー入力・SecretStorageの実装
+- モデル名からの能力自動推測機能
+- 新しいUIコンポーネントの実装
+- `git add`、`git commit`
 
 ## 調査結果・設計まとめ
 
-- 実運用のモデル定義は`~/.byok-agent/models.json`だけから読み込み、`resources/default-models.json`は初回生成用テンプレートとしてだけ使う。VS Code User Settingsとワークスペース設定はモデル定義の入力にしない。
-- 既存のモデル選択UIは`ModelSummary`としてID・表示名・Provider名だけを受け取るため、Provider内部設定やSecret情報はUI境界を越えない。
-- 既存の仮CatalogはUI向けの表示情報のみを扱う暫定境界であり、Model Configuration Loader接続時にProvider／Model定義から解決済み定義を生成する。
-- Modelの`id`を実際のProvider APIへ送るモデル名として使用し、別名のAPIモデル項目は持たない。
-- 設定不備の通知は、設定値を露出させない`source`、`path`、`code`、安全な表示メッセージを持つ診断イベントに限定する。
-
-## 参考資料
-
-- `AGENTS.md`
-- `.cursor/rules/project.mdc`
-- `.cursor/rules/branch.mdc`
-- `documents/design.md` §5「モデル設定」、§14.2.3「モデル選択UI」、§17「主要インターフェース」、§19「テスト設計」
-- `documents/issues.md`「Milestone 2: モデル設定とBYOK」のModel Catalog項目
-- `resources/model-config.schema.json`
-- `resources/default-models.json`
+- 現在のSchemaは`toolCalling`、`vision`、`thinking`、`supportsReasoningEffort`を持つが、Streamingを明示していない。設計上は`reasoning`へ名称を統一し、既存の`thinking`からの暗黙変換は行わず、移行時に明示的な変換規則を定める。
+- 既存のModel Catalogは設定値をHost側で解決する境界を持つため、Capabilitiesの正本をCatalogの解決済みModel Definitionへ置く。
+- 既存のモデル選択UIは表示用要約だけを受け取るため、能力情報を表示する場合も安全な表示フラグに限定し、Provider接続情報は渡さない。
+- Tool Registryは実行環境やPermission Profileも加味するが、モデル能力による制約を先に適用し、能力不足のツールをモデルへ公開しない。
+- `streaming=false`の場合はUIの逐次表示を待機表示へ切り替え、Providerが非ストリーム応答しか返せないことをユーザーへ明示する。

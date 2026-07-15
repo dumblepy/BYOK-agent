@@ -66,7 +66,9 @@ const DEFAULT_FALLBACK_CONFIG = `{
           "name": "Coding Primary",
           "url": "https://api.openai.com/v1/responses",
           "toolCalling": true,
+          "streaming": true,
           "vision": true,
+          "reasoning": false,
           "maxInputTokens": 128000,
           "maxOutputTokens": 16384
         }

@@ -25,8 +25,13 @@ export interface ModelConfigModel {
   vendor?: string;
   url: string;
   toolCalling: boolean;
+  streaming?: boolean;
   vision: boolean;
+  reasoning?: boolean;
+  reasoningEfforts?: readonly ReasoningEffort[];
+  /** @deprecated Use reasoning. Kept only for reading existing config files. */
   thinking?: boolean;
+  /** @deprecated Use reasoningEfforts. Kept only for reading existing config files. */
   supportsReasoningEffort?: readonly ReasoningEffort[];
   maxInputTokens: number;
   maxOutputTokens: number;
@@ -51,8 +56,13 @@ export interface ModelConfigDocument {
 
 export interface ModelCapabilities {
   toolCalling: boolean;
+  streaming: boolean;
   vision: boolean;
+  reasoning: boolean;
+  reasoningEfforts: readonly ReasoningEffort[];
+  /** @deprecated Runtime code must use reasoning. */
   thinking?: boolean;
+  /** @deprecated Runtime code must use reasoningEfforts. */
   supportsReasoningEffort?: readonly ReasoningEffort[];
 }
 
@@ -271,13 +281,37 @@ function semanticIssues(config: ModelConfig): ModelConfigValidationIssue[] {
           actual: String(model.maxOutputTokens),
         });
       }
-      if (model.supportsReasoningEffort !== undefined && model.thinking !== true) {
+      const reasoning = model.reasoning ?? model.thinking ?? false;
+      const reasoningEfforts = model.reasoningEfforts ?? model.supportsReasoningEffort;
+      if (reasoningEfforts !== undefined && reasoning !== true) {
         issues.push({
           code: "CONFIG_SEMANTIC_INVALID",
-          path: `${path}/supportsReasoningEffort`,
-          message: "thinkingがtrueの場合だけreasoning effortを指定できます。",
-          expected: "thinking=true",
-          actual: "thinking is not true",
+          path: `${path}/${model.reasoningEfforts !== undefined ? "reasoningEfforts" : "supportsReasoningEffort"}`,
+          message: "reasoningがtrueの場合だけreasoning effortを指定できます。",
+          expected: "reasoning=true",
+          actual: "reasoning is not true",
+        });
+      }
+      if (
+        model.reasoning !== undefined &&
+        model.thinking !== undefined &&
+        model.reasoning !== model.thinking
+      ) {
+        issues.push({
+          code: "CONFIG_SEMANTIC_INVALID",
+          path: `${path}/reasoning`,
+          message: "reasoningと旧thinkingの値を一致させてください。",
+        });
+      }
+      if (
+        model.reasoningEfforts !== undefined &&
+        model.supportsReasoningEffort !== undefined &&
+        JSON.stringify(model.reasoningEfforts) !== JSON.stringify(model.supportsReasoningEffort)
+      ) {
+        issues.push({
+          code: "CONFIG_SEMANTIC_INVALID",
+          path: `${path}/reasoningEfforts`,
+          message: "reasoningEffortsと旧supportsReasoningEffortの値を一致させてください。",
         });
       }
     });

@@ -151,4 +151,41 @@ describe("model config validator", () => {
       "大文字小文字を無視したHTTPヘッダー名の重複は許可されません。",
     );
   });
+
+  it("新しいReasoning設定を検証し、旧形式との矛盾を拒否する", () => {
+    const valid = validateModelConfig(
+      document([
+        {
+          ...minimal[0],
+          models: [
+            {
+              ...minimal[0].models[0],
+              streaming: true,
+              reasoning: true,
+              reasoningEfforts: ["low", "high"],
+            },
+          ],
+        },
+      ]),
+    );
+    expect(valid.valid).toBe(true);
+
+    const invalid = validateModelConfig(
+      document([
+        {
+          ...minimal[0],
+          models: [
+            {
+              ...minimal[0].models[0],
+              reasoning: false,
+              reasoningEfforts: ["low"],
+            },
+          ],
+        },
+      ]),
+    );
+    expect(invalid.issues.map((issue) => issue.path)).toContain(
+      "/providers/0/models/0/reasoningEfforts",
+    );
+  });
 });

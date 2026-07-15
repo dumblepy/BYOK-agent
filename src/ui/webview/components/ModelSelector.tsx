@@ -72,6 +72,8 @@ export function ModelSelector({
   };
 
   const selectedModel = state.models.find((m) => m.id === state.selectedModelId);
+  const reasoningEnabled = selectedModel?.capabilities?.reasoning === true;
+  const reasoningEfforts = selectedModel?.capabilities?.reasoningEfforts ?? [];
 
   return (
     <div class="model-selector" aria-label="モデル選択">
@@ -102,6 +104,7 @@ export function ModelSelector({
               type="button"
               class="model-selector-menu-item"
               role="menuitem"
+              disabled={!reasoningEnabled || !reasoningEfforts.includes("low")}
               onClick={() => handleSelect("low")}
             >
               <span>低</span>
@@ -111,6 +114,7 @@ export function ModelSelector({
               type="button"
               class="model-selector-menu-item"
               role="menuitem"
+              disabled={!reasoningEnabled || !reasoningEfforts.includes("medium")}
               onClick={() => handleSelect("medium")}
             >
               <span>中</span>
@@ -119,6 +123,7 @@ export function ModelSelector({
               type="button"
               class="model-selector-menu-item"
               role="menuitem"
+              disabled={!reasoningEnabled || !reasoningEfforts.includes("high")}
               onClick={() => handleSelect("high")}
             >
               <span>高</span>
@@ -127,10 +132,14 @@ export function ModelSelector({
               type="button"
               class="model-selector-menu-item"
               role="menuitem"
+              disabled={!reasoningEnabled || !reasoningEfforts.includes("xhigh")}
               onClick={() => handleSelect("very-high")}
             >
               <span>非常に高い</span>
             </button>
+            {!reasoningEnabled ? (
+              <div class="model-selector-menu-subtitle">このモデルは推論に対応していません</div>
+            ) : null}
           </div>
 
           <div class="model-selector-menu-divider" />

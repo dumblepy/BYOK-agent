@@ -16,6 +16,7 @@ import {
   DEFAULT_THREAD_ID,
   type UiToExtensionMessage,
 } from "./webview-protocol";
+import type { ModelCatalogChangeSubscription } from "../models/model-catalog";
 
 const WEBVIEW_ROOT = ["out", "webview"] as const;
 
@@ -97,11 +98,19 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         await this.handleUiMessage(message, protocolSession);
       },
     });
+    let modelCatalogSubscription: ModelCatalogChangeSubscription | undefined;
+    if (this.modelCatalog?.onDidChange) {
+      modelCatalogSubscription = this.modelCatalog.onDidChange(() => {
+        const threadId = this.activeThreadId;
+        if (threadId !== undefined) void protocolSession.sendModelList(threadId);
+      });
+    }
     const trustSubscription = this.onDidGrantWorkspaceTrust?.(() => {
       void protocolSession.sendPermissionUpdated(this.activeThreadId ?? DEFAULT_THREAD_ID);
     });
     webviewView.onDidDispose?.(() => {
       trustSubscription?.dispose();
+      modelCatalogSubscription?.dispose();
       protocolSession.dispose();
     });
   }
@@ -319,11 +328,20 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
   private async getModelList(threadId: string) {
     this.activeThreadId = threadId;
-    const models = (this.modelCatalog?.listAvailable() ?? []).map(({ id, label, provider }) => ({
-      id,
-      label,
-      provider: provider.id,
-    }));
+    const models = (this.modelCatalog?.listAvailable() ?? []).map(
+      ({ id, label, provider, effectiveCapabilities }) => ({
+        id,
+        label,
+        provider: provider.id,
+        capabilities: {
+          toolCalling: effectiveCapabilities.toolCalling,
+          streaming: effectiveCapabilities.streaming,
+          vision: effectiveCapabilities.vision,
+          reasoning: effectiveCapabilities.reasoning,
+          reasoningEfforts: [...effectiveCapabilities.reasoningEfforts],
+        },
+      }),
+    );
     const state = this.threadModelStore
       ? await this.threadModelStore.getThreadModelState(threadId)
       : { threadId, revision: 0 };

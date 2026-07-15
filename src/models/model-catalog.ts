@@ -5,7 +5,29 @@ import type {
   ModelConfig,
   ModelConfigModel,
   ModelConfigProvider,
+  ReasoningEffort,
 } from "./model-config-validator";
+
+export type CapabilityName = "toolCalling" | "streaming" | "vision" | "reasoning";
+
+export interface EffectiveCapabilities {
+  readonly toolCalling: boolean;
+  readonly streaming: boolean;
+  readonly vision: boolean;
+  readonly reasoning: boolean;
+  readonly reasoningEfforts: readonly ReasoningEffort[];
+  readonly revision: number;
+}
+
+export interface CapabilityResolution {
+  readonly configured: ModelCapabilities;
+  readonly effective: EffectiveCapabilities;
+  readonly disabledReasons: Readonly<Partial<Record<CapabilityName, string>>>;
+}
+
+export interface ModelCatalogChangeSubscription {
+  dispose(): void;
+}
 
 export interface ResolvedAgentSettings {
   readonly promptProfile: string;
@@ -30,6 +52,7 @@ export interface ModelDefinition {
   readonly label: string;
   readonly provider: ResolvedProviderSettings;
   readonly capabilities: ModelCapabilities;
+  readonly effectiveCapabilities: EffectiveCapabilities;
   readonly contextWindow: number;
   readonly maxOutputTokens: number;
   readonly agent: ResolvedAgentSettings;
@@ -43,6 +66,7 @@ export type ModelCatalogDiagnosticCode =
   | "MODEL_DUPLICATE_ID"
   | "MODEL_PROVIDER_NOT_FOUND"
   | "MODEL_ADAPTER_UNSUPPORTED"
+  | "MODEL_CAPABILITY_ADAPTER_UNSUPPORTED"
   | "MODEL_SECRET_UNAVAILABLE"
   | "MODEL_NOT_AVAILABLE"
   | "MODEL_DEFAULT_INVALID";
@@ -61,12 +85,14 @@ export interface ModelCatalog {
   resolve(modelId: string): ModelDefinition | undefined;
   getDefault(): ModelDefinition | undefined;
   diagnostics(): readonly ModelCatalogDiagnostic[];
+  onDidChange?(listener: () => void): ModelCatalogChangeSubscription;
 }
 
 export interface ConfiguredModelCatalogOptions {
   readonly supportedApiTypes?: readonly ApiType[];
   readonly hasSecret?: (secretRef: string) => boolean;
   readonly defaultModelId?: string;
+  readonly adapterCapabilities?: Partial<Record<CapabilityName, boolean>>;
 }
 
 const DEFAULT_AGENT_SETTINGS: ResolvedAgentSettings = {
@@ -82,6 +108,8 @@ export class ConfiguredModelCatalog implements ModelCatalog {
   private entries: readonly ModelCatalogEntry[] = [];
   private invalidEntries: readonly ModelCatalogDiagnostic[] = [];
   private configuredDefaultModelId: string | undefined;
+  private revision = 0;
+  private readonly changeListeners = new Set<() => void>();
 
   public constructor(
     config?: ModelConfig,
@@ -113,6 +141,15 @@ export class ConfiguredModelCatalog implements ModelCatalog {
     this.entries = Object.freeze(entries);
     this.invalidEntries = Object.freeze(diagnostics);
     this.configuredDefaultModelId = defaultModelId;
+    this.revision += 1;
+    for (const listener of this.changeListeners) listener();
+  }
+
+  public onDidChange(listener: () => void): ModelCatalogChangeSubscription {
+    this.changeListeners.add(listener);
+    return {
+      dispose: () => this.changeListeners.delete(listener),
+    };
   }
 
   public listAvailable(): readonly ModelCatalogEntry[] {
@@ -181,6 +218,32 @@ export class ConfiguredModelCatalog implements ModelCatalog {
       return undefined;
     }
 
+    const capabilityResolution = createCapabilities(
+      model,
+      this.options.adapterCapabilities,
+      this.revision + 1,
+    );
+    const capabilityNames: readonly CapabilityName[] = [
+      "toolCalling",
+      "streaming",
+      "vision",
+      "reasoning",
+    ];
+    for (const capability of capabilityNames) {
+      if (
+        capabilityResolution.configured[capability] &&
+        this.options.adapterCapabilities?.[capability] === false
+      ) {
+        diagnostics.push(
+          diagnostic(
+            `${path}/${capability}`,
+            "MODEL_CAPABILITY_ADAPTER_UNSUPPORTED",
+            "Provider Adapterがこのモデルの能力に対応していません。",
+          ),
+        );
+      }
+    }
+
     return Object.freeze({
       id: model.id,
       label: model.name,
@@ -192,14 +255,8 @@ export class ConfiguredModelCatalog implements ModelCatalog {
         ...(provider.apiKey ? { secretRef: provider.apiKey } : {}),
         headers: Object.freeze({ ...(provider.headers ?? {}) }),
       }),
-      capabilities: Object.freeze({
-        toolCalling: model.toolCalling,
-        vision: model.vision,
-        ...(model.thinking === undefined ? {} : { thinking: model.thinking }),
-        ...(model.supportsReasoningEffort === undefined
-          ? {}
-          : { supportsReasoningEffort: Object.freeze([...model.supportsReasoningEffort]) }),
-      }),
+      capabilities: capabilityResolution.configured,
+      effectiveCapabilities: capabilityResolution.effective,
       contextWindow: model.maxInputTokens,
       maxOutputTokens: model.maxOutputTokens,
       agent: resolveAgentSettings(model.agent),
@@ -229,7 +286,21 @@ export class StaticModelCatalog implements ModelCatalog {
               url: "https://localhost.invalid",
               headers: Object.freeze({}),
             }),
-            capabilities: Object.freeze({ toolCalling: false, vision: false }),
+            capabilities: Object.freeze({
+              toolCalling: false,
+              streaming: false,
+              vision: false,
+              reasoning: false,
+              reasoningEfforts: [],
+            }),
+            effectiveCapabilities: Object.freeze({
+              toolCalling: false,
+              streaming: false,
+              vision: false,
+              reasoning: false,
+              reasoningEfforts: [],
+              revision: 0,
+            }),
             contextWindow: 1024,
             maxOutputTokens: 1,
             agent: DEFAULT_AGENT_SETTINGS,
@@ -296,4 +367,50 @@ function compareEntries(left: ModelCatalogEntry, right: ModelCatalogEntry): numb
     left.provider.id.localeCompare(right.provider.id) ||
     left.id.localeCompare(right.id)
   );
+}
+
+function createCapabilities(
+  model: ModelConfigModel,
+  adapterCapabilities: Partial<Record<CapabilityName, boolean>> | undefined,
+  revision: number,
+): CapabilityResolution {
+  const reasoning = model.reasoning ?? model.thinking ?? false;
+  const reasoningEfforts = [...(model.reasoningEfforts ?? model.supportsReasoningEffort ?? [])];
+  const capabilities: ModelCapabilities = Object.freeze({
+    toolCalling: model.toolCalling,
+    streaming: model.streaming ?? false,
+    vision: model.vision,
+    reasoning,
+    reasoningEfforts: Object.freeze(reasoningEfforts),
+    // Keep legacy fields on the resolved object for consumers that have not migrated yet.
+    thinking: reasoning,
+    supportsReasoningEffort: Object.freeze(reasoningEfforts),
+  });
+  const configured: Record<CapabilityName, boolean> = {
+    toolCalling: capabilities.toolCalling,
+    streaming: capabilities.streaming,
+    vision: capabilities.vision,
+    reasoning: capabilities.reasoning,
+  };
+  const effective = Object.fromEntries(
+    Object.entries(configured).map(([name, value]) => [
+      name,
+      value && (adapterCapabilities?.[name as CapabilityName] ?? true),
+    ]),
+  ) as Record<CapabilityName, boolean>;
+  const effectiveReasoningEfforts = effective.reasoning ? reasoningEfforts : [];
+  const disabledReasons = Object.fromEntries(
+    Object.entries(configured)
+      .filter(([name, value]) => value && adapterCapabilities?.[name as CapabilityName] === false)
+      .map(([name]) => [name, "Provider Adapterがこの能力に対応していません。"]),
+  ) as Partial<Record<CapabilityName, string>>;
+  return {
+    configured: capabilities,
+    effective: Object.freeze({
+      ...effective,
+      reasoningEfforts: Object.freeze(effectiveReasoningEfforts),
+      revision,
+    }),
+    disabledReasons: Object.freeze(disabledReasons),
+  };
 }

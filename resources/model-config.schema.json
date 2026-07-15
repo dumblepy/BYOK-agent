@@ -71,7 +71,14 @@
         "vendor": { "type": "string", "minLength": 1, "maxLength": 128 },
         "url": { "type": "string", "format": "provider-url" },
         "toolCalling": { "type": "boolean" },
+        "streaming": { "type": "boolean" },
         "vision": { "type": "boolean" },
+        "reasoning": { "type": "boolean" },
+        "reasoningEfforts": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["none", "low", "medium", "high", "xhigh"] }
+        },
         "thinking": { "type": "boolean" },
         "supportsReasoningEffort": {
           "type": "array",

@@ -164,6 +164,16 @@ const modelSummarySchema = z
     id: identifierSchema,
     label: z.string().min(1).max(256),
     provider: identifierSchema,
+    capabilities: z
+      .object({
+        toolCalling: z.boolean(),
+        streaming: z.boolean(),
+        vision: z.boolean(),
+        reasoning: z.boolean(),
+        reasoningEfforts: z.array(z.enum(["none", "low", "medium", "high", "xhigh"])).max(5),
+      })
+      .strict()
+      .optional(),
   })
   .strict();
 const modelCatalogDiagnosticSchema = z
@@ -173,6 +183,7 @@ const modelCatalogDiagnosticSchema = z
       "MODEL_DUPLICATE_ID",
       "MODEL_PROVIDER_NOT_FOUND",
       "MODEL_ADAPTER_UNSUPPORTED",
+      "MODEL_CAPABILITY_ADAPTER_UNSUPPORTED",
       "MODEL_SECRET_UNAVAILABLE",
       "MODEL_NOT_AVAILABLE",
       "MODEL_DEFAULT_INVALID",
