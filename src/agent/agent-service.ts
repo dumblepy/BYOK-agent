@@ -2,11 +2,14 @@ import { DisposableStore, ManagedService } from "../extension/service-lifecycle"
 import type { ProviderService } from "../providers/provider-service";
 import type { PermissionContext } from "../permissions/permission-profile";
 import type { StorageService } from "../storage/storage-service";
+import type { EffectiveCapabilities, ModelCatalog, ModelDefinition } from "../models/model-catalog";
 
 export interface AgentRunRequest {
   readonly threadId: string;
   readonly text: string;
   readonly modelId: string;
+  readonly model?: ModelDefinition;
+  readonly effectiveCapabilities?: EffectiveCapabilities;
   readonly permissionContext: PermissionContext;
 }
 
@@ -19,6 +22,7 @@ export interface AgentService extends ManagedService {
 export interface AgentServiceDependencies {
   readonly provider: ProviderService;
   readonly storage: StorageService;
+  readonly modelCatalog?: ModelCatalog;
 }
 
 interface ActiveRun {
@@ -66,6 +70,15 @@ export class DefaultAgentService extends ManagedService implements AgentService 
       return Promise.reject(new Error("Agent service is not accepting runs"));
     }
 
+    if (this.dependencies.modelCatalog) {
+      const model = this.dependencies.modelCatalog.resolve(request.modelId);
+      if (!model) return Promise.reject(new Error("Selected model is not available"));
+      return Promise.resolve({
+        ...request,
+        model,
+        effectiveCapabilities: model.effectiveCapabilities,
+      });
+    }
     return Promise.resolve(request);
   }
 

@@ -108,7 +108,20 @@ describe("Webview protocol schemas", () => {
     const modelList = createExtensionToUiMessage("model-list", {
       threadId: "thread-1",
       threadRevision: 3,
-      models: [{ id: "coding-primary", label: "Coding Primary", provider: "primary" }],
+      models: [
+        {
+          id: "coding-primary",
+          label: "Coding Primary",
+          provider: "Open Router",
+          capabilities: {
+            toolCalling: true,
+            streaming: true,
+            vision: false,
+            reasoning: true,
+            reasoningEfforts: ["low", "high"],
+          },
+        },
+      ],
       selectedModelId: "coding-primary",
     });
 

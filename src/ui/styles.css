@@ -68,6 +68,130 @@ h2 {
   font-size: 11px;
 }
 
+.provider-credentials {
+  padding: 12px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 6px;
+}
+
+.provider-credentials-heading,
+.provider-credential-item,
+.provider-credential-info,
+.provider-credential-actions {
+  display: flex;
+  align-items: center;
+}
+
+.provider-credentials-heading,
+.provider-credential-item {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.provider-credentials-heading {
+  margin-bottom: 8px;
+}
+
+.provider-credentials-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.provider-credentials-heading-actions > .codicon {
+  color: var(--vscode-textLink-foreground);
+  font-size: 16px;
+}
+
+.provider-credentials-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: var(--vscode-descriptionForeground);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.provider-credentials-close:hover,
+.provider-credentials-close:focus {
+  color: var(--vscode-foreground);
+  background: var(--vscode-toolbar-hoverBackground, rgba(255, 255, 255, 0.08));
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.provider-credentials-description,
+.provider-credentials-empty,
+.provider-credentials-status-message,
+.provider-credentials-notice,
+.provider-credentials-error {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.provider-credentials-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.provider-credential-item {
+  min-height: 34px;
+  padding: 4px 0;
+  border-top: 1px solid var(--vscode-widget-border);
+}
+
+.provider-credential-info {
+  min-width: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.provider-credential-info strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-credential-status {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+}
+
+.provider-credential-status-configured {
+  color: var(--vscode-testing-iconPassed);
+}
+
+.provider-credential-status-unavailable,
+.provider-credential-delete,
+.provider-credentials-error {
+  color: var(--vscode-errorForeground);
+}
+
+.provider-credential-actions {
+  flex-shrink: 0;
+  gap: 2px;
+}
+
+.provider-credentials-notice {
+  margin-top: 8px;
+  color: var(--vscode-testing-iconPassed);
+}
+
+.provider-credentials-error {
+  margin-top: 8px;
+}
+
 .model-selector {
   position: relative;
   display: inline-flex;
@@ -453,6 +577,52 @@ textarea:focus {
 
 .composer-toolbar-mode-button {
   color: var(--vscode-foreground);
+}
+
+.composer-menu {
+  position: relative;
+  display: inline-flex;
+}
+
+.composer-menu-toggle {
+  width: 28px;
+  height: 28px;
+  justify-content: center;
+  padding: 0;
+  font-size: 16px;
+}
+
+.composer-menu-bar {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 120;
+  min-width: 190px;
+  padding: 4px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 6px;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.24);
+}
+
+.composer-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 9px;
+  color: var(--vscode-foreground);
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.composer-menu-item:hover,
+.composer-menu-item:focus {
+  background: var(--vscode-list-hoverBackground, rgba(255, 255, 255, 0.08));
+  outline: none;
 }
 
 .permission-selector {

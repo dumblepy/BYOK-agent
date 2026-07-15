@@ -1,7 +1,13 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { JSX } from "preact";
 
-import { getSelectedModelLabel, type ModelSelectorState } from "../model-selector-state";
+import {
+  getSelectedModelLabel,
+  getDefaultReasoningEffort,
+  REASONING_EFFORT_OPTIONS,
+  type ModelSelectorState,
+  type ReasoningEffort,
+} from "../model-selector-state";
 
 export interface ModelSelectorInlineProps {
   readonly state: ModelSelectorState;
@@ -15,6 +21,9 @@ export function ModelSelectorInline({
   onSelect,
 }: ModelSelectorInlineProps): JSX.Element {
   const [isOpen, setIsOpen] = useState(false);
+  const [selectedReasoningEffort, setSelectedReasoningEffort] = useState<
+    ReasoningEffort | undefined
+  >();
   const buttonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -68,6 +77,16 @@ export function ModelSelectorInline({
 
   const selectedModel = state.models.find((m) => m.id === state.selectedModelId);
   const modelLabel = selectedModel ? selectedModel.label : "モデル未選択";
+  const reasoningEfforts = selectedModel?.capabilities?.reasoningEfforts ?? [];
+  const supportsReasoningEffort = selectedModel !== undefined && reasoningEfforts.length > 0;
+
+  useEffect(() => {
+    setSelectedReasoningEffort(getDefaultReasoningEffort(reasoningEfforts));
+  }, [state.selectedModelId, reasoningEfforts.join("|")]);
+
+  const handleReasoningEffortSelect = (effort: ReasoningEffort): void => {
+    setSelectedReasoningEffort(effort);
+  };
 
   return (
     <div class="model-selector-inline" aria-label="モデル選択">
@@ -90,47 +109,34 @@ export function ModelSelectorInline({
 
       {isOpen ? (
         <div ref={menuRef} class="model-selector-inline-menu" role="menu">
-          <div class="model-selector-inline-menu-section">
-            <div class="model-selector-inline-menu-section-title">推論</div>
-            <button
-              type="button"
-              class="model-selector-inline-menu-item"
-              role="menuitem"
-              onClick={() => handleSelect("low")}
-            >
-              <span>低</span>
-              <i
-                class="codicon codicon-check model-selector-inline-menu-check"
-                aria-label="選択中"
-              />
-            </button>
-            <button
-              type="button"
-              class="model-selector-inline-menu-item"
-              role="menuitem"
-              onClick={() => handleSelect("medium")}
-            >
-              <span>中</span>
-            </button>
-            <button
-              type="button"
-              class="model-selector-inline-menu-item"
-              role="menuitem"
-              onClick={() => handleSelect("high")}
-            >
-              <span>高</span>
-            </button>
-            <button
-              type="button"
-              class="model-selector-inline-menu-item"
-              role="menuitem"
-              onClick={() => handleSelect("very-high")}
-            >
-              <span>非常に高い</span>
-            </button>
-          </div>
+          {supportsReasoningEffort ? (
+            <>
+              <div class="model-selector-inline-menu-section">
+                <div class="model-selector-inline-menu-section-title">推論</div>
+                {REASONING_EFFORT_OPTIONS.filter(([effort]) =>
+                  reasoningEfforts.includes(effort),
+                ).map(([effort, label]) => (
+                  <button
+                    key={effort}
+                    type="button"
+                    class="model-selector-inline-menu-item"
+                    role="menuitem"
+                    onClick={() => handleReasoningEffortSelect(effort)}
+                  >
+                    <span>{label}</span>
+                    {effort === selectedReasoningEffort ? (
+                      <i
+                        class="codicon codicon-check model-selector-inline-menu-check"
+                        aria-label="選択中"
+                      />
+                    ) : null}
+                  </button>
+                ))}
+              </div>
 
-          <div class="model-selector-inline-menu-divider" />
+              <div class="model-selector-inline-menu-divider" />
+            </>
+          ) : null}
 
           <div class="model-selector-inline-menu-section">
             <div class="model-selector-inline-menu-section-title">
@@ -171,6 +177,14 @@ export function ModelSelectorInline({
               />
             </button>
           </div>
+        </div>
+      ) : null}
+
+      {(state.diagnostics ?? []).length > 0 ? (
+        <div class="model-selector-inline-diagnostics" role="status" aria-live="polite">
+          {(state.diagnostics ?? []).map((diagnostic) => (
+            <p key={`${diagnostic.code}:${diagnostic.path}`}>{diagnostic.message}</p>
+          ))}
         </div>
       ) : null}
     </div>

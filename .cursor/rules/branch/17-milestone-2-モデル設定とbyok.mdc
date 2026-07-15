@@ -1,0 +1,57 @@
+---
+description: 17-milestone-2-モデル設定とbyokブランチでProvider認証設定UIを設計・実装するときに読み込む
+alwaysApply: false
+---
+# Provider認証設定UIの実装方針
+
+このブランチでは、ProviderごとのAPIキー設定状態を確認し、APIキーの登録・更新・削除をUIまたはCommand Paletteから安全に操作できる機能を実装する。
+
+## 実装方針
+
+- APIキーの正本は`ExtensionContext.secrets`（SecretStorage）だけとし、設定ファイル、VS Code設定、環境変数、Webview状態、ログ、会話保存へ保存しない。
+- Webviewへ渡す認証情報はProviderの表示名、登録状態（boolean）、操作可否、構造化された安全なエラーだけとする。キー本体、マスク値、長さ、入力履歴、SecretStorageキー名は渡さない。
+- APIキー入力はExtension Hostが提供するパスワード入力UIまたは同等のHost側入力経路で受け付ける。Webviewメッセージ、Command URI、コマンド引数、クリップボード経由でキー本体を搬送しない。
+- Provider設定の識別子と表示情報は検証済みModel Catalogから解決する。Webviewから任意Provider IDを登録・追加・変更させない。
+- 設定済み状態の変更はHostでSecretStorageへ反映した後、最新の認証状態一覧をWebviewへ再通知する。UIの楽観的更新は行わない。
+- Command Palette操作とWebview操作は同一の`ProviderCredentialService`を経由し、保存・削除・状態再取得の挙動を一致させる。
+- Provider通信直前にHost内でのみキーを取得し、認証ヘッダー生成の局所スコープを越えて保持しない。
+
+## 進捗
+
+- [x] `AGENTS.md`、プロジェクトルール、共通ブランチルール、既存ブランチルールを確認する
+- [x] Provider認証UIの責務境界と操作経路を設計する
+- [x] 既存のブランチルールを削除し、Provider認証UI向けに新規作成する
+- [x] `documents/design.md`へ実装方針と詳細設計を追記する
+- [x] Provider認証設定UIを実装する
+- [x] Provider認証設定UIのテストを実装する
+
+## 参考資料
+
+- `documents/design.md` §5.3 APIキー
+- `documents/design.md` §14 UI設計
+- `documents/design.md` §14.3 Webview通信
+- `documents/design.md` §16 セキュリティ設計
+- `.cursor/rules/project.mdc`
+
+## 完了条件
+
+1. ProviderごとのAPIキー登録状態をUIで表示できる。
+2. UIまたはCommand PaletteからAPIキーの設定・更新・削除を操作できる。
+3. APIキー本体が再表示されず、Webview・設定・ログ・会話保存へ流出しない。
+4. SecretStorage障害、Provider不在、キャンセル、未設定状態を安全に表示できる。
+
+## 対象外
+
+- Provider APIの有効性確認、ローテーション、自動生成
+- 環境変数、`.env`、外部Secret Managerからの読み込み
+- APIキー本体の表示、コピー、マスク表示
+- ProviderやModelのJSON編集UI
+- `git add`、`git commit`
+
+## 調査結果・設計まとめ
+
+- APIキー保存の既存設計（`SecretStorage`のみ）を正本として維持し、UIは認証状態の投影だけを扱う。
+- Provider一覧はModel Catalogの検証済みスナップショットから作り、Provider IDの正規化・重複排除・表示順はHost側で確定する。
+- UI操作とCommand Palette操作を別実装にせず、Hostの同一サービス・同一コマンド契約へ集約する。
+- 保存・削除成功時は状態一覧を再取得して通知し、失敗時は確定済み状態を維持する。これにより通信遅延やWebview再生成時の不整合を避ける。
+- APIキーの存在はUI表示要件に必要なbooleanとして扱うが、ログ・診断には記録しない。

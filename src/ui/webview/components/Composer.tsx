@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "preact/hooks";
+import { useEffect, useRef, useState } from "preact/hooks";
 import type { JSX } from "preact";
 
 import {
@@ -18,11 +18,14 @@ import {
 import type { UserSelectablePermissionProfile } from "../../../permissions/permission-profile";
 import { PermissionProfileSelector } from "./PermissionProfileSelector";
 import { ModelSelectorInline } from "./ModelSelectorInline";
+import { ProviderCredentialPanel } from "./ProviderCredentialPanel";
+import type { ProviderCredentialState } from "../provider-credential-state";
 
 export interface ComposerProps {
   readonly state: ComposerState;
   readonly modelSelectorState: ModelSelectorState;
   readonly permissionSelectorState?: PermissionSelectorState;
+  readonly providerCredentialState?: ProviderCredentialState;
   readonly onDraftChange: (draft: string) => void;
   readonly onSubmit: () => void;
   readonly onStop: () => void;
@@ -30,12 +33,15 @@ export interface ComposerProps {
   readonly onPermissionSelect?: (profile: UserSelectablePermissionProfile) => void;
   readonly onPermissionConfirm?: () => void;
   readonly onPermissionCancel?: () => void;
+  readonly onProviderCredentialSet?: (providerId: string) => void;
+  readonly onProviderCredentialDelete?: (providerId: string) => void;
 }
 
 export function Composer({
   state,
   modelSelectorState,
   permissionSelectorState = INITIAL_PERMISSION_SELECTOR_STATE,
+  providerCredentialState,
   onDraftChange,
   onSubmit,
   onStop,
@@ -43,11 +49,15 @@ export function Composer({
   onPermissionSelect = () => undefined,
   onPermissionConfirm = () => undefined,
   onPermissionCancel = () => undefined,
+  onProviderCredentialSet = () => undefined,
+  onProviderCredentialDelete = () => undefined,
 }: ComposerProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const isBusy = isComposerBusy(state.phase);
   const canSubmit = !isBusy && isComposerDraftSubmittable(state.draft);
   const statusLabel = getComposerStatusLabel(state);
+  const [isMenuOpen, setIsMenuOpen] = useState(false);
+  const [isProviderCredentialsOpen, setIsProviderCredentialsOpen] = useState(false);
 
   useEffect(() => {
     const textarea = textareaRef.current;
@@ -89,11 +99,47 @@ export function Composer({
         onInput={handleInput}
         onKeyDown={handleKeyDown}
       />
+      {isProviderCredentialsOpen && providerCredentialState ? (
+        <ProviderCredentialPanel
+          state={providerCredentialState}
+          onSet={onProviderCredentialSet}
+          onDelete={onProviderCredentialDelete}
+          onClose={() => setIsProviderCredentialsOpen(false)}
+        />
+      ) : null}
       <div class="composer-toolbar">
         <div class="composer-toolbar-left">
-          <button type="button" class="composer-toolbar-button" aria-label="添付ファイルを追加">
-            <i class="codicon codicon-attach" aria-hidden="true" />
-          </button>
+          <div class="composer-menu">
+            <button
+              type="button"
+              class="composer-toolbar-button composer-menu-toggle"
+              aria-label="メニューを開く"
+              aria-haspopup="menu"
+              aria-expanded={isMenuOpen}
+              onClick={() => setIsMenuOpen((open) => !open)}
+            >
+              <i
+                class={`codicon ${isMenuOpen ? "codicon-close" : "codicon-add"}`}
+                aria-hidden="true"
+              />
+            </button>
+            {isMenuOpen ? (
+              <div class="composer-menu-bar" role="menu">
+                <button
+                  type="button"
+                  class="composer-menu-item"
+                  role="menuitem"
+                  onClick={() => {
+                    setIsProviderCredentialsOpen((open) => !open);
+                    setIsMenuOpen(false);
+                  }}
+                >
+                  <i class="codicon codicon-key" aria-hidden="true" />
+                  <span>Provider認証設定</span>
+                </button>
+              </div>
+            ) : null}
+          </div>
           <PermissionProfileSelector
             state={permissionSelectorState}
             disabled={isBusy}

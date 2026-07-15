@@ -6,6 +6,7 @@ import { DefaultProviderService, type ProviderService } from "../providers/provi
 import { DefaultStorageService, type StorageService } from "../storage/storage-service";
 import { DefaultUIService, type UIService, type UIServiceDependencies } from "../ui/ui-service";
 import { type ApplicationService, disposeInReverse } from "./service-lifecycle";
+import type { ModelCatalog } from "../models/model-catalog";
 
 export interface ApplicationServices {
   readonly provider: ProviderService;
@@ -21,6 +22,7 @@ export interface ApplicationServiceFactories {
   readonly agent: (dependencies: {
     readonly provider: ProviderService;
     readonly storage: StorageService;
+    readonly modelCatalog?: ModelCatalog;
   }) => AgentService;
   readonly ui: (dependencies: UIServiceDependencies) => UIService;
 }
@@ -68,6 +70,7 @@ async function disposeCreatedServices(services: readonly ApplicationService[]): 
 export async function createApplicationServices(
   context: ExtensionContext,
   factories: ApplicationServiceFactories = defaultFactories,
+  modelCatalog?: ModelCatalog,
 ): Promise<ApplicationServices> {
   const created: ApplicationService[] = [];
 
@@ -80,7 +83,7 @@ export async function createApplicationServices(
     await provider.initialize();
     await storage.initialize();
 
-    const agent = factories.agent({ provider, storage });
+    const agent = factories.agent({ provider, storage, modelCatalog });
     created.push(agent);
     await agent.initialize();
 
@@ -88,6 +91,8 @@ export async function createApplicationServices(
       context,
       agent,
       storage,
+      provider,
+      modelCatalog,
       registerWebviewViewProvider: (viewId, provider, options) =>
         vscode.window.registerWebviewViewProvider(viewId, provider, options),
     });

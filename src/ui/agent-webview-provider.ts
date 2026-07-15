@@ -4,6 +4,7 @@ import * as vscode from "vscode";
 
 import type { AgentRunRequest } from "../agent/agent-service";
 import { type ModelCatalog } from "../models/model-catalog";
+import type { ProviderService } from "../providers/provider-service";
 import { createPermissionSummary, type PermissionSummary } from "../permissions/permission-profile";
 import {
   ThreadPermissionRevisionConflictError,
@@ -16,6 +17,7 @@ import {
   DEFAULT_THREAD_ID,
   type UiToExtensionMessage,
 } from "./webview-protocol";
+import type { ModelCatalogChangeSubscription } from "../models/model-catalog";
 
 const WEBVIEW_ROOT = ["out", "webview"] as const;
 
@@ -49,6 +51,7 @@ function createContentSecurityPolicy(webview: vscode.Webview, nonce: string): st
 
 export interface AgentWebviewProviderOptions {
   readonly modelCatalog?: ModelCatalog;
+  readonly providerService?: ProviderService;
   readonly threadModelStore?: ThreadModelStore;
   readonly isThreadRunActive?: (threadId: string) => boolean;
   readonly isWorkspaceTrusted?: () => boolean;
@@ -60,6 +63,7 @@ export interface AgentWebviewProviderOptions {
 
 export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   private readonly modelCatalog: ModelCatalog | undefined;
+  private readonly providerService: ProviderService | undefined;
   private readonly threadModelStore: ThreadModelStore | undefined;
   private readonly isThreadRunActive: (threadId: string) => boolean;
   private readonly isWorkspaceTrusted: () => boolean;
@@ -74,6 +78,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     options: AgentWebviewProviderOptions = {},
   ) {
     this.modelCatalog = options.modelCatalog;
+    this.providerService = options.providerService;
     this.threadModelStore = options.threadModelStore;
     this.isThreadRunActive = options.isThreadRunActive ?? (() => false);
     this.isWorkspaceTrusted = options.isWorkspaceTrusted ?? (() => true);
@@ -93,15 +98,25 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const protocolSession = new ExtensionWebviewProtocolSession(webviewView.webview, {
       getModelList: (threadId) => this.getModelList(threadId),
       getPermissionSummary: (threadId) => this.getPermissionSummary(threadId),
+      getProviderCredentials: (providerId) => this.getProviderCredentials(providerId),
       onMessage: async (message) => {
         await this.handleUiMessage(message, protocolSession);
       },
     });
+    let modelCatalogSubscription: ModelCatalogChangeSubscription | undefined;
+    if (this.modelCatalog?.onDidChange) {
+      modelCatalogSubscription = this.modelCatalog.onDidChange(() => {
+        const threadId = this.activeThreadId;
+        if (threadId !== undefined) void protocolSession.sendModelList(threadId);
+        void protocolSession.sendProviderCredentials();
+      });
+    }
     const trustSubscription = this.onDidGrantWorkspaceTrust?.(() => {
       void protocolSession.sendPermissionUpdated(this.activeThreadId ?? DEFAULT_THREAD_ID);
     });
     webviewView.onDidDispose?.(() => {
       trustSubscription?.dispose();
+      modelCatalogSubscription?.dispose();
       protocolSession.dispose();
     });
   }
@@ -117,6 +132,21 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     if (message.type === "set-permission") {
       await this.handleSetPermission(message, protocolSession);
+      return;
+    }
+
+    if (message.type === "request-provider-credentials") {
+      await protocolSession.sendProviderCredentials(message.payload.providerId, message.messageId);
+      return;
+    }
+
+    if (message.type === "set-provider-credential") {
+      await this.handleSetProviderCredential(message, protocolSession);
+      return;
+    }
+
+    if (message.type === "delete-provider-credential") {
+      await this.handleDeleteProviderCredential(message, protocolSession);
       return;
     }
 
@@ -319,22 +349,55 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
   private async getModelList(threadId: string) {
     this.activeThreadId = threadId;
-    const models = (this.modelCatalog?.listAvailable() ?? []).map(({ id, label, provider }) => ({
-      id,
-      label,
-      provider,
-    }));
+    const models = (this.modelCatalog?.listAvailable() ?? []).map(
+      ({ id, label, provider, effectiveCapabilities }) => ({
+        id,
+        label,
+        provider: provider.id,
+        capabilities: {
+          toolCalling: effectiveCapabilities.toolCalling,
+          streaming: effectiveCapabilities.streaming,
+          vision: effectiveCapabilities.vision,
+          reasoning: effectiveCapabilities.reasoning,
+          reasoningEfforts: [...effectiveCapabilities.reasoningEfforts],
+        },
+      }),
+    );
     const state = this.threadModelStore
       ? await this.threadModelStore.getThreadModelState(threadId)
       : { threadId, revision: 0 };
     let resolvedState = state;
 
     if (this.threadModelStore && models.length > 0 && state.modelId === undefined) {
-      resolvedState = await this.threadModelStore.updateThreadModel(
-        threadId,
-        state.revision,
-        models[0].id,
-      );
+      const defaultModel = this.modelCatalog?.getDefault();
+      if (!defaultModel) {
+        return {
+          threadId,
+          threadRevision: state.revision,
+          models,
+          ...(this.modelCatalog && this.modelCatalog.diagnostics().length > 0
+            ? {
+                diagnostics: this.modelCatalog.diagnostics().map((diagnostic) => ({
+                  path: diagnostic.path,
+                  code: diagnostic.code,
+                  severity: diagnostic.severity,
+                  message: diagnostic.userMessage,
+                })),
+              }
+            : {}),
+        };
+      }
+      try {
+        resolvedState = await this.threadModelStore.updateThreadModel(
+          threadId,
+          state.revision,
+          defaultModel.id,
+        );
+      } catch {
+        // A storage failure must not hide an otherwise valid model list from the UI.
+        // The explicit selection can be retried after the storage problem is resolved.
+        resolvedState = state;
+      }
     }
 
     const selectedModelId =
@@ -345,6 +408,16 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       threadId,
       threadRevision: resolvedState.revision,
       models,
+      ...(this.modelCatalog && this.modelCatalog.diagnostics().length > 0
+        ? {
+            diagnostics: this.modelCatalog.diagnostics().map((diagnostic) => ({
+              path: diagnostic.path,
+              code: diagnostic.code,
+              severity: diagnostic.severity,
+              message: diagnostic.userMessage,
+            })),
+          }
+        : {}),
       ...(selectedModelId ? { selectedModelId } : {}),
     };
   }
@@ -363,6 +436,110 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       state.revision,
       this.isWorkspaceTrusted() ? "trusted" : "restricted",
     );
+  }
+
+  private getProviderEntries(): readonly { id: string; label: string; vendor: string }[] {
+    const entries = new Map<string, { id: string; label: string; vendor: string }>();
+    for (const model of this.modelCatalog?.listAvailable() ?? []) {
+      if (!entries.has(model.provider.id)) {
+        entries.set(model.provider.id, {
+          id: model.provider.id,
+          label: model.provider.id,
+          vendor: model.provider.vendor,
+        });
+      }
+    }
+    return [...entries.values()].sort(
+      (left, right) =>
+        left.label.localeCompare(right.label, "ja") || left.id.localeCompare(right.id),
+    );
+  }
+
+  private async getProviderCredentials(providerId?: string) {
+    const entries = this.getProviderEntries().filter(
+      (entry) => providerId === undefined || entry.id === providerId,
+    );
+    return Promise.all(
+      entries.map(async (entry) => ({
+        providerId: entry.id,
+        displayName: entry.label,
+        vendor: entry.vendor,
+        status: (await this.providerService?.getApiKeyStatus(entry.id)) ?? "not-configured",
+        canEdit: this.providerService !== undefined,
+      })),
+    );
+  }
+
+  private findProvider(providerId: string): { id: string; label: string } | undefined {
+    return this.getProviderEntries().find((provider) => provider.id === providerId);
+  }
+
+  private async handleSetProviderCredential(
+    message: Extract<UiToExtensionMessage, { type: "set-provider-credential" }>,
+    protocolSession: ExtensionWebviewProtocolSession,
+  ): Promise<void> {
+    const provider = this.findProvider(message.payload.providerId);
+    let status: "succeeded" | "cancelled" | "failed" = "failed";
+    if (provider && this.providerService) {
+      const value = await vscode.window.showInputBox({
+        prompt: `${provider.label} のAPIキーを入力してください`,
+        password: true,
+        ignoreFocusOut: true,
+        validateInput: (input) =>
+          input.trim().length > 0 ? undefined : "APIキーを入力してください。",
+      });
+      if (value === undefined) {
+        status = "cancelled";
+      } else {
+        try {
+          await this.providerService.setApiKey(provider.id, value);
+          status = "succeeded";
+        } catch {
+          status = "failed";
+        }
+      }
+    }
+    await protocolSession.sendToUi(
+      createExtensionToUiMessage(
+        "provider-credential-operation",
+        { providerId: message.payload.providerId, operation: "set", status },
+        { correlationId: message.messageId },
+      ),
+    );
+    await protocolSession.sendProviderCredentials(message.payload.providerId, message.messageId);
+  }
+
+  private async handleDeleteProviderCredential(
+    message: Extract<UiToExtensionMessage, { type: "delete-provider-credential" }>,
+    protocolSession: ExtensionWebviewProtocolSession,
+  ): Promise<void> {
+    const provider = this.findProvider(message.payload.providerId);
+    let status: "succeeded" | "cancelled" | "failed" = "failed";
+    if (provider && this.providerService) {
+      const confirmation = await vscode.window.showWarningMessage(
+        `${provider.label} のAPIキーを削除しますか？`,
+        { modal: true },
+        "削除",
+      );
+      if (confirmation === "削除") {
+        try {
+          await this.providerService.deleteApiKey(provider.id);
+          status = "succeeded";
+        } catch {
+          status = "failed";
+        }
+      } else {
+        status = "cancelled";
+      }
+    }
+    await protocolSession.sendToUi(
+      createExtensionToUiMessage(
+        "provider-credential-operation",
+        { providerId: message.payload.providerId, operation: "delete", status },
+        { correlationId: message.messageId },
+      ),
+    );
+    await protocolSession.sendProviderCredentials(message.payload.providerId, message.messageId);
   }
 
   private async sendModelError(

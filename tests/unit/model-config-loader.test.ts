@@ -1,0 +1,283 @@
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { afterEach, describe, expect, it } from "vitest";
+
+import { ModelConfigLoader } from "../../src/models/model-config-loader";
+
+const model = (id: string, name = id) => ({
+  id,
+  name,
+  url: "https://api.example.com/v1/responses",
+  toolCalling: true,
+  vision: false,
+  maxInputTokens: 10000,
+  maxOutputTokens: 1000,
+});
+const document = (providers: unknown) => ({ providers });
+const json = (providers: unknown) => JSON.stringify(document(providers));
+
+const tempDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    tempDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })),
+  );
+});
+
+describe("ModelConfigLoader", () => {
+  it("オブジェクト形式のモデル設定を読み込む", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const defaultPath = join(directory, "default.json");
+    await writeFile(
+      defaultPath,
+      JSON.stringify({
+        providers: [
+          { name: "Provider", vendor: "test", apiType: "responses", models: [model("one")] },
+        ],
+        defaultModelId: "one",
+      }),
+    );
+
+    const loader = new ModelConfigLoader({ defaultPath });
+    const snapshot = await loader.load();
+    expect(snapshot?.config[0]?.models[0]?.id).toBe("one");
+    loader.dispose();
+  });
+
+  it("組み込みデフォルトが見つからなくても自動生成ファイルを有効にする", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const userPath = join(directory, "user.json");
+    const loader = new ModelConfigLoader({
+      defaultPath: join(directory, "missing-default.json"),
+      userCommonPath: userPath,
+    });
+
+    expect(await loader.ensureUserCommonConfig()).toBe(true);
+    const snapshot = await loader.load();
+    expect(snapshot?.config[0]?.models[0]).toMatchObject({
+      id: "coding-primary",
+    });
+    expect(snapshot?.defaultModelId).toBe("coding-primary");
+    loader.dispose();
+  });
+
+  it("旧配列形式のユーザー設定を受け付けない", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const userPath = join(directory, "user.json");
+    await writeFile(
+      userPath,
+      JSON.stringify([
+        {
+          name: "Provider",
+          vendor: "test",
+          apiType: "responses",
+          models: [model("one")],
+        },
+      ]),
+    );
+
+    const loader = new ModelConfigLoader({
+      defaultPath: join(directory, "missing-default.json"),
+      userCommonPath: userPath,
+    });
+    await loader.ensureUserCommonConfig();
+    expect(JSON.parse(await readFile(userPath, "utf8"))).toEqual(
+      expect.arrayContaining([expect.objectContaining({ name: "Provider" })]),
+    );
+    expect(await loader.load()).toBeUndefined();
+    loader.dispose();
+  });
+
+  it("優先順位とProvider/Model単位の部分マージを適用する", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const userPath = join(directory, "user.json");
+    const workspacePath = join(directory, "workspace.json");
+    await writeFile(
+      userPath,
+      json([
+        {
+          name: "Provider",
+          vendor: "user",
+          apiType: "responses",
+          models: [model("one", "User model")],
+        },
+      ]),
+    );
+    await writeFile(
+      workspacePath,
+      json([{ name: "Provider", models: [{ id: "one", name: "Workspace label" }] }]),
+    );
+
+    const loader = new ModelConfigLoader({
+      defaultPath: join(directory, "missing-default.json"),
+      userCommonPath: userPath,
+      workspacePath,
+      workspaceTrusted: true,
+      userSettings: () =>
+        document([{ name: "Provider", models: [{ id: "one", name: "Settings label" }] }]),
+    });
+    const snapshot = await loader.load();
+    expect(snapshot?.config[0]).toMatchObject({ name: "Provider", vendor: "user" });
+    expect(snapshot?.config[0]?.models[0]).toMatchObject({ id: "one", name: "Settings label" });
+    loader.dispose();
+  });
+
+  it("無効なソースでは直前の有効スナップショットを維持する", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const userPath = join(directory, "user.json");
+    await writeFile(
+      userPath,
+      json([{ name: "Provider", vendor: "user", apiType: "responses", models: [model("one")] }]),
+    );
+    const diagnostics: unknown[] = [];
+    const loader = new ModelConfigLoader({
+      defaultPath: join(directory, "missing-default.json"),
+      userCommonPath: userPath,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+    const first = await loader.load();
+    await writeFile(userPath, "{");
+    const second = await loader.refresh();
+    expect(second).toBe(first);
+    expect(diagnostics.length).toBeGreaterThan(0);
+    loader.dispose();
+  });
+
+  it("無効なUser Settingsがあっても有効なデフォルト設定で起動する", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const defaultPath = join(directory, "default.json");
+    await writeFile(
+      defaultPath,
+      json([
+        {
+          name: "Default",
+          vendor: "test",
+          apiType: "responses",
+          models: [model("default")],
+        },
+      ]),
+    );
+    const diagnostics: unknown[] = [];
+    const loader = new ModelConfigLoader({
+      defaultPath,
+      userSettings: () => [{ name: "Invalid", vendor: "test", apiType: "responses", models: [] }],
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+
+    const snapshot = await loader.load();
+    expect(snapshot?.config[0]?.name).toBe("Default");
+    expect(diagnostics).toHaveLength(1);
+    loader.dispose();
+  });
+
+  it("信頼されていないWorkspaceの設定を採用しない", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const workspacePath = join(directory, "workspace.json");
+    const defaultPath = join(directory, "default.json");
+    await writeFile(
+      workspacePath,
+      json([
+        { name: "Workspace", vendor: "x", apiType: "responses", models: [model("workspace")] },
+      ]),
+    );
+    await writeFile(
+      defaultPath,
+      json([{ name: "Default", vendor: "x", apiType: "responses", models: [model("default")] }]),
+    );
+    const loader = new ModelConfigLoader({
+      defaultPath,
+      workspacePath,
+      workspaceTrusted: false,
+    });
+    const snapshot = await loader.load();
+    expect(snapshot?.config[0]?.name).toBe("Default");
+    loader.dispose();
+  });
+
+  it("ワークスペースのAPIキーと任意ヘッダーを原子的に拒否する", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const userPath = join(directory, "user.json");
+    const workspacePath = join(directory, "workspace.json");
+    await writeFile(
+      userPath,
+      json([
+        {
+          name: "Provider",
+          vendor: "user",
+          apiType: "responses",
+          headers: { "X-Client-Version": "1" },
+          models: [model("one")],
+        },
+      ]),
+    );
+    await writeFile(
+      workspacePath,
+      json([{ name: "Provider", models: [{ id: "one", name: "Workspace" }] }]),
+    );
+    const diagnostics: unknown[] = [];
+    const loader = new ModelConfigLoader({
+      defaultPath: join(directory, "missing-default.json"),
+      userCommonPath: userPath,
+      workspacePath,
+      workspaceTrusted: true,
+      onDiagnostic: (diagnostic) => diagnostics.push(diagnostic),
+    });
+
+    const first = await loader.load();
+    expect(first?.config[0]?.models[0]?.name).toBe("Workspace");
+
+    await writeFile(
+      workspacePath,
+      json([
+        {
+          name: "Provider",
+          apiKey: "secret://attacker",
+          headers: { Authorization: "Bearer attacker" },
+          models: [{ id: "one", name: "Malicious" }],
+        },
+      ]),
+    );
+    const second = await loader.refresh();
+    expect(second).toBe(first);
+    expect(first?.config[0]).not.toHaveProperty("apiKey");
+    expect(first?.config[0]?.headers).toEqual({ "X-Client-Version": "1" });
+    expect(diagnostics).toHaveLength(1);
+    loader.dispose();
+  });
+
+  it("Workspace Trustの変更時に設定を再評価できる", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "byok-loader-"));
+    tempDirectories.push(directory);
+    const defaultPath = join(directory, "default.json");
+    const workspacePath = join(directory, "workspace.json");
+    await writeFile(
+      defaultPath,
+      json([{ name: "Provider", vendor: "default", apiType: "responses", models: [model("one")] }]),
+    );
+    await writeFile(
+      workspacePath,
+      json([{ name: "Provider", models: [{ id: "one", name: "Trusted label" }] }]),
+    );
+    let trusted = false;
+    const loader = new ModelConfigLoader({
+      defaultPath,
+      workspacePath,
+      workspaceTrusted: () => trusted,
+    });
+
+    expect((await loader.load())?.config[0]?.models[0]?.name).toBe("one");
+    trusted = true;
+    expect((await loader.refresh())?.config[0]?.models[0]?.name).toBe("Trusted label");
+    loader.dispose();
+  });
+});

@@ -1,0 +1,22 @@
+{
+  "providers": [
+    {
+      "name": "OpenAI",
+      "vendor": "openai",
+      "apiType": "responses",
+      "models": [
+        {
+          "id": "coding-primary",
+          "name": "Coding Primary",
+          "url": "https://api.openai.com/v1/responses",
+          "toolCalling": true,
+          "streaming": true,
+          "vision": true,
+          "reasoning": false,
+          "maxInputTokens": 128000,
+          "maxOutputTokens": 16384
+        }
+      ]
+    }
+  ]
+}

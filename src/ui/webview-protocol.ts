@@ -163,7 +163,43 @@ const modelSummarySchema = z
   .object({
     id: identifierSchema,
     label: z.string().min(1).max(256),
-    provider: identifierSchema,
+    provider: z.string().min(1).max(256),
+    capabilities: z
+      .object({
+        toolCalling: z.boolean(),
+        streaming: z.boolean(),
+        vision: z.boolean(),
+        reasoning: z.boolean(),
+        reasoningEfforts: z.array(z.enum(["none", "low", "medium", "high", "xhigh"])).max(5),
+      })
+      .strict()
+      .optional(),
+  })
+  .strict();
+const modelCatalogDiagnosticSchema = z
+  .object({
+    path: z.string().min(1).max(512),
+    code: z.enum([
+      "MODEL_DUPLICATE_ID",
+      "MODEL_PROVIDER_NOT_FOUND",
+      "MODEL_ADAPTER_UNSUPPORTED",
+      "MODEL_CAPABILITY_ADAPTER_UNSUPPORTED",
+      "MODEL_SECRET_UNAVAILABLE",
+      "MODEL_NOT_AVAILABLE",
+      "MODEL_DEFAULT_INVALID",
+    ]),
+    severity: z.enum(["warning", "error"]),
+    message: z.string().min(1).max(1_000),
+  })
+  .strict();
+const providerCredentialStatusSchema = z.enum(["configured", "not-configured", "unavailable"]);
+const providerCredentialSummarySchema = z
+  .object({
+    providerId: z.string().min(1).max(256),
+    displayName: z.string().min(1).max(256),
+    vendor: z.string().min(1).max(256),
+    status: providerCredentialStatusSchema,
+    canEdit: z.boolean(),
   })
   .strict();
 
@@ -248,6 +284,30 @@ export const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
       .strict(),
   ),
   messageSchema(
+    "request-provider-credentials",
+    z
+      .object({
+        providerId: z.string().min(1).max(256).optional(),
+      })
+      .strict(),
+  ),
+  messageSchema(
+    "set-provider-credential",
+    z
+      .object({
+        providerId: z.string().min(1).max(256),
+      })
+      .strict(),
+  ),
+  messageSchema(
+    "delete-provider-credential",
+    z
+      .object({
+        providerId: z.string().min(1).max(256),
+      })
+      .strict(),
+  ),
+  messageSchema(
     "request-thread-snapshot",
     z
       .object({
@@ -326,6 +386,7 @@ export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
         threadRevision: z.number().int().nonnegative(),
         models: z.array(modelSummarySchema).max(256),
         selectedModelId: identifierSchema.optional(),
+        diagnostics: z.array(modelCatalogDiagnosticSchema).max(256).optional(),
       })
       .strict(),
   ),
@@ -334,6 +395,24 @@ export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
     z
       .object({
         summary: permissionSummarySchema,
+      })
+      .strict(),
+  ),
+  messageSchema(
+    "provider-credentials",
+    z
+      .object({
+        providers: z.array(providerCredentialSummarySchema).max(256),
+      })
+      .strict(),
+  ),
+  messageSchema(
+    "provider-credential-operation",
+    z
+      .object({
+        providerId: z.string().min(1).max(256),
+        operation: z.enum(["set", "delete"]),
+        status: z.enum(["succeeded", "cancelled", "failed"]),
       })
       .strict(),
   ),
@@ -371,6 +450,7 @@ export type ProposedActionSummary = z.infer<typeof proposedActionSummarySchema>;
 export type ChangeSetStatus = z.infer<typeof changeSetStatusSchema>;
 export type ChangeFileSummary = z.infer<typeof changeFileSummarySchema>;
 export type ModelSummary = z.infer<typeof modelSummarySchema>;
+export type ProviderCredentialSummary = z.infer<typeof providerCredentialSummarySchema>;
 export type UiToExtensionMessage = z.infer<typeof uiToExtensionMessageSchema>;
 export type ExtensionToUiMessage = z.infer<typeof extensionToUiMessageSchema>;
 export type ModelListPayload = Extract<ExtensionToUiMessage, { type: "model-list" }>["payload"];

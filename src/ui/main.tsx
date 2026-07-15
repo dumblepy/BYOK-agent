@@ -24,6 +24,10 @@ import {
 import type { UserSelectablePermissionProfile } from "../permissions/permission-profile";
 import { ThreadView } from "./webview/components/ThreadView";
 import {
+  INITIAL_PROVIDER_CREDENTIAL_STATE,
+  providerCredentialReducer,
+} from "./webview/provider-credential-state";
+import {
   INITIAL_THREAD_VIEW_STATE,
   eventToThreadViewAction,
   threadViewReducer,
@@ -54,6 +58,10 @@ function App() {
   const [permissionSelectorState, dispatchPermissionSelector] = useReducer(
     permissionSelectorReducer,
     createInitialPermissionSelectorState(DEFAULT_THREAD_ID),
+  );
+  const [providerCredentialState, dispatchProviderCredential] = useReducer(
+    providerCredentialReducer,
+    INITIAL_PROVIDER_CREDENTIAL_STATE,
   );
   const modelSelectionRequestIdRef = useRef<string | undefined>(undefined);
   const permissionSelectionRequestIdRef = useRef<string | undefined>(undefined);
@@ -107,6 +115,7 @@ function App() {
               threadId: message.payload.threadId,
               threadRevision: message.payload.threadRevision,
               models: message.payload.models,
+              diagnostics: message.payload.diagnostics,
               ...(message.payload.selectedModelId
                 ? { selectedModelId: message.payload.selectedModelId }
                 : {}),
@@ -115,6 +124,17 @@ function App() {
             dispatchPermissionSelector({
               type: "permission-updated",
               summary: message.payload.summary,
+            });
+          } else if (message.type === "provider-credentials") {
+            dispatchProviderCredential({
+              type: "credentials-updated",
+              providers: message.payload.providers,
+            });
+          } else if (message.type === "provider-credential-operation") {
+            dispatchProviderCredential({
+              type: "operation-result",
+              providerId: message.payload.providerId,
+              status: message.payload.status,
             });
           } else if (message.type === "error") {
             if (message.correlationId === modelSelectionRequestIdRef.current) {
@@ -259,6 +279,24 @@ function App() {
     }
   };
 
+  const handleSetProviderCredential = (providerId: string): void => {
+    try {
+      protocolClient.send("set-provider-credential", { providerId });
+      dispatchProviderCredential({ type: "operation-requested", providerId });
+    } catch {
+      dispatchProviderCredential({ type: "error", message: "設定要求を送信できませんでした。" });
+    }
+  };
+
+  const handleDeleteProviderCredential = (providerId: string): void => {
+    try {
+      protocolClient.send("delete-provider-credential", { providerId });
+      dispatchProviderCredential({ type: "operation-requested", providerId });
+    } catch {
+      dispatchProviderCredential({ type: "error", message: "削除要求を送信できませんでした。" });
+    }
+  };
+
   const sendPermissionSelection = (profile: UserSelectablePermissionProfile): void => {
     const summary = permissionSelectorState.summary;
     if (
@@ -326,6 +364,7 @@ function App() {
         state={composerState}
         modelSelectorState={modelSelectorState}
         permissionSelectorState={permissionSelectorState}
+        providerCredentialState={providerCredentialState}
         onDraftChange={handleComposerDraftChange}
         onSubmit={handleComposerSubmit}
         onStop={handleComposerStop}
@@ -333,6 +372,8 @@ function App() {
         onPermissionSelect={handlePermissionSelect}
         onPermissionConfirm={handlePermissionConfirm}
         onPermissionCancel={() => dispatchPermissionSelector({ type: "confirmation-cancelled" })}
+        onProviderCredentialSet={handleSetProviderCredential}
+        onProviderCredentialDelete={handleDeleteProviderCredential}
       />
     </main>
   );

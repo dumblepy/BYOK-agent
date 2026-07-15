@@ -12,7 +12,7 @@ const vscodeMock = vi.hoisted(() => ({
 vi.mock("vscode", () => vscodeMock);
 
 import { AgentWebviewProvider } from "../../src/ui/agent-webview-provider";
-import { StaticModelCatalog } from "../../src/models/model-catalog";
+import { ConfiguredModelCatalog, StaticModelCatalog } from "../../src/models/model-catalog";
 import { FileThreadModelStore } from "../../src/storage/thread-model-store";
 import { createUiToExtensionMessage } from "../../src/ui/webview-protocol";
 
@@ -235,6 +235,81 @@ describe("AgentWebviewProvider", () => {
         payload: expect.objectContaining({ code: "MODEL_SELECTION_CONFLICT" }),
       }),
     );
+  });
+
+  it("Catalog更新時に複数モデルを表示中のUIへ即時反映する", async () => {
+    const catalog = new ConfiguredModelCatalog([
+      {
+        name: "Provider",
+        vendor: "test",
+        apiType: "responses",
+        models: [
+          {
+            id: "model-one",
+            name: "Model One",
+            url: "https://example.com/v1/responses",
+            toolCalling: true,
+            streaming: true,
+            vision: false,
+            reasoning: false,
+            maxInputTokens: 8_000,
+            maxOutputTokens: 1_000,
+          },
+        ],
+      },
+    ]);
+    const provider = new AgentWebviewProvider({ extensionUri: { path: "/extension" } } as never, {
+      modelCatalog: catalog,
+      threadModelStore: new FileThreadModelStore(),
+    });
+    const view = createWebviewView();
+    provider.resolveWebviewView(view as never);
+
+    view.emit(
+      createUiToExtensionMessage("ui-ready", {
+        clientInstanceId: "00000000-0000-4000-8000-000000000002",
+        supportedProtocolVersions: ["1.0"],
+      }),
+    );
+    await flush();
+
+    catalog.replace([
+      {
+        name: "Provider",
+        vendor: "test",
+        apiType: "responses",
+        models: [
+          {
+            id: "model-one",
+            name: "Model One",
+            url: "https://example.com/v1/responses",
+            toolCalling: true,
+            streaming: true,
+            vision: false,
+            reasoning: false,
+            maxInputTokens: 8_000,
+            maxOutputTokens: 1_000,
+          },
+          {
+            id: "model-two",
+            name: "Model Two",
+            url: "https://example.com/v1/responses",
+            toolCalling: false,
+            streaming: false,
+            vision: true,
+            reasoning: false,
+            maxInputTokens: 8_000,
+            maxOutputTokens: 1_000,
+          },
+        ],
+      },
+    ]);
+    await flush();
+
+    const latestList = view.sent.findLast(
+      (message) => (message as { type?: string }).type === "model-list",
+    ) as { payload: { models: readonly { id: string }[] } };
+    expect(latestList.payload.models.map((model) => model.id)).toEqual(["model-one", "model-two"]);
   });
 
   it("rejects model changes while a thread run is active", async () => {

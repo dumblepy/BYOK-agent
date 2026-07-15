@@ -337,97 +337,300 @@ tests/
 
 ## 5.1 設定ファイル
 
-ユーザー設定は次の優先順位で読み込む。
+モデル設定はユーザー共通設定ファイルだけから読み込む。
 
-1. VS Code User Settings
-2. ユーザー共通設定ファイル
-3. ワークスペース設定ファイル
-4. 組み込みデフォルト
+```text
+~/.byok-agent/models.json
+```
+
+`resources/default-models.json`は、`models.json`が存在しない初回起動時の生成テンプレートとしてだけ使用する。VS Code User Settingsやワークスペース設定からモデル定義を読み込まない。
 
 推奨ファイル名：
 
 ```text
-~/.config/byok-agent/models.json
+~/.byok-agent/models.json
 <workspace>/.vscode/byok-agent.models.json
 ```
 
 ワークスペース側からAPIキー参照先、任意ヘッダー、外部URLを上書きすることは、原則禁止する。悪意あるリポジトリが外部送信先を変更するのを防ぐためである。
 
+### 5.1.1 設定ローダーの責務
+
+`ModelConfigLoader`は設定ソースを読み込み、検証済みの最終設定スナップショットをModel Catalogへ渡すExtension Host側のコンポーネントとする。Webviewは設定ファイルを直接読まず、ローダーが生成した安全なモデル要約だけを受け取る。
+
+#### 設定ソースと優先順位
+
+実行時は`~/.byok-agent/models.json`だけを読み込む。ファイルが存在しない場合だけ、組み込みテンプレートをコピーしてから読み込む。
+
+存在しない任意ソースは空設定として扱う。読み込み対象のパスは固定の解決規則で決定し、ワークスペース設定から任意のファイルパスを追加指定できない。
+
+#### マージ規則
+
+- Providerのマージキーは`name`、ModelのマージキーはProvider内の`id`とする。キーが異なる定義は別エントリとして扱う。
+- Provider配列とModel配列は単純な配列連結をせず、キー単位で順序を保ちながらマージする。同一キーは低優先エントリを基礎に高優先エントリを重ねる。
+- 同一オブジェクト内のオブジェクト値は再帰的にマージする。スカラー値は高優先ソースの値で置換する。
+- 配列値は原則として高優先ソースの配列で置換し、要素の暗黙的な結合や重複排除は行わない。ただしProvider／Model配列だけは上記の識別子マージを適用する。
+- 高優先ソースにないProvider／Modelは低優先ソースから引き継ぐ。削除操作やnullによる削除はSchema契約に含めず、将来の明示的なSchema拡張で定義する。
+- マージ後にProvider名またはModel IDが重複する状態を残さず、参照整合性、Token上限、Capabilities、URL、スコープ安全性を最終設定として再検証する。
+
+#### 検証と公開単位
+
+各ソースを、JSON構文、JSON Schema、意味検証、スコープ別セキュリティポリシーの順に個別検証する。いずれかの検証に失敗したソースは部分採用せず、直前の有効スナップショットを維持する。全ソースの読み込みと検証が完了した場合だけ、マージ済み設定を一つの不変スナップショットとして原子的に公開する。
+
+ワークスペース設定は、APIキー参照先、Authorizationを含む任意ヘッダー、外部URL、認証方式を追加・変更できない。Workspace Trustが無効な場合、ワークスペース由来の外部接続設定は採用せず、組み込み・ユーザー側の安全な設定だけで再計算する。エラー通知にはソース種別、ファイルパスの安全な識別子、構造化エラーコードだけを含め、秘密情報や設定値全体を含めない。
+
+#### ファイル変更時の再読み込み
+
+ユーザー共通設定とワークスペース設定はファイル監視対象とする。変更・作成・削除イベントは短時間のデバウンス後に対象ソースを再読み込みし、同時発生した複数イベントを一回の再計算へまとめる。読み込み中の中間結果は公開せず、再読み込み完了後にスナップショットを置き換える。
+
+再読み込みが成功した場合は設定変更イベントに新しいrevisionと変更されたソース種別だけを含める。JSON構文または検証に失敗した場合は最後の有効設定を維持し、診断イベントを通知する。削除された任意設定ファイルは空設定として再計算し、組み込みデフォルトまでフォールバックする。監視解除時にはファイルディスクリプターとイベント購読を解放し、同じ変更を二重に通知しない。
+
+### 5.1.2 ワークスペース由来設定の安全制約
+
+#### 脅威モデル
+
+ワークスペース設定ファイルはリポジトリから取得され得るため、ユーザーの明示的な設定と同じ信頼境界で扱わない。攻撃者が設定ファイルを追加・変更することで、ユーザーが登録したAPIキーを攻撃者のサーバーへ送信する、送信先を差し替える、Authorization等の認証・転送ヘッダーを追加・上書きする、といった操作を防ぐ。
+
+設定ロード時点でソーススコープを付与し、各フィールドの変更権限を検証する。`Workspace Trust` は信頼状態を表す入力であり、APIキーや認証ヘッダーの禁止を解除する権限ではない。
+
+#### スコープ別ポリシー
+
+| 設定項目 | 組み込み・ユーザー側 | ワークスペース側 | 未信頼ワークスペース |
+|---|---|---|---|
+| Provider／Modelの表示情報・能力 | 許可 | 許可 | 許可（Schema検証後） |
+| `apiKey`本体 | 禁止 | 禁止 | 禁止 |
+| SecretStorageのキーID・参照先 | Host内部でのみ管理 | 禁止 | 禁止 |
+| 環境変数・入力変数による秘密参照 | 許可（定義した方式のみ） | 禁止 | 禁止 |
+| Provider／Modelの外部URL | 許可（ネットワーク規則に従う） | 既存値の変更・新規追加とも禁止 | ワークスペース由来は不採用 |
+| 任意HTTPヘッダー | 許可範囲のみ | 禁止 | 禁止 |
+
+ワークスペース設定で禁止項目が見つかった場合は、該当フィールドだけを黙って落とさず、ソース全体を無効化する。Provider名やModel IDだけを採用して別の認証情報と組み合わせる意図しない昇格を防ぐためである。
+
+#### APIキーと認証情報
+
+ワークスペース設定の`apiKey`は、平文、`${input:...}`、`secret://...`、環境変数展開など形式に関係なく拒否する。既存のユーザー側SecretのID、Providerの認証方式、Authorization値、Cookieを指定・変更することも拒否する。APIキーの解決はExtension HostのSecretStorage責務とし、設定由来の識別子を解決関数へ渡さない。
+
+#### URLとWorkspace Trust
+
+URLは正規化・解析後に、URL内ユーザー情報、許可されないスキーム、HTTPS要件、localhostのHTTP例外を検証する。ワークスペース設定はURLを新規追加できず、既存ProviderのURLも変更できない。Workspace Trustが無効な場合は、ワークスペースソースに含まれる外部URLを全て不採用とし、組み込み・ユーザー側ソースだけで最終スナップショットを再計算する。
+
+Trust状態が変更された場合は、設定ファイルの変更がなくても全ソースを再評価する。HTTPリダイレクトが発生した場合も、最終URLに対して同じ検証を再実行する。
+
+#### HTTPヘッダー
+
+任意HTTPヘッダーはリクエストへそのまま追加する自由形式の辞書として扱わない。許可する場合はユーザー側設定に限定し、ヘッダー名をASCII小文字へ正規化して、空白、制御文字、重複名、CR/LFを拒否する。次の予約カテゴリは明示的な許可リストに入れない。
+
+- `authorization`、`proxy-authorization`、`cookie`、`set-cookie`
+- `host`、`content-length`、`transfer-encoding`
+- `origin`、`referer`、`forwarded`、`via`、`proxy-*`、`x-forwarded-*`
+
+ワークスペース設定では任意ヘッダーを一件も許可しない。ユーザー側の非予約ヘッダーも、Providerの固定認証ヘッダーやHTTPクライアント管理のHop-by-hopヘッダーを上書きできないよう、固定値を優先する。最終リクエスト生成前に再検証し、検証済みの不変マップだけをProvider Adapterへ渡す。
+
+#### 検証順序と失敗時動作
+
+設定ソースごとに、(1) UTF-8 JSON解析とJSON Schema、(2) Provider／Modelの意味検証、(3) ソーススコープとWorkspace TrustによるAPIキー・Secret参照・URL・認証方式・ヘッダーのポリシー検証、(4) 全ソースの安全なマージ、の順で処理する。いずれかが失敗した場合はソース全体を部分採用せず、直前の有効スナップショットを維持する。初回ロードでは失敗ソースを除いた組み込み設定へフォールバックする。
+
+診断にはソース種別、安定したファイル識別子、構造化エラーコード、JSON Pointerだけを含める。APIキー、Secret ID、Authorization値、URL全体、ヘッダー値、環境変数展開結果はログ・診断・UI通知に出力しない。
+
+#### 実装・テスト方針
+
+実装は、`ConfigSourceScope`を保持する読み込み結果、スコープポリシー検証、URL検証、ヘッダー正規化・検証、原子的なスナップショット公開を分離する。Provider Adapterは検証済み設定だけを受け取り、ワークスペース由来かどうかを推測して独自に認可しない。
+
+最低限、平文・SecretStorage参照・環境変数参照の拒否、ユーザーProviderのURL・認証方式変更の拒否、未信頼状態での外部URL不採用とTrust変更時の再評価、大文字小文字違い・重複・前後空白・CR/LF・予約名・`x-forwarded-*`による上書き拒否、禁止項目を含むソース全体の無効化、リダイレクト先の再検証、診断やWebviewデータへの秘密値非出力をテストする。
+
+完了条件は、悪意あるリポジトリの設定だけでは送信先、Secret参照先、認証情報、任意HTTPヘッダーを変更できず、ユーザーが明示的に登録した安全な設定のみによってProviderリクエストが構成されることである。
+
+#### ローダーの完了条件
+
+- 複数ソースから優先順位どおりのProvider／Model最終設定を決定できる。
+- 同一Provider／Modelの部分更新、配列置換、未指定項目の継承が規則どおりに再現できる。
+- 無効なソースを部分採用せず、直前の有効スナップショットを維持できる。
+- ファイル変更・作成・削除後にデバウンスされた一回の再読み込みで新しいスナップショットを公開できる。
+- ワークスペース設定から秘密情報・外部送信先・任意ヘッダーを変更できない。
+
 ## 5.2 JSON例
 
 ```json
 {
-  "$schema": "./model-config.schema.json",
-  "version": 1,
-
-  "providers": {
-    "primary-openai": {
-      "type": "openai-responses",
-      "baseUrl": "https://api.example.com/v1",
-      "apiKeyRef": "secret://primary-openai",
-      "timeoutMs": 120000,
-      "headers": {}
-    },
-
-    "company-gateway": {
-      "type": "openai-compatible",
-      "baseUrl": "https://llm-gateway.example.net/v1",
-      "apiKeyRef": "secret://company-gateway",
-      "timeoutMs": 120000,
-      "headers": {
-        "X-Client-Name": "byok-vscode-agent"
-      }
-    }
-  },
-
-  "models": [
-    {
-      "id": "coding-primary",
-      "displayName": "Coding Primary",
-      "provider": "primary-openai",
-      "apiModel": "provider-model-id",
-      "family": "openai",
-      "contextWindow": 200000,
-      "maxOutputTokens": 16000,
-
-      "capabilities": {
-        "streaming": true,
+  "providers": [
+  {
+    "name": "OpenRouter",
+    "vendor": "customendpoint",
+    "apiType": "chat-completions",
+    "models": [
+      {
+        "id": "grok-4.5",
+        "name": "Grok 4.5(1.6)",
+        "vendor": "xAI",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
         "toolCalling": true,
-        "parallelToolCalls": true,
         "vision": false,
-        "reasoning": true,
-        "systemMessage": true,
-        "promptCaching": false,
-        "strictJsonSchema": true
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 131072
       },
-
-      "request": {
-        "temperature": null,
-        "topP": null,
-        "reasoningEffort": "medium"
+      {
+        "id": "glm-5.2",
+        "name": "GLM 5.2(1.12)",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "toolCalling": true,
+        "vision": false,
+        "thinking": true,
+        "supportsReasoningEffort": ["high", "xhigh"],
+        "maxInputTokens": 1000000,
+        "maxOutputTokens": 131072
       },
-
-      "agent": {
-        "promptProfile": "default-coding",
-        "contextProfile": "balanced",
-        "toolProfile": "workspace",
-        "maxIterations": 30,
-        "maxToolCalls": 80,
-        "maxConsecutiveFailures": 3
+      {
+        "id": "qwen3.7-plus",
+        "name": "Qwen3.7 Plus(0.32)",
+        "url": "https://openrouter.ai/api/v1/chat/completions",
+        "toolCalling": true,
+        "vision": true,
+        "thinking": true,
+        "maxInputTokens": 991800,
+        "maxOutputTokens": 65500
       }
-    }
-  ],
-
-  "defaults": {
-    "model": "coding-primary",
-    "permissionProfile": "confirm-writes"
+    ]
   }
+  ]
 }
 ```
 
+### 5.2.1 モデル設定JSON Schemaの設計
+
+モデル設定ファイルは、ルートに`providers`を持つドキュメントオブジェクトとし、Providerの中にModel配列を持つ構造にする。Provider固有の接続設定とModel固有の能力・Token上限を分離し、Modelの選択やAgent実行設定はModel IDを基準に解決する。Copilot固有の認証実装やサービスエンドポイントは流用しない。入力形式はドキュメントオブジェクトに限定する。
+
+この構造上の互換性と、プロジェクト固有の意味を分離する。
+
+- ルートは`type: "object"`、必須の`providers`はProvider配列、ProviderとModelは`type: "object"`で定義し、設定項目を`properties`に列挙する。`defaultModelId`は任意の既定モデル指定である。ルート配列は許可しない。
+- Providerの識別子は`name`、Modelの識別子はModelオブジェクトの`id`を正本とする。IDはModel Catalogの解決とエラー表示に利用する。
+- 各オブジェクトは`additionalProperties: false`を基本とし、未知のキーを黙って無視しない。将来の拡張はSchemaのversion更新と明示的な移行で行う。
+- 配列は空を許可しない。Provider名とModel IDの重複、Model間のURL不整合はJSON Schema検証後の意味検証で確認する。
+- Agent設定は提示例に存在しないため、Model内の任意の`agent`拡張として定義する。省略時は組み込みの安全な既定値を使用し、提示例を有効な最小設定として扱う。
+
+#### Schemaのトップレベル契約
+
+```text
+ModelConfigDocument
+├─ providers: Provider[]
+└─ defaultModelId?: string
+Provider
+├─ name: string
+├─ vendor: string
+├─ apiType: chat-completions | responses | messages
+└─ models: Model[]
+Model
+├─ id: string
+├─ name: string
+├─ vendor?: string
+├─ url: URI
+├─ toolCalling: boolean
+├─ vision: boolean
+├─ thinking?: boolean
+├─ supportsReasoningEffort?: ReasoningEffort[]
+├─ maxInputTokens: integer
+├─ maxOutputTokens: integer
+└─ agent?: AgentSettings
+```
+
+#### Provider
+
+必須項目は`name`、`vendor`、`apiType`、`models`とする。APIキーやSecret参照の項目は定義しない。認証情報はProvider名からExtension HostのSecretStorageで解決する。
+
+- `name`、`vendor`: 1〜128文字の非空文字列
+- `apiType`: `chat-completions`、`responses`、`messages`のいずれか。`chat-completions`はOpenAI互換、`responses`はOpenAI Responses、`messages`はAnthropic Messagesを表す
+- `models`: 1件以上のModel配列
+
+Providerの設定で許可するプロトコルは、プロジェクトルールの初期対応範囲と一致させる。Gemini等の第2段階プロトコルは、Schema version 1の列挙値へ追加しない。API URLはProviderではなくModelごとの`url`に置く。
+
+#### Model
+
+必須項目は`id`、`name`、`url`、`toolCalling`、`vision`、`maxInputTokens`、`maxOutputTokens`とする。提示例にない`vendor`、`thinking`、`supportsReasoningEffort`、`agent`は任意とする。
+
+- `id`、`name`、`vendor`: 1〜128文字の非空文字列。IDは`^[a-z0-9][a-z0-9._-]*$`に限定する
+- `url`: URI。`https`を既定とし、`http`は`localhost`またはループバックアドレスに限定する
+- `maxInputTokens`: 整数、`1,024`以上`10,000,000`以下
+- `maxOutputTokens`: 整数、`1`以上`1,000,000`以下。`maxInputTokens`以下であることは意味検証で確認する
+- `toolCalling`、`vision`、`thinking`: boolean
+- `supportsReasoningEffort`: `none`、`low`、`medium`、`high`、`xhigh`からなる重複なし配列。`thinking`がtrueの場合だけ指定を許可する
+
+Provider内のModel ID重複、URLの不正、`maxOutputTokens`と`maxInputTokens`の関係、`supportsReasoningEffort`と`thinking`の整合性は、JSON Schemaの型検証だけでは表現しにくいため、Schema検証後の意味検証エラーとして扱う。
+
+#### Capabilities
+
+Capabilitiesはモデル名から推測せず、設定値を正の情報源とする。提示例の能力項目をModel直下に置き、`toolCalling`と`vision`を必須、`thinking`と`supportsReasoningEffort`を任意とする。未指定時の暗黙の有効化は行わない。
+
+```text
+toolCalling        boolean
+vision             boolean
+thinking           boolean
+supportsReasoningEffort  ReasoningEffort[]
+```
+
+Providerの`apiType`が`chat-completions`でも、Modelごとに`toolCalling`や`vision`を指定できる。能力不足時のUI・Tool・Agent挙動は後続のModel Catalog／Provider実装で利用する。
+
+#### Agent設定
+
+Agent設定はModel単位の任意オブジェクトとし、指定された場合は実行上限をSchemaの数値範囲で制限する。提示例のように省略した場合は、組み込みの安全な既定値を使用する。
+
+- `promptProfile`: 1〜64文字のProfile ID
+- `contextProfile`: `compact`、`balanced`、`extended`のいずれか
+- `toolProfile`: `read-only`、`workspace`、`full`のいずれか。これは権限プロファイルではなく、利用可能Toolの集合を選ぶ設定とする
+- `maxIterations`: 整数、`1`以上`100`以下
+- `maxToolCalls`: 整数、`1`以上`500`以下
+- `maxConsecutiveFailures`: 整数、`1`以上`10`以下
+
+`toolProfile`で`full`を指定しても権限確認を省略できない。権限は`Permission Profile`とWorkspace Trustで別途判定し、`autonomous`は既定設定の列挙値に含めない。
+
+#### スコープとCopilot系設定構造の適用範囲
+
+設定ファイルの構造はCopilot系設定と同じく、グローバル設定とリポジトリ／ワークスペース設定を別ファイルに置き、同じキーを後のスコープで上書きできる形にする。ただし本プロジェクトの優先順位は既存ルールを優先し、次の順序を固定する。
+
+```text
+User Settings > ユーザー共通モデル設定 > ワークスペースモデル設定 > 組み込みデフォルト
+```
+
+JSON Schemaは設定ファイル全体の形を検証する。スコープごとの安全性は別のポリシーとして適用し、ワークスペース設定から外部URL、認証情報を変更できないようにする。互換性のため`apiKey`項目だけは受け付けるが、値を検証・解決・保存せず、正規化済み設定から直ちに除去する。Secret参照、Authorization値など他の認証項目は拒否する。
+
+#### 検証エラーの契約
+
+検証結果は例外文字列ではなく、すべての違反をパス付きの構造化エラーとして返す。エラーの順序はJSON Pointerのパス順で安定させ、複数エラーを一度に表示できるようにする。
+
+```ts
+interface ModelConfigValidationIssue {
+  code:
+    | "CONFIG_INVALID_JSON"
+    | "CONFIG_SCHEMA_INVALID"
+    | "CONFIG_UNKNOWN_PROPERTY"
+    | "CONFIG_INVALID_REFERENCE"
+    | "CONFIG_SEMANTIC_INVALID"
+    | "CONFIG_WORKSPACE_POLICY_VIOLATION";
+  path: string;
+  keyword?: string;
+  message: string;
+  expected?: string;
+  actual?: string;
+}
+```
+
+メッセージには、例えば`/0/models/0/toolCalling`、期待値`boolean`、実際値`"yes"`のように、対象パス・期待値・実際値を含める。APIキーやAuthorization値などの秘密情報は`actual`、ログ、UI通知のいずれにも出力しない。ユーザー向け表示は安全な概要、開発者向け診断はSchema keywordと位置情報、ログは設定ファイルの種別とエラーコードだけに分離する。
+
+検証段階は次の順序とする。
+
+1. UTF-8 JSONとして解析する。解析不能なら`CONFIG_INVALID_JSON`を返す。
+2. JSON Schema Draft 2020-12で型、必須項目、列挙値、数値範囲、形式、未知プロパティを検証する。
+3. Provider／Modelの構造、ID重複、能力間の関係、Token上限を意味検証する。
+4. ファイルのスコープに応じたSecret、URL、ヘッダー、Workspace Trustのポリシーを検証する。
+5. 1〜4の違反があれば設定全体を無効とし、部分的なProviderやModelを実行経路へ渡さない。
+
+#### 実装時の検証とテスト方針
+
+Schemaは`resources/model-config.schema.json`として配置し、Draft 2020-12対応のAJVバリデーターで検証する。検証コードは`src/models/model-config-validator.ts`に置き、JSON構文、Schema、意味、スコープポリシーを順番に検証する。
+
+実装時は、正常な最小設定、全項目を含む設定、未知プロパティ、必須項目欠落、列挙値外、各数値範囲の境界値、URI不正、Provider／Model参照不整合、重複Model ID、秘密情報混入、ワークスペースポリシー違反を`tests/unit/`で検証する。完了条件は、設定ファイルをSchema検証し、失敗時に上記のパス付きエラーを取得できることである。
+
 ### 5.3 APIキー
 
-APIキー本体はJSONに保存しない。
+APIキー本体はJSON、VS Code設定、環境変数、ワークスペース、会話保存、ログ、Webview状態のいずれにも新規保存しない。旧設定に残る`apiKey`項目は互換性のため読み飛ばし、正規化済み設定から除去する。APIキーの新しい保存先は、Extension Hostが保持する`ExtensionContext.secrets`（`SecretStorage`）だけとする。
 
 ```ts
 interface SecretStore {
@@ -437,30 +640,269 @@ interface SecretStore {
 }
 ```
 
-実装には`ExtensionContext.secrets`を使用する。VS Codeの`SecretStorage`は機密情報を暗号化して保存し、端末間同期を行わない。
+`SecretStore`は`ExtensionContext.secrets`をラップするExtension Host専用サービスである。Provider Adapter、コマンドハンドラー、Catalogの認証状態判定はこのサービスを介し、Webview、Thread Store、設定ローダー、ログ出力層には依存を公開しない。VS Codeの`SecretStorage`は機密情報を暗号化して保存し、端末間同期を行わない。
+
+#### 5.3.1 ProviderとSecretStorageキーの対応
+
+Provider設定の`name`を正規化した値をProvider IDとして扱う。正規化は前後空白除去、英字の小文字化、制御文字・パス区切り文字の拒否を行い、別名への自動変換や曖昧なフォールバックは行わない。空白を含むProvider名は許可し、SecretStorageキーのProvider ID部分へURIエンコードして格納する。正規化後に衝突するProvider定義は設定エラーとする。
+
+SecretStorageのキーは次の固定形式とする。
+
+```text
+byokAgent.secret.v1.apiKey.<encodeURIComponent(providerId)>
+```
+
+キー名は設定ファイルへ書き戻さず、Provider設定にSecret IDを指定させない。`set`は空文字または前後空白だけの値を拒否し、保存前に入力値の前後空白を除去するかどうかはコマンド契約で明示的に統一する。推奨動作は、意図しないキー変更を防ぐため入力値を加工せず、空白だけを拒否することである。
+
+#### 5.3.2 保存・取得・削除の契約
+
+- `set(providerId, value)`: Provider IDを検証し、非空のAPIキーを該当キーへ保存する。成功・失敗のログに値を含めない。
+- `get(providerId)`: Provider IDを検証し、該当ProviderのAPIキーまたは`undefined`をHost内部へ返す。呼び出し元は返却値をリクエスト生成のスコープ内に限定する。
+- `delete(providerId)`: Provider IDを検証し、該当キーを削除する。未登録状態でも冪等に成功として扱う。
+- SecretStorageの読み書き失敗は認証設定エラーへ分類し、内部例外や値をそのままUI・ログへ渡さない。
+
+Provider通信では、実行開始時にCatalogがProvider IDを解決し、Adapterへ渡す直前にHost内で`get`を呼び出す。APIキーを`ModelDefinition`、`ProviderSummary`、`ProviderRequest`の永続化可能な形式へ含めず、Provider Adapterの認証ヘッダー生成処理のローカルスコープだけで使用する。リトライやストリームイベントへAPIキーを引き継がない。
+
+#### 5.3.3 APIキー入力コマンド
+
+Extension Hostに次のコマンドを登録する。
+
+| コマンド | 動作 | UIへ返す情報 |
+|---|---|---|
+| `byokAgent.setApiKey` | Providerを選択し、パスワード入力欄でAPIキーを受け取りSecretStorageへ保存 | Providerの表示名と保存成功状態のみ |
+| `byokAgent.deleteApiKey` | Providerを選択し、対応するSecretStorageエントリを削除 | Providerの表示名と削除成功状態のみ |
+
+Provider選択は検証済みCatalogのProvider表示名・IDだけを使う。入力欄はパスワード入力、フォーカス外クリックでの誤送信を抑制する設定、キャンセル処理を備える。APIキーをコマンド引数、コマンドURI、クリップボード経由、Webviewメッセージへ含めない。設定済み状態の一覧はbooleanだけをWebviewへ通知し、キーの存在そのものを診断ログへ記録しない。
+
+#### 5.3.4 非出力・非保存規則
+
+APIキーおよびAuthorizationヘッダーは、次のすべてから除外する。
+
+- モデル設定JSON、ワークスペース設定、`globalStorage`のmeta/events/summary/artifacts
+- OutputChannel、Debug Console、例外メッセージ、テレメトリ、診断、クラッシュ情報
+- Webview初期状態、IPCメッセージ、UIイベント、ProviderEvent、Agent履歴
+- URL、HTTPリクエストのダンプ、リトライ記録、テストのスナップショット
+
+ネットワーククライアントや共通ロガーに認証ヘッダーを渡す場合は、値を出力可能な汎用オブジェクトへ格納しない。エラーをユーザーへ表示する場合は、Provider名、モデルID、構造化エラーコードなどの安全な概要だけに変換する。
+
+#### 5.3.5 テスト設計と完了条件
+
+実装時はFakeの`SecretStorage`を注入し、次を検証する。
+
+1. Provider A/Bの保存・取得・削除が相互に干渉しない。
+2. 空文字、未知Provider、正規化衝突、削除済みProviderを拒否または安全に未設定扱いにする。
+3. `setApiKey`の入力値が設定JSON、ログ、Webviewメッセージ、会話イベントに現れない。
+4. Providerリクエスト成功、認証失敗、通信失敗、リトライ、キャンセルの全経路でAPIキーが記録されない。
+5. SecretStorage障害時にAPIキーを代替保存せず、再入力可能な安全なエラーを返す。
+6. 実際の`ExtensionContext.secrets`以外の永続化先にAPIキーが書き込まれていない。
+
+完了条件は、APIキーの保存・取得・削除と入力コマンドがProvider単位で動作し、APIキー本体が`ExtensionContext.secrets`にのみ保存されることである。本節では設計のみを定義し、実装は別タスクで行う。
 
 ### 5.4 モデル能力
 
-モデル名から能力を推測する実装は補助的なものに留める。
-
-正の情報源はJSON設定とする。
+モデル能力はModel Definitionに属する明示的な設定値であり、正の情報源は検証済みJSON設定とする。モデル名、Provider名、URL、APIレスポンスの名称規則から能力を推測して実行可否を決めてはならない。未指定・不正・不明な能力は利用不可として扱う。
 
 ```ts
+type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
+
 interface ModelCapabilities {
-  streaming: boolean;
   toolCalling: boolean;
-  parallelToolCalls: boolean;
+  streaming: boolean;
   vision: boolean;
   reasoning: boolean;
-  systemMessage: boolean;
-  promptCaching: boolean;
-  strictJsonSchema: boolean;
+  reasoningEfforts: readonly ("none" | "low" | "medium" | "high" | "xhigh")[];
 }
 ```
+
+`reasoning`は推論機能を利用できるか、`reasoningEfforts`は設定可能な強度の集合を表す。`reasoning=false`の場合、`reasoningEfforts`は空でなければならず、空でない設定は能力矛盾としてモデルを利用不可にする。`reasoning=true`でも強度が空の場合は、Provider既定の推論だけを許可し、UIに強度選択を表示しない。`none`は推論機能を無効化した明示値として扱う。
+
+推論強度がUIまたは実行要求で明示されていない場合は、Copilotの公開実装に合わせて解決する。対応値が1件だけならその値を選択し、複数値に`high`が含まれる場合は`high`を既定値とする。複数値に`high`がなく、単一値でもない場合は値を指定せずProvider既定へ委ねる。要求値が対応集合に含まれない場合も、未指定と同じ規則で解決する。Copilot公開ソースでは設定Schemaの既定値を`high`（対応時のみ）とし、単一対応値はその値、その他は未指定としている。
+
+既存設定の`thinking`は旧名称であり、Capabilitiesの正規化後に実行経路から参照しない。移行処理を導入する場合は、設定ファイルのバージョンと明示的な変換診断を追加し、`thinking`をモデル名推測の代替にしない。
+
+### 5.4.1 設定値から実効能力への解決
+
+設定値は能力の許可上限であり、実効能力は次の順でHost内に一度だけ解決する。
+
+```text
+configuredCapabilities
+  ∩ providerAdapterCapabilities
+  ∩ requestEnvironmentCapabilities
+  = effectiveCapabilities
+```
+
+ただし、明示的な`false`は常に`false`を維持する。Provider Adapterが能力を宣言していない場合も`false`とし、モデル名やAPIエラーから`true`へ昇格させない。設定値とAdapterの能力が矛盾する場合は診断を残し、そのモデルを利用可能一覧から除外するか、該当能力だけを無効化するかをエラー分類に従って決定する。少なくともTool CallingとStreamingのように実行プロトコルへ影響する能力は、矛盾時にRun開始を拒否する。
+
+解決済みスナップショットは次の境界を越えて共有する。
+
+```ts
+interface EffectiveCapabilities {
+  readonly toolCalling: boolean;
+  readonly streaming: boolean;
+  readonly vision: boolean;
+  readonly reasoning: boolean;
+  readonly reasoningEfforts: readonly ReasoningEffort[];
+  readonly revision: number;
+}
+
+interface CapabilityResolution {
+  readonly configured: ModelCapabilities;
+  readonly effective: EffectiveCapabilities;
+  readonly disabledReasons: Readonly<Record<string, string>>;
+}
+```
+
+`revision`はCatalogのスナップショットと同じ更新単位で採番する。Agent Run開始時に解決結果をコピーし、Run中は同じ値をProvider Request、Tool選定、Prompt構築、UIイベントへ使用する。
+
+### 5.4.2 能力不足時の機能切り替え
+
+| 能力 | `true`の場合 | `false`または不明の場合 |
+|---|---|---|
+| `toolCalling` | 利用可能かつ権限条件を満たすTool定義をリクエストへ含める | Tool定義を送らず、Tool Callを要求するAgent経路を開始しない |
+| `streaming` | `ProviderEvent`を受信するたびにUIへ逐次反映する | 完了応答を待って一括表示し、ストリーム専用の中断・進捗表示を無効にする |
+| `vision` | 画像入力をモデル入力へ変換し、添付UIを有効にする | 画像添付を無効にし、既存の画像入力は送信前に安全なエラーにする |
+| `reasoning` | 設定可能な`reasoningEfforts`だけを選択肢として表示・送信する | Reasoning設定UIとReasoning専用プロンプトを無効にする |
+
+能力不足を黙って別能力へ置き換えない。例えばTool Calling非対応モデルに対してテキスト内のTool記法を有効にするフォールバックはMVPでは提供しない。UIの無効状態は色だけに依存せず、理由を表示し、送信前にHostでも再検証する。Webviewから能力フラグを受け取っても正本とはせず、Hostの実効能力を再計算する。
+
+### 5.4.3 設定Schemaと診断
+
+将来のSchemaでは、Modelの`capabilities`オブジェクトに各能力を必須Booleanとして定義する。Reasoningの強度は`reasoningEfforts`配列で定義し、`reasoning=false`と非空配列の組み合わせを意味検証で拒否する。既存のフラットな`toolCalling`・`vision`から移行する場合は、読み込み時に新旧形式を混在させず、明示的なSchemaバージョンを用いる。
+
+診断には少なくとも次を含める。
+
+* `MODEL_CAPABILITY_MISSING`: 必須能力が未指定
+* `MODEL_CAPABILITY_CONFLICT`: 能力とReasoning設定が矛盾
+* `MODEL_CAPABILITY_ADAPTER_UNSUPPORTED`: 設定された能力をAdapterが提供できない
+* `MODEL_CAPABILITY_REQUEST_UNSUPPORTED`: 現在のリクエスト形式または環境で能力を利用できない
+
+診断はURL、ヘッダー、Secret、プロンプト本文を含めない。利用可能モデル一覧には実効能力を反映したモデルだけを含め、能力不足で無効化された機能は構造化診断とUIの安全な説明へ変換する。
 
 VS CodeのLanguage Model Chat Provider APIも、一つのプロバイダーから複数モデルを公開し、コンテキスト長、出力長、画像入力、Tool Callingなどのメタデータを提供する構造を採用している。
 
 ただし、本拡張の中核はVS CodeのLanguage Model APIに依存させない。管理者ポリシーやAPI変更の影響を避け、BYOK通信を直接制御するためである。
+
+### 5.5 Model Catalog
+
+#### 5.5.1 目的と責務境界
+
+`ModelCatalog`は、`ModelConfigLoader`が公開した検証済み設定スナップショットを、実行可能なモデルの解決結果へ変換するExtension Host側のレジストリである。UIやThread Storeは論理的な`modelId`だけを保持し、Provider URL、SecretStorage、APIキー、任意ヘッダーを直接参照しない。
+
+Model Catalogの責務は次のとおりとする。
+
+* 論理モデルIDを一意に解決する
+* Provider Adapterの識別子とProviderの接続設定を解決する
+* APIへ送るモデル名としてModelの`id`をProviderリクエストへ渡す
+* JSONで定義されたCapabilitiesとAgent設定を解決する
+* 既定モデルを決定し、利用可能モデル一覧を決定的な順序で返す
+* 無効設定、重複、参照不能、Secret未設定を利用可能一覧から除外する
+* 設定変更時に新しい不変スナップショットを原子的に公開する
+
+次の責務は持たない。
+
+* Provider APIへの接続、モデル一覧のリモート取得、リトライ
+* APIキーの入力、保存、Webviewへの返却
+* Toolの実行、権限判定、Agent Loopの判断
+* モデル名やProvider名からのCapabilitiesの推測
+
+#### 5.5.2 識別子と解決モデル
+
+設定上の`id`はUI・Thread Storeが扱う論理モデルIDであり、Provider APIのリクエストへ渡すモデル名も同じ`id`を使用する。論理IDとAPIモデル名を別フィールドへ分離しない。
+
+Providerの識別子は設定の`name`とし、Adapter選択には`apiType`を使う。接続先URLと許可済みヘッダーはProvider設定として解決結果に含めるが、Webview向けの`ModelSummary`には含めない。SecretStorageのキーや認証状態はCatalogのモデル定義へ含めない。
+
+```ts
+interface ModelDefinition {
+  readonly id: string;
+  readonly label: string;
+  readonly provider: {
+    readonly id: string;
+    readonly vendor: string;
+    readonly apiType: "chat-completions" | "responses" | "messages";
+    readonly url: string;
+    readonly headers: Readonly<Record<string, string>>;
+  };
+  readonly capabilities: ModelCapabilities;
+  readonly agent: ResolvedAgentSettings;
+}
+
+interface ModelCatalog {
+  list(): readonly ModelDefinition[];
+  listAvailable(): readonly ModelDefinition[];
+  resolve(modelId: string): ModelDefinition | undefined;
+  getDefault(): ModelDefinition | undefined;
+  diagnostics(): readonly ModelCatalogDiagnostic[];
+}
+```
+
+Catalogが外部へ返す`ModelDefinition`は認証情報を保持しない。Provider Adapterへ渡す直前にProviderサービスがSecretStorageから解決し、ログ・UI・保存データへ逆流させない。
+
+#### 5.5.3 Catalog構築と利用可能性
+
+設定スナップショットのProviderを入力順に走査し、Provider内の各Modelを正規化してCatalogを構築する。次の条件をすべて満たすものだけを利用可能とする。
+
+1. ProviderとModelの必須項目、Model ID、URL、Capabilities、Agent設定が検証済みである。
+2. 論理モデルIDがCatalog全体で一意である。
+3. Providerの`apiType`に対応するAdapterがRegistryに存在する。
+4. Provider IDがSecretStorageのキー規則に適合している。
+5. Provider URLがネットワーク安全規則を満たし、解決結果のヘッダーがポリシー検証済みである。
+
+一つのModelが不正でも、同一ソース全体を無効化するLoaderの規則を優先する。Catalog構築後に利用不能となった項目は診断対象として保持するが、実行可能一覧や既定モデルには含めない。表示順は`label`、同名時はProvider ID、最後に論理IDの昇順で固定する。
+
+#### 5.5.4 既定モデルの管理
+
+既定モデルは、ユーザーが明示選択していない新規Threadで使用するモデルである。解決優先順位は次のとおりとする。
+
+1. User Settingsで指定された`defaultModelId`
+2. ユーザー共通設定で指定された`defaultModelId`
+3. 組み込みデフォルトの`defaultModelId`
+4. 既定値指定がない場合の、利用可能一覧の先頭
+
+ワークスペース設定は、ユーザーのSecretや送信先を間接的に切り替え得るため、既定モデルの変更権限を持たせない。ワークスペースで定義されたモデルを一覧へ表示することと、既定モデルに昇格させることを分離する。指定された既定モデルが存在しない、重複する、または利用不能な場合は自動的に別モデルへ黙って切り替えず、診断を出したうえで安全な未選択状態とする。ただし初回起動時に組み込みデフォルト以外がない場合の先頭フォールバックは許可する。
+
+Threadに保存された`modelId`は既定モデルより優先する。保存値を解決できない場合はRunを開始せず、UIへモデル再選択を要求する。既定モデルはThreadの保存値を上書きしない。
+
+#### 5.5.5 無効設定の診断とUI通知
+
+設定不備は例外文字列ではなく、Catalogのrevisionに紐づく構造化診断として扱う。
+
+```ts
+interface ModelCatalogDiagnostic {
+  readonly source: "builtin" | "user-file" | "workspace-file" | "user-settings";
+  readonly path: string;
+  readonly code:
+    | "MODEL_DUPLICATE_ID"
+    | "MODEL_PROVIDER_NOT_FOUND"
+    | "MODEL_ADAPTER_UNSUPPORTED"
+    | "MODEL_SECRET_UNAVAILABLE"
+    | "MODEL_NOT_AVAILABLE"
+    | "MODEL_DEFAULT_INVALID";
+  readonly severity: "warning" | "error";
+  readonly userMessage: string;
+}
+```
+
+UIへは診断コード、表示可能なモデルラベルまたはProvider名、設定ソースの安全な種別、修正の案内だけを送る。Secret値、Secret ID、Authorization値、URL全体、ヘッダー値、設定JSON全文は送らない。`model-list`には利用可能モデルだけを含め、無効なモデルは`diagnostics`通知で別に伝える。無効化後も直前の有効Catalogを使い続け、初回ロードに有効なCatalogがない場合は選択・送信を無効化する。
+
+#### 5.5.6 更新と一貫性
+
+Loaderが新しい検証済みスナップショットを公開すると、Catalogは全エントリ、既定モデル、診断、revisionを一度に再構築する。構築途中の一覧をUIやAgentへ公開しない。実行開始時にはThread Storeから取得した`modelId`を同一revisionで解決し、Run中は解決済み`ModelDefinition`を固定する。設定変更によって次回Runの解決結果が変わっても、実行中のProvider設定を途中で差し替えない。
+
+モデル選択の`modelId`はHostでCatalogに対して再検証する。Webviewから送られたIDをそのままProviderへ渡さず、Catalogで解決できない場合は保存せず、安全なエラーと最新一覧を返す。これにより、UIが古い一覧を保持していても実行経路が未知モデルへ到達しない。
+
+#### 5.5.7 実装単位とテスト方針
+
+実装時は次の単位へ分割する。
+
+* `src/models/model-catalog.ts`: 正規化済み設定からの構築、解決、一覧、既定値、診断
+* `src/models/model-config-loader.ts`: 設定ソースの読み込み、検証、マージ、スナップショット公開
+* `src/models/model-types.ts`: `ModelDefinition`、Capabilities、Agent設定、診断の共有型
+* Extension HostのUIルーター: Catalogの一覧・診断をWebview契約へ変換
+* Agent Service: Threadの`modelId`をCatalogで解決し、Run要求へ渡す
+
+単体テストでは、Model IDのProvider／Adapter解決、能力値の保持、重複ID、Provider不在、無効既定値、優先順位、決定的な一覧順を検証する。SecretStorageの保存・取得・削除と認証状態の検証はProviderサービスのテストで行う。統合テストでは、モデル選択成功後の次回`send-message`がHost側Thread StoreのIDから実際のProvider設定を取得すること、設定再読み込み中に中間状態が公開されないこと、無効設定がUIへ安全な診断として届くことを検証する。実APIは呼ばず、Provider RegistryとSecretStorageをFakeで差し替える。
+
+完了条件は、モデル選択で得たModel IDから、Host内で一意な`ModelDefinition`を解決し、その`provider.apiType`、接続設定、Model ID、Capabilitiesを使って対象Provider Adapterへ渡せることである。
 
 ---
 
@@ -1847,6 +2289,100 @@ type ExtensionToUiPermissionMessage = MessageEnvelope<"permission-updated", {
 
 完了条件は、3つのプロファイルを安全に選択でき、現在の要求・実効権限を常時表示し、書き込み能力を広げる前に説明と確認を行い、選択確定後の次回Agent実行がHostのThread Storeから解決した権限Contextを用いてToolごとの権限判定を行うこととする。`autonomous`の有効化、承認ダイアログそのものの一般化、Permission Policyの全操作定義は本UI設計の完了条件に含めない。
 
+### 14.2.5 Provider認証設定UI詳細設計
+
+Provider認証設定UIは、検証済みModel Catalogに存在するProviderの認証状態を確認し、APIキーの登録・更新・削除を開始するためのWebview UIとする。APIキーの保存・取得・削除、入力UIの起動、Providerの存在確認、状態の正本管理はExtension Hostが担当する。Webviewは認証状態の表示と操作要求の送信だけを担当し、APIキー本体を扱わない。
+
+#### 責務と表示契約
+
+HostからUIへ渡すProvider認証要約は、次の情報に限定する。
+
+```ts
+type ProviderCredentialStatus =
+  | "configured"
+  | "not-configured"
+  | "unavailable";
+
+interface ProviderCredentialSummary {
+  providerId: string;
+  displayName: string;
+  vendor: string;
+  status: ProviderCredentialStatus;
+  canEdit: boolean;
+}
+```
+
+`configured`はSecretStorageに非空の値が存在することだけを表す。キーの一部、マスク値、長さ、更新日時、SecretStorageキー名は返さない。`unavailable`はProvider設定が不正、Providerが解決不能、またはSecretStorageの読み取りに失敗した場合の安全な表示状態であり、内部例外の詳細は含めない。UIはProvider URL、認証ヘッダー、Model設定JSONを直接読まない。
+
+Provider一覧はHostが表示名の昇順、同名の場合は正規化済みProvider IDの昇順で決定する。Webview側で任意のProviderを追加したり、受信したIDを表示ラベルへ変換したりしない。Providerが0件の場合は設定対象がない旨を表示し、操作を無効にする。
+
+#### 操作と状態遷移
+
+入力フォーム下のツールバー左端に`＋`ボタンを置き、クリックでメニューバーを開く。メニューバーには「Provider認証設定」ボタンを置き、このボタンからProvider認証パネルを開く。パネル上部右端には`✕`ボタンを置き、押下時はパネルだけを閉じる。パネルではProviderごとに状態ラベルと、登録・更新・削除の操作を表示する。未設定時は「APIキーを設定」、設定済み時は「APIキーを更新」「APIキーを削除」を表示する。キー本体を再表示する操作、コピー操作、マスク値の表示は提供しない。
+
+状態は`loading`、`ready`、`updating`、`error`で管理する。`updating`中は対象Providerの操作を無効にし、同一要求の二重送信を防ぐ。保存または削除が成功するまで確定表示を変更せず、成功後にHostから届いた新しい一覧で更新する。キャンセル、失敗、Webview再生成時はHostの最後の確定状態を表示する。
+
+設定・更新はHostがProviderを検証した後、VS Codeのパスワード入力UIを開き、非空の入力だけをSecretStorageへ保存する。更新操作も同じ保存経路を使う。削除はHostがProvider IDを再検証してSecretStorageから冪等に削除する。Webviewから送るのはProvider IDと操作種別だけであり、入力値をpayloadへ含めない。
+
+Command Paletteには次のコマンドを登録する。
+
+| コマンド | 動作 | 成功時の通知 |
+|---|---|---|
+| `byokAgent.manageProviderCredentials` | Provider一覧を選択し、設定済み状態を確認して設定・更新・削除を実行 | 保存・削除されたことだけを表示 |
+| `byokAgent.setProviderApiKey` | Providerを選択し、Hostのパスワード入力UIから設定・更新 | Provider表示名と完了状態だけを表示 |
+| `byokAgent.deleteProviderApiKey` | Providerを選択し、削除確認後に削除 | Provider表示名と完了状態だけを表示 |
+
+Command PaletteとWebviewから同時に要求が来た場合はHost側でProvider単位に直列化し、後から完了した操作の結果を新しい状態一覧として配信する。コマンド引数にProvider IDを受け付ける場合も、Catalogに存在するIDとの完全一致をHostで検証し、表示名や任意文字列から解決しない。
+
+#### Webview通信
+
+既存の共通エンベロープを使い、UIからHostへの要求を次のように追加する。
+
+```ts
+type UiToExtensionMessage =
+  // 既存のメンバー
+  | MessageEnvelope<"request-provider-credentials", {
+      providerId?: string;
+    }>
+  | MessageEnvelope<"set-provider-credential", {
+      providerId: string;
+    }>
+  | MessageEnvelope<"delete-provider-credential", {
+      providerId: string;
+    }>;
+```
+
+`request-provider-credentials`は全Providerまたは指定Providerの状態再取得要求、`set-provider-credential`はHostの入力UI起動要求、`delete-provider-credential`は削除確認を経た削除要求である。`set-provider-credential`の完了は、Hostが入力UIを閉じてSecretStorageへの保存結果を確定した後に返す。
+
+HostからUIへは次の通知を追加する。
+
+```ts
+type ExtensionToUiMessage =
+  // 既存のメンバー
+  | MessageEnvelope<"provider-credentials", {
+      providers: readonly ProviderCredentialSummary[];
+    }>
+  | MessageEnvelope<"provider-credential-operation", {
+      providerId: string;
+      operation: "set" | "delete";
+      status: "succeeded" | "cancelled" | "failed";
+    }>;
+```
+
+操作結果の`failed`には構造化エラーコードだけを含め、SecretStorageの例外、APIキー、入力値、Providerの生レスポンスは含めない。UIは操作結果を受け取った後に`provider-credentials`を正本として適用し、古い`messageId`や別セッションの通知を無視する。
+
+#### セキュリティ、アクセシビリティ、実装単位
+
+Webviewの通信受信時は既存のZod判別共用体へ追加したスキーマで検証し、検証前の値をDOM、ログ、コマンド実行、SecretStorageへ渡さない。Provider表示名やエラー文はテキストとして表示し、HTML、URL、Command URIとして解釈しない。UIはVS Code標準テーマトークンとCodiconを使用し、状態を色だけで表現しない。操作ボタンにはProvider名と操作内容を含むアクセシブルな名前を付け、更新中は`aria-busy`、成功・失敗は`aria-live`で通知する。削除はキーボード操作可能な確認ダイアログを必須とする。
+
+実装単位は、Host側の`ProviderCredentialService`、Command Paletteのコマンド登録、認証状態を返すUIルーター、Webview側の`ProviderCredentialPanel`、通信スキーマ・Reducerとする。`ProviderCredentialService`は`SecretStore`、`ModelCatalog`、入力UIを依存先とし、WebviewやThread StoreへSecretStorageを公開しない。
+
+#### テストと完了条件
+
+単体テストではProviderごとの状態判定、保存・更新・削除、未知Provider、空入力、キャンセル、SecretStorage障害、同時操作の直列化を検証する。UIテストでは未設定・設定済み・利用不能・更新中・失敗の表示、キー本体非表示、二重操作抑止、削除確認、キーボード操作、`aria-live`通知を検証する。通信テストではpayloadにAPIキー本体・マスク値・長さが存在しないこと、Zod検証、相関ID、古い通知の無視を検証する。Command Paletteの統合テストではWebviewを開かずに設定・更新・削除が完了することを検証する。
+
+完了条件は、UIまたはCommand PaletteからProviderを選び、登録状態を確認し、APIキーを設定・更新・削除できること、かつ操作後もAPIキー本体が再表示されずSecretStorage以外へ保存・送信・記録されないことである。Provider APIの有効性確認は本UIの完了条件に含めない。
+
 ## 14.3 Webview通信
 
 Extension HostとWebviewの通信は、VS Code Webview APIの`postMessage`を搬送路とし、その上に本拡張専用のバージョン付きメッセージプロトコルを定義する。WebviewはUI状態の投影とユーザー操作を担当し、会話・Agent実行・権限・変更の正本はExtension Hostが保持する。
@@ -1910,6 +2446,15 @@ type UiToExtensionMessage =
       profile: Exclude<PermissionProfile, "autonomous">;
       expectedThreadRevision: number;
     }>
+  | MessageEnvelope<"request-provider-credentials", {
+      providerId?: string;
+    }>
+  | MessageEnvelope<"set-provider-credential", {
+      providerId: string;
+    }>
+  | MessageEnvelope<"delete-provider-credential", {
+      providerId: string;
+    }>
   | MessageEnvelope<"request-thread-snapshot", {
       threadId: string;
     }>;
@@ -1960,6 +2505,14 @@ type ExtensionToUiMessage =
   | MessageEnvelope<"permission-updated", {
       summary: PermissionSummary;
     }>
+  | MessageEnvelope<"provider-credentials", {
+      providers: readonly ProviderCredentialSummary[];
+    }>
+  | MessageEnvelope<"provider-credential-operation", {
+      providerId: string;
+      operation: "set" | "delete";
+      status: "succeeded" | "cancelled" | "failed";
+    }>
   | MessageEnvelope<"protocol-error", {
       code: "UNSUPPORTED_VERSION" | "INVALID_MESSAGE" | "MESSAGE_TOO_LARGE";
       message: string;
@@ -1991,6 +2544,9 @@ const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
   discardChangeSetSchema,
   selectModelSchema,
   setPermissionSchema,
+  requestProviderCredentialsSchema,
+  setProviderCredentialSchema,
+  deleteProviderCredentialSchema,
   requestThreadSnapshotSchema,
 ]);
 
@@ -2584,6 +3140,10 @@ interface AgentError {
 ### 19.1 単体テスト
 
 * Model JSON Schema
+* Capabilitiesの設定値優先（モデル名・Provider名による推測が実行結果へ影響しないこと）
+* `false`・未指定・能力矛盾・Adapter非対応時の実効能力
+* Tool Calling、Streaming、Vision、Reasoningごとの機能無効化マトリクス
+* Run開始時のCapabilitiesスナップショット固定とCatalog revision更新
 * Provider設定マージ
 * コンテキスト優先順位
 * トークン予算配分
@@ -2674,6 +3234,7 @@ const scenario = [
 * Webview再表示時の一時UI状態復元
 * Model JSON
 * SecretStorage
+* Provider認証設定UI（Webview / Command Palette）
 * OpenAI互換Provider
 * ストリーミングチャット
 * スレッド保存
@@ -2683,6 +3244,7 @@ const scenario = [
 * BYOKキーで通常チャットが動作する
 * モデルをJSONで追加できる
 * APIキーが設定ファイルやログへ出ない
+* UIまたはCommand PaletteからProviderごとのAPIキーを設定・更新・削除できる
 
 ### Phase 2：読み取り専用エージェント
 

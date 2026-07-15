@@ -1,5 +1,30 @@
 import type { AgentErrorCode, ModelSummary } from "../webview-protocol";
 
+export interface ModelCatalogDiagnosticSummary {
+  readonly path: string;
+  readonly code: string;
+  readonly severity: "warning" | "error";
+  readonly message: string;
+}
+
+export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
+
+export const REASONING_EFFORT_OPTIONS: readonly [ReasoningEffort, string][] = [
+  ["none", "なし"],
+  ["low", "低"],
+  ["medium", "中"],
+  ["high", "高"],
+  ["xhigh", "非常に高い"],
+];
+
+/** Matches Copilot's default resolution for a model's supported effort levels. */
+export function getDefaultReasoningEffort(
+  efforts: readonly ReasoningEffort[],
+): ReasoningEffort | undefined {
+  if (efforts.length === 1) return efforts[0];
+  return efforts.includes("high") ? "high" : undefined;
+}
+
 export type ModelSelectorPhase = "loading" | "ready" | "selecting" | "error";
 
 export interface ModelSelectorState {
@@ -11,6 +36,7 @@ export interface ModelSelectorState {
   readonly pendingModelId?: string;
   readonly pendingRequestId?: string;
   readonly errorMessage?: string;
+  readonly diagnostics: readonly ModelCatalogDiagnosticSummary[];
 }
 
 export type ModelSelectorAction =
@@ -21,6 +47,7 @@ export type ModelSelectorAction =
       readonly threadRevision: number;
       readonly models: readonly ModelSummary[];
       readonly selectedModelId?: string;
+      readonly diagnostics?: readonly ModelCatalogDiagnosticSummary[];
     }
   | {
       readonly type: "selection-requested";
@@ -36,6 +63,7 @@ export type ModelSelectorAction =
 export const INITIAL_MODEL_SELECTOR_STATE: ModelSelectorState = {
   phase: "loading",
   models: [],
+  diagnostics: [],
 };
 
 export function createInitialModelSelectorState(threadId?: string): ModelSelectorState {
@@ -59,6 +87,7 @@ export function modelSelectorReducer(
         threadId: action.threadId,
         threadRevision: action.threadRevision,
         models: [],
+        diagnostics: [],
       };
     case "model-list":
       if (state.threadId !== undefined && state.threadId !== action.threadId) {
@@ -78,6 +107,7 @@ export function modelSelectorReducer(
         threadId: action.threadId,
         threadRevision: action.threadRevision,
         models: action.models,
+        diagnostics: action.diagnostics ?? [],
         ...(action.selectedModelId ? { selectedModelId: action.selectedModelId } : {}),
       };
     case "selection-requested":
@@ -123,7 +153,9 @@ export function getModelSelectorStatusLabel(state: ModelSelectorState): string {
       return "モデル一覧を読み込んでいます。";
     case "ready":
       return state.models.length > 0
-        ? `現在のモデル: ${getSelectedModelLabel(state)}`
+        ? (state.diagnostics ?? []).length > 0
+          ? `現在のモデル: ${getSelectedModelLabel(state)}（設定に警告があります）`
+          : `現在のモデル: ${getSelectedModelLabel(state)}`
         : "利用可能なモデルがありません。";
     case "selecting":
       return "モデルを変更しています。";

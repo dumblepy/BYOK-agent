@@ -7,6 +7,7 @@ import {
   type ExtensionToUiMessage,
   type ModelListPayload,
   type PermissionSummaryValue,
+  type ProviderCredentialSummary,
   type ThreadEvent,
   type UiToExtensionMessage,
 } from "./webview-protocol";
@@ -22,6 +23,9 @@ export interface ExtensionWebviewProtocolHandlers {
   readonly getPermissionSummary?: (
     threadId: string,
   ) => PermissionSummaryValue | Promise<PermissionSummaryValue>;
+  readonly getProviderCredentials?: (
+    providerId?: string,
+  ) => readonly ProviderCredentialSummary[] | Promise<readonly ProviderCredentialSummary[]>;
 }
 
 const MAX_SEEN_MESSAGE_IDS = 2_048;
@@ -171,6 +175,7 @@ export class ExtensionWebviewProtocolSession {
     );
     await this.sendModelList(threadId, correlationId);
     await this.sendPermissionUpdated(threadId, correlationId);
+    await this.sendProviderCredentials(undefined, correlationId);
   }
 
   public async sendModelList(threadId: string, correlationId?: string): Promise<void> {
@@ -197,6 +202,17 @@ export class ExtensionWebviewProtocolSession {
       createExtensionToUiMessage(
         "permission-updated",
         { summary: { ...summary, restrictions: [...summary.restrictions] } },
+        correlationId ? { correlationId } : {},
+      ),
+    );
+  }
+
+  public async sendProviderCredentials(providerId?: string, correlationId?: string): Promise<void> {
+    const providers = (await this.handlers.getProviderCredentials?.(providerId)) ?? [];
+    await this.sendToUi(
+      createExtensionToUiMessage(
+        "provider-credentials",
+        { providers: [...providers] },
         correlationId ? { correlationId } : {},
       ),
     );
