@@ -2,10 +2,26 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://byok-agent.dev/schemas/model-config.schema.json",
   "title": "BYOK Agent model configuration",
-  "type": "array",
-  "minItems": 1,
-  "items": { "$ref": "#/$defs/provider" },
+  "$ref": "#/$defs/document",
   "$defs": {
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["providers"],
+      "properties": {
+        "providers": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/provider" }
+        },
+        "defaultModelId": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._-]*$",
+          "minLength": 1,
+          "maxLength": 128
+        }
+      }
+    },
     "provider": {
       "type": "object",
       "additionalProperties": false,

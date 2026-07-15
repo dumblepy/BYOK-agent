@@ -27,7 +27,7 @@ export interface ModelConfigModel {
   toolCalling: boolean;
   vision: boolean;
   thinking?: boolean;
-  supportsReasoningEffort?: ReasoningEffort[];
+  supportsReasoningEffort?: readonly ReasoningEffort[];
   maxInputTokens: number;
   maxOutputTokens: number;
   agent?: AgentSettings;
@@ -43,6 +43,18 @@ export interface ModelConfigProvider {
 }
 
 export type ModelConfig = ModelConfigProvider[];
+
+export interface ModelConfigDocument {
+  readonly providers: ModelConfigProvider[];
+  readonly defaultModelId?: string;
+}
+
+export interface ModelCapabilities {
+  toolCalling: boolean;
+  vision: boolean;
+  thinking?: boolean;
+  supportsReasoningEffort?: readonly ReasoningEffort[];
+}
 
 export type ModelConfigIssueCode =
   | "CONFIG_INVALID_JSON"
@@ -228,7 +240,7 @@ function semanticIssues(config: ModelConfig): ModelConfigValidationIssue[] {
     if (providerNames.has(provider.name)) {
       issues.push({
         code: "CONFIG_SEMANTIC_INVALID",
-        path: `/${providerIndex}/name`,
+        path: `/providers/${providerIndex}/name`,
         message: "Provider名が重複しています。",
         expected: "unique provider name",
         actual: provider.name,
@@ -236,10 +248,10 @@ function semanticIssues(config: ModelConfig): ModelConfigValidationIssue[] {
     }
     providerNames.add(provider.name);
     if (provider.headers !== undefined) {
-      issues.push(...headerIssues(provider.headers, `/${providerIndex}/headers`));
+      issues.push(...headerIssues(provider.headers, `/providers/${providerIndex}/headers`));
     }
     provider.models.forEach((model, modelIndex) => {
-      const path = `/${providerIndex}/models/${modelIndex}`;
+      const path = `/providers/${providerIndex}/models/${modelIndex}`;
       if (modelIds.has(model.id)) {
         issues.push({
           code: "CONFIG_SEMANTIC_INVALID",
@@ -279,14 +291,14 @@ function workspaceIssues(config: ModelConfig): ModelConfigValidationIssue[] {
     if (provider.apiKey !== undefined) {
       issues.push({
         code: "CONFIG_WORKSPACE_POLICY_VIOLATION",
-        path: `/${providerIndex}/apiKey`,
+        path: `/providers/${providerIndex}/apiKey`,
         message: "ワークスペース設定からSecret参照を変更できません。",
       });
     }
     provider.models.forEach((model, modelIndex) => {
       issues.push({
         code: "CONFIG_WORKSPACE_POLICY_VIOLATION",
-        path: `/${providerIndex}/models/${modelIndex}/url`,
+        path: `/providers/${providerIndex}/models/${modelIndex}/url`,
         message: "ワークスペース設定からProvider URLを変更できません。",
       });
     });
@@ -328,7 +340,7 @@ export function validateModelConfig(
     const issues = (validate.errors ?? []).map((error) => issueFromAjv(error, value));
     return { valid: false, issues };
   }
-  const config = value as ModelConfig;
+  const config = (value as ModelConfigDocument).providers;
   const issues = [
     ...semanticIssues(config),
     ...(scope === "workspace" ? workspaceIssues(config) : []),

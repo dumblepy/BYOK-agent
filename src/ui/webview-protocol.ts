@@ -166,6 +166,21 @@ const modelSummarySchema = z
     provider: identifierSchema,
   })
   .strict();
+const modelCatalogDiagnosticSchema = z
+  .object({
+    path: z.string().min(1).max(512),
+    code: z.enum([
+      "MODEL_DUPLICATE_ID",
+      "MODEL_PROVIDER_NOT_FOUND",
+      "MODEL_ADAPTER_UNSUPPORTED",
+      "MODEL_SECRET_UNAVAILABLE",
+      "MODEL_NOT_AVAILABLE",
+      "MODEL_DEFAULT_INVALID",
+    ]),
+    severity: z.enum(["warning", "error"]),
+    message: z.string().min(1).max(1_000),
+  })
+  .strict();
 
 export const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
   messageSchema(
@@ -326,6 +341,7 @@ export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
         threadRevision: z.number().int().nonnegative(),
         models: z.array(modelSummarySchema).max(256),
         selectedModelId: identifierSchema.optional(),
+        diagnostics: z.array(modelCatalogDiagnosticSchema).max(256).optional(),
       })
       .strict(),
   ),

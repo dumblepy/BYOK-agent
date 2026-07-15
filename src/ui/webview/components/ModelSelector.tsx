@@ -177,6 +177,13 @@ export function ModelSelector({
       <p id="model-selector-status" class="model-selector-status" aria-live="polite">
         {statusLabel}
       </p>
+      {(state.diagnostics ?? []).length > 0 ? (
+        <div class="model-selector-diagnostics" role="status" aria-live="polite">
+          {(state.diagnostics ?? []).map((diagnostic) => (
+            <p key={`${diagnostic.code}:${diagnostic.path}`}>{diagnostic.message}</p>
+          ))}
+        </div>
+      ) : null}
       {state.errorMessage ? (
         <p id="model-selector-error" class="model-selector-error" role="alert">
           {state.errorMessage}

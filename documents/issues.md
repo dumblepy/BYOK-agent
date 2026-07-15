@@ -117,7 +117,7 @@
 
 - [Models] Model Catalogを実装する
 
-  - モデルIDからProvider、APIモデル名、能力を解決する
+  - モデルIDからProvider、能力を解決する（Provider APIへは同じモデルIDを渡す）
   - 既定モデルを管理する
   - 無効なモデル設定をUIへ通知する
   - 完了条件: モデル選択から実際のProvider設定を取得できる

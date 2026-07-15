@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 
 import { AgentWebviewProvider } from "./agent-webview-provider";
 import type { AgentRunRequest } from "../agent/agent-service";
-import { StaticModelCatalog } from "../models/model-catalog";
+import { StaticModelCatalog, type ModelCatalog } from "../models/model-catalog";
 import {
   DisposableStore,
   ManagedService,
@@ -24,6 +24,7 @@ export interface UIServiceDependencies {
   readonly context: vscode.ExtensionContext;
   readonly agent: AgentService;
   readonly storage: StorageService;
+  readonly modelCatalog?: ModelCatalog;
   readonly registerWebviewViewProvider: (
     viewId: string,
     provider: vscode.WebviewViewProvider,
@@ -43,7 +44,7 @@ export class DefaultUIService extends ManagedService implements UIService {
 
   protected override onInitialize(): void {
     const provider = new AgentWebviewProvider(this.dependencies.context, {
-      modelCatalog: new StaticModelCatalog(),
+      modelCatalog: this.dependencies.modelCatalog ?? new StaticModelCatalog(),
       threadModelStore: this.dependencies.storage,
       isThreadRunActive: (threadId) => this.dependencies.agent.hasActiveRun(threadId),
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,

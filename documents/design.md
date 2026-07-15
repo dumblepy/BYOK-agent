@@ -337,12 +337,13 @@ tests/
 
 ## 5.1 設定ファイル
 
-ユーザー設定は次の優先順位で読み込む。
+モデル設定はユーザー共通設定ファイルだけから読み込む。
 
-1. VS Code User Settings
-2. ユーザー共通設定ファイル
-3. ワークスペース設定ファイル
-4. 組み込みデフォルト
+```text
+~/.byok-agent/models.json
+```
+
+`resources/default-models.json`は、`models.json`が存在しない初回起動時の生成テンプレートとしてだけ使用する。VS Code User Settingsやワークスペース設定からモデル定義を読み込まない。
 
 推奨ファイル名：
 
@@ -359,18 +360,7 @@ tests/
 
 #### 設定ソースと優先順位
 
-次の順に低優先から読み込み、後のソースを高優先として統合する。
-
-1. 組み込みデフォルト（`resources/default-models.json`）
-2. ユーザー共通設定（`~/.byok-agent/models.json`）
-3. ワークスペース設定（`<workspace>/.vscode/byok-agent.models.json`）
-4. VS Code User Settingsの`byokAgent.models`設定
-
-したがって優先順位は次のとおりである。
-
-```text
-VS Code User Settings > ユーザー共通モデル設定 > ワークスペースモデル設定 > 組み込みデフォルト
-```
+実行時は`~/.byok-agent/models.json`だけを読み込む。ファイルが存在しない場合だけ、組み込みテンプレートをコピーしてから読み込む。
 
 存在しない任意ソースは空設定として扱う。読み込み対象のパスは固定の解決規則で決定し、ワークスペース設定から任意のファイルパスを追加指定できない。
 
@@ -461,7 +451,8 @@ Trust状態が変更された場合は、設定ファイルの変更がなくて
 ## 5.2 JSON例
 
 ```json
-[
+{
+  "providers": [
   {
     "name": "OpenRouter",
     "vendor": "customendpoint",
@@ -501,16 +492,17 @@ Trust状態が変更された場合は、設定ファイルの変更がなくて
       }
     ]
   }
-]
+  ]
+}
 ```
 
 ### 5.2.1 モデル設定JSON Schemaの設計
 
-モデル設定ファイルは、提示されたCopilot系のモデル設定と同じく、ルートをProvider配列とし、Providerの中にModel配列を持つ構造にする。Provider固有の接続設定とModel固有の能力・Token上限を分離し、Modelの選択やAgent実行設定はModel IDを基準に解決する。Copilot固有の認証実装やサービスエンドポイントは流用しない。
+モデル設定ファイルは、ルートに`providers`を持つドキュメントオブジェクトとし、Providerの中にModel配列を持つ構造にする。Provider固有の接続設定とModel固有の能力・Token上限を分離し、Modelの選択やAgent実行設定はModel IDを基準に解決する。Copilot固有の認証実装やサービスエンドポイントは流用しない。入力形式はドキュメントオブジェクトに限定する。
 
 この構造上の互換性と、プロジェクト固有の意味を分離する。
 
-- ルートは`type: "array"`、ProviderとModelは`type: "object"`で定義し、設定項目を`properties`に列挙する。
+- ルートは`type: "object"`、必須の`providers`はProvider配列、ProviderとModelは`type: "object"`で定義し、設定項目を`properties`に列挙する。`defaultModelId`は任意の既定モデル指定である。ルート配列は許可しない。
 - Providerの識別子は`name`、Modelの識別子はModelオブジェクトの`id`を正本とする。IDはModel Catalogの解決とエラー表示に利用する。
 - 各オブジェクトは`additionalProperties: false`を基本とし、未知のキーを黙って無視しない。将来の拡張はSchemaのversion更新と明示的な移行で行う。
 - 配列は空を許可しない。Provider名とModel IDの重複、Model間のURL不整合はJSON Schema検証後の意味検証で確認する。
@@ -519,7 +511,9 @@ Trust状態が変更された場合は、設定ファイルの変更がなくて
 #### Schemaのトップレベル契約
 
 ```text
-ModelConfig = Provider[]
+ModelConfigDocument
+├─ providers: Provider[]
+└─ defaultModelId?: string
 Provider
 ├─ name: string
 ├─ vendor: string
@@ -669,6 +663,129 @@ interface ModelCapabilities {
 VS CodeのLanguage Model Chat Provider APIも、一つのプロバイダーから複数モデルを公開し、コンテキスト長、出力長、画像入力、Tool Callingなどのメタデータを提供する構造を採用している。
 
 ただし、本拡張の中核はVS CodeのLanguage Model APIに依存させない。管理者ポリシーやAPI変更の影響を避け、BYOK通信を直接制御するためである。
+
+### 5.5 Model Catalog
+
+#### 5.5.1 目的と責務境界
+
+`ModelCatalog`は、`ModelConfigLoader`が公開した検証済み設定スナップショットを、実行可能なモデルの解決結果へ変換するExtension Host側のレジストリである。UIやThread Storeは論理的な`modelId`だけを保持し、Provider URL、SecretStorage、APIキー、任意ヘッダーを直接参照しない。
+
+Model Catalogの責務は次のとおりとする。
+
+* 論理モデルIDを一意に解決する
+* Provider Adapterの識別子とProviderの接続設定を解決する
+* APIへ送るモデル名としてModelの`id`をProviderリクエストへ渡す
+* JSONで定義されたCapabilitiesとAgent設定を解決する
+* 既定モデルを決定し、利用可能モデル一覧を決定的な順序で返す
+* 無効設定、重複、参照不能、Secret未設定を利用可能一覧から除外する
+* 設定変更時に新しい不変スナップショットを原子的に公開する
+
+次の責務は持たない。
+
+* Provider APIへの接続、モデル一覧のリモート取得、リトライ
+* APIキーの入力、保存、Webviewへの返却
+* Toolの実行、権限判定、Agent Loopの判断
+* モデル名やProvider名からのCapabilitiesの推測
+
+#### 5.5.2 識別子と解決モデル
+
+設定上の`id`はUI・Thread Storeが扱う論理モデルIDであり、Provider APIのリクエストへ渡すモデル名も同じ`id`を使用する。論理IDとAPIモデル名を別フィールドへ分離しない。
+
+Providerの識別子は設定の`name`とし、Adapter選択には`apiType`を使う。接続先URL、Secret参照、許可済みヘッダーはProvider設定として解決結果に含めるが、Webview向けの`ModelSummary`には含めない。
+
+```ts
+interface ModelDefinition {
+  readonly id: string;
+  readonly label: string;
+  readonly provider: {
+    readonly id: string;
+    readonly vendor: string;
+    readonly apiType: "chat-completions" | "responses" | "messages";
+    readonly url: string;
+    readonly secretRef?: string;
+    readonly headers: Readonly<Record<string, string>>;
+  };
+  readonly capabilities: ModelCapabilities;
+  readonly agent: ResolvedAgentSettings;
+}
+
+interface ModelCatalog {
+  list(): readonly ModelDefinition[];
+  listAvailable(): readonly ModelDefinition[];
+  resolve(modelId: string): ModelDefinition | undefined;
+  getDefault(): ModelDefinition | undefined;
+  diagnostics(): readonly ModelCatalogDiagnostic[];
+}
+```
+
+Catalogが外部へ返す`ModelDefinition`は、Secretの実値ではなくSecret参照の検証済み識別子だけを保持する。Provider Adapterへ渡す直前にSecretStorageから解決し、ログ・UI・保存データへ逆流させない。
+
+#### 5.5.3 Catalog構築と利用可能性
+
+設定スナップショットのProviderを入力順に走査し、Provider内の各Modelを正規化してCatalogを構築する。次の条件をすべて満たすものだけを利用可能とする。
+
+1. ProviderとModelの必須項目、Model ID、URL、Capabilities、Agent設定が検証済みである。
+2. 論理モデルIDがCatalog全体で一意である。
+3. Providerの`apiType`に対応するAdapterがRegistryに存在する。
+4. 必要なSecret参照が定義され、SecretStorageから利用可能である。
+5. Provider URLがネットワーク安全規則を満たし、解決結果のヘッダーがポリシー検証済みである。
+
+一つのModelが不正でも、同一ソース全体を無効化するLoaderの規則を優先する。Catalog構築後に利用不能となった項目は診断対象として保持するが、実行可能一覧や既定モデルには含めない。表示順は`label`、同名時はProvider ID、最後に論理IDの昇順で固定する。
+
+#### 5.5.4 既定モデルの管理
+
+既定モデルは、ユーザーが明示選択していない新規Threadで使用するモデルである。解決優先順位は次のとおりとする。
+
+1. User Settingsで指定された`defaultModelId`
+2. ユーザー共通設定で指定された`defaultModelId`
+3. 組み込みデフォルトの`defaultModelId`
+4. 既定値指定がない場合の、利用可能一覧の先頭
+
+ワークスペース設定は、ユーザーのSecretや送信先を間接的に切り替え得るため、既定モデルの変更権限を持たせない。ワークスペースで定義されたモデルを一覧へ表示することと、既定モデルに昇格させることを分離する。指定された既定モデルが存在しない、重複する、または利用不能な場合は自動的に別モデルへ黙って切り替えず、診断を出したうえで安全な未選択状態とする。ただし初回起動時に組み込みデフォルト以外がない場合の先頭フォールバックは許可する。
+
+Threadに保存された`modelId`は既定モデルより優先する。保存値を解決できない場合はRunを開始せず、UIへモデル再選択を要求する。既定モデルはThreadの保存値を上書きしない。
+
+#### 5.5.5 無効設定の診断とUI通知
+
+設定不備は例外文字列ではなく、Catalogのrevisionに紐づく構造化診断として扱う。
+
+```ts
+interface ModelCatalogDiagnostic {
+  readonly source: "builtin" | "user-file" | "workspace-file" | "user-settings";
+  readonly path: string;
+  readonly code:
+    | "MODEL_DUPLICATE_ID"
+    | "MODEL_PROVIDER_NOT_FOUND"
+    | "MODEL_ADAPTER_UNSUPPORTED"
+    | "MODEL_SECRET_UNAVAILABLE"
+    | "MODEL_NOT_AVAILABLE"
+    | "MODEL_DEFAULT_INVALID";
+  readonly severity: "warning" | "error";
+  readonly userMessage: string;
+}
+```
+
+UIへは診断コード、表示可能なモデルラベルまたはProvider名、設定ソースの安全な種別、修正の案内だけを送る。Secret値、Secret ID、Authorization値、URL全体、ヘッダー値、設定JSON全文は送らない。`model-list`には利用可能モデルだけを含め、無効なモデルは`diagnostics`通知で別に伝える。無効化後も直前の有効Catalogを使い続け、初回ロードに有効なCatalogがない場合は選択・送信を無効化する。
+
+#### 5.5.6 更新と一貫性
+
+Loaderが新しい検証済みスナップショットを公開すると、Catalogは全エントリ、既定モデル、診断、revisionを一度に再構築する。構築途中の一覧をUIやAgentへ公開しない。実行開始時にはThread Storeから取得した`modelId`を同一revisionで解決し、Run中は解決済み`ModelDefinition`を固定する。設定変更によって次回Runの解決結果が変わっても、実行中のProvider設定を途中で差し替えない。
+
+モデル選択の`modelId`はHostでCatalogに対して再検証する。Webviewから送られたIDをそのままProviderへ渡さず、Catalogで解決できない場合は保存せず、安全なエラーと最新一覧を返す。これにより、UIが古い一覧を保持していても実行経路が未知モデルへ到達しない。
+
+#### 5.5.7 実装単位とテスト方針
+
+実装時は次の単位へ分割する。
+
+* `src/models/model-catalog.ts`: 正規化済み設定からの構築、解決、一覧、既定値、診断
+* `src/models/model-config-loader.ts`: 設定ソースの読み込み、検証、マージ、スナップショット公開
+* `src/models/model-types.ts`: `ModelDefinition`、Capabilities、Agent設定、診断の共有型
+* Extension HostのUIルーター: Catalogの一覧・診断をWebview契約へ変換
+* Agent Service: Threadの`modelId`をCatalogで解決し、Run要求へ渡す
+
+単体テストでは、Model IDのProvider／Adapter解決、能力値の保持、重複ID、Provider不在、未設定Secret、無効既定値、優先順位、決定的な一覧順を検証する。統合テストでは、モデル選択成功後の次回`send-message`がHost側Thread StoreのIDから実際のProvider設定を取得すること、設定再読み込み中に中間状態が公開されないこと、無効設定がUIへ安全な診断として届くことを検証する。実APIは呼ばず、Provider RegistryとSecretStorageをFakeで差し替える。
+
+完了条件は、モデル選択で得たModel IDから、Host内で一意な`ModelDefinition`を解決し、その`provider.apiType`、接続設定、Model ID、Capabilitiesを使って対象Provider Adapterへ渡せることである。
 
 ---
 

@@ -22,6 +22,7 @@ export interface ModelConfigLoaderOptions {
   readonly userCommonPath?: string;
   readonly workspacePath?: string;
   readonly userSettings?: () => unknown;
+  readonly includeBuiltinDefault?: boolean;
   readonly workspaceTrusted?: boolean | (() => boolean);
   readonly debounceMs?: number;
   readonly onDidChange?: (snapshot: ModelConfigSnapshot) => void;
@@ -31,6 +32,7 @@ export interface ModelConfigLoaderOptions {
 export interface ModelConfigSnapshot {
   readonly revision: number;
   readonly config: ModelConfig;
+  readonly defaultModelId?: string;
   readonly sources: readonly ModelConfigSourceKind[];
 }
 
@@ -52,6 +54,28 @@ const SOURCE_ORDER: readonly ModelConfigSourceKind[] = [
 ];
 
 const DEFAULT_BUILTIN_PATH = resolve(__dirname, "../../resources/default-models.json");
+const DEFAULT_FALLBACK_CONFIG = `{
+  "providers": [
+    {
+      "name": "OpenAI",
+      "vendor": "openai",
+      "apiType": "responses",
+      "models": [
+        {
+          "id": "coding-primary",
+          "name": "Coding Primary",
+          "url": "https://api.openai.com/v1/responses",
+          "toolCalling": true,
+          "vision": true,
+          "maxInputTokens": 128000,
+          "maxOutputTokens": 16384
+        }
+      ]
+    }
+  ],
+  "defaultModelId": "coding-primary"
+}
+`;
 
 export function defaultUserCommonPath(): string {
   return join(homedir(), ".byok-agent", "models.json");
@@ -89,7 +113,7 @@ export class ModelConfigLoader {
       await fs.copyFile(this.options.defaultPath ?? DEFAULT_BUILTIN_PATH, path);
     } catch (error) {
       if (!isMissingFileError(error)) throw error;
-      await fs.writeFile(path, "[]\n", { encoding: "utf8", flag: "wx" });
+      await fs.writeFile(path, DEFAULT_FALLBACK_CONFIG, { encoding: "utf8", flag: "wx" });
     }
     return true;
   }
@@ -98,36 +122,54 @@ export class ModelConfigLoader {
     this.assertActive();
     const sources = await this.readSources();
     const merged: unknown[] = [];
+    let defaultModelId: string | undefined;
+    let invalidSourceFound = false;
 
     for (const source of sources) {
       if (source.value === undefined) continue;
       const sourceResult = this.validateSource(source);
       if (!sourceResult.valid) {
         this.report({ source: source.kind, path: source.path, issues: sourceResult.issues });
-        return this.snapshot;
+        invalidSourceFound = true;
+        continue;
+      }
+
+      if (isRecord(source.value) && typeof source.value.defaultModelId === "string") {
+        defaultModelId = source.value.defaultModelId;
       }
 
       if (source.kind === "workspace") {
-        const policyIssues = this.workspacePolicyIssues(source.value, merged);
+        const policyIssues = this.workspacePolicyIssues(
+          isRecord(source.value) ? source.value.providers : undefined,
+          merged,
+        );
         if (policyIssues.length > 0) {
           this.report({ source: source.kind, path: source.path, issues: policyIssues });
-          return this.snapshot;
+          invalidSourceFound = true;
+          continue;
         }
       }
 
-      merged.splice(0, merged.length, ...mergeProviderArrays(merged, source.value));
+      merged.splice(
+        0,
+        merged.length,
+        ...mergeProviderArrays(merged, isRecord(source.value) ? source.value.providers : undefined),
+      );
     }
 
-    const result = validateModelConfig(merged, "default");
+    const result = validateModelConfig({ providers: merged }, "default");
     if (!result.valid || !result.config) {
       const source = sources.at(-1);
       this.report({ source: source?.kind ?? "default", path: source?.path, issues: result.issues });
       return this.snapshot;
     }
 
+    if (invalidSourceFound && this.snapshot) return this.snapshot;
+
     const next: ModelConfigSnapshot = {
       revision: ++this.revision,
       config: deepFreeze(result.config),
+      ...(defaultModelId ? { defaultModelId } : {}),
       sources: sources.filter((source) => source.value !== undefined).map((source) => source.kind),
     };
     this.snapshot = next;
@@ -180,6 +222,7 @@ export class ModelConfigLoader {
     };
     const sources: ModelConfigSource[] = [];
     for (const kind of SOURCE_ORDER) {
+      if (kind === "default" && this.options.includeBuiltinDefault === false) continue;
       const source = configured[kind];
       if (source.value !== undefined) {
         sources.push(source);
@@ -351,12 +394,13 @@ function mergeValue(base: unknown, overlay: unknown): unknown {
 }
 
 function validateOverlay(value: unknown): ModelConfigValidationIssue[] {
-  if (!Array.isArray(value) || value.length === 0) {
+  const providers = isRecord(value) ? value.providers : undefined;
+  if (!Array.isArray(providers) || providers.length === 0) {
     return [
       {
         code: "CONFIG_SCHEMA_INVALID",
-        path: "/",
-        message: "設定ソースはProvider配列でなければなりません。",
+        path: "/providers",
+        message: "設定ソースはproviders配列を持つオブジェクトでなければなりません。",
       },
     ];
   }

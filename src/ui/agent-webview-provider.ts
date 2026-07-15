@@ -322,7 +322,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     const models = (this.modelCatalog?.listAvailable() ?? []).map(({ id, label, provider }) => ({
       id,
       label,
-      provider,
+      provider: provider.id,
     }));
     const state = this.threadModelStore
       ? await this.threadModelStore.getThreadModelState(threadId)
@@ -330,10 +330,28 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     let resolvedState = state;
 
     if (this.threadModelStore && models.length > 0 && state.modelId === undefined) {
+      const defaultModel = this.modelCatalog?.getDefault();
+      if (!defaultModel) {
+        return {
+          threadId,
+          threadRevision: state.revision,
+          models,
+          ...(this.modelCatalog && this.modelCatalog.diagnostics().length > 0
+            ? {
+                diagnostics: this.modelCatalog.diagnostics().map((diagnostic) => ({
+                  path: diagnostic.path,
+                  code: diagnostic.code,
+                  severity: diagnostic.severity,
+                  message: diagnostic.userMessage,
+                })),
+              }
+            : {}),
+        };
+      }
       resolvedState = await this.threadModelStore.updateThreadModel(
         threadId,
         state.revision,
-        models[0].id,
+        defaultModel.id,
       );
     }
 
@@ -345,6 +363,16 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       threadId,
       threadRevision: resolvedState.revision,
       models,
+      ...(this.modelCatalog && this.modelCatalog.diagnostics().length > 0
+        ? {
+            diagnostics: this.modelCatalog.diagnostics().map((diagnostic) => ({
+              path: diagnostic.path,
+              code: diagnostic.code,
+              severity: diagnostic.severity,
+              message: diagnostic.userMessage,
+            })),
+          }
+        : {}),
       ...(selectedModelId ? { selectedModelId } : {}),
     };
   }

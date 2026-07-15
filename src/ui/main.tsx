@@ -107,6 +107,7 @@ function App() {
               threadId: message.payload.threadId,
               threadRevision: message.payload.threadRevision,
               models: message.payload.models,
+              diagnostics: message.payload.diagnostics,
               ...(message.payload.selectedModelId
                 ? { selectedModelId: message.payload.selectedModelId }
                 : {}),

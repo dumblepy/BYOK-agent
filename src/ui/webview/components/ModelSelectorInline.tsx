@@ -173,6 +173,14 @@ export function ModelSelectorInline({
           </div>
         </div>
       ) : null}
+
+      {(state.diagnostics ?? []).length > 0 ? (
+        <div class="model-selector-inline-diagnostics" role="status" aria-live="polite">
+          {(state.diagnostics ?? []).map((diagnostic) => (
+            <p key={`${diagnostic.code}:${diagnostic.path}`}>{diagnostic.message}</p>
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
