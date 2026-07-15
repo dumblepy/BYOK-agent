@@ -8,7 +8,6 @@ const config: ModelConfig = [
     name: "OpenAI",
     vendor: "openai",
     apiType: "responses",
-    apiKey: "secret://openai",
     headers: { "X-Client-Version": "1" },
     models: [
       {
@@ -28,8 +27,33 @@ const config: ModelConfig = [
 ];
 
 describe("ConfiguredModelCatalog", () => {
+  it("Open Router設定のモデルを利用可能一覧へ含める", () => {
+    const catalog = new ConfiguredModelCatalog([
+      {
+        name: "Open Router",
+        vendor: "openrouter",
+        apiType: "responses",
+        models: [
+          {
+            id: "gpt-5.4-nano",
+            name: "GPT-5.4 Nano(0.16)",
+            url: "https://openrouter.ai/api/v1/chat/completions",
+            toolCalling: true,
+            vision: false,
+            thinking: true,
+            supportsReasoningEffort: ["none", "low", "medium", "high", "xhigh"],
+            maxInputTokens: 400000,
+            maxOutputTokens: 128000,
+          },
+        ],
+      },
+    ]);
+
+    expect(catalog.listAvailable().map((model) => model.id)).toEqual(["gpt-5.4-nano"]);
+  });
+
   it("モデルIDからProvider設定と能力を解決する", () => {
-    const catalog = new ConfiguredModelCatalog(config, { hasSecret: () => true });
+    const catalog = new ConfiguredModelCatalog(config);
     const model = catalog.resolve("logical-coding");
 
     expect(model).toMatchObject({
@@ -38,7 +62,6 @@ describe("ConfiguredModelCatalog", () => {
         id: "OpenAI",
         apiType: "responses",
         url: "https://api.openai.com/v1/responses",
-        secretRef: "secret://openai",
       },
       capabilities: { toolCalling: true, vision: true, thinking: true },
       agent: { maxIterations: 8, toolProfile: "workspace" },
@@ -46,20 +69,9 @@ describe("ConfiguredModelCatalog", () => {
     expect(model?.provider.headers).toEqual({ "X-Client-Version": "1" });
   });
 
-  it("Secretが利用できないモデルを一覧と既定値から除外する", () => {
-    const catalog = new ConfiguredModelCatalog(config, { hasSecret: () => false });
-
-    expect(catalog.listAvailable()).toHaveLength(0);
-    expect(catalog.getDefault()).toBeUndefined();
-    expect(catalog.diagnostics()).toContainEqual(
-      expect.objectContaining({ code: "MODEL_SECRET_UNAVAILABLE" }),
-    );
-  });
-
   it("明示した既定モデルを優先し、無効な既定値は自動補正しない", () => {
     const catalog = new ConfiguredModelCatalog(config, {
       defaultModelId: "missing-model",
-      hasSecret: () => true,
     });
 
     expect(catalog.getDefault()).toBeUndefined();
@@ -70,7 +82,7 @@ describe("ConfiguredModelCatalog", () => {
 
   it("重複IDを実行可能一覧へ含めない", () => {
     const duplicate = [...config, { ...config[0], models: [{ ...config[0].models[0] }] }];
-    const catalog = new ConfiguredModelCatalog(duplicate, { hasSecret: () => true });
+    const catalog = new ConfiguredModelCatalog(duplicate);
 
     expect(catalog.listAvailable()).toHaveLength(1);
     expect(catalog.diagnostics()).toContainEqual(

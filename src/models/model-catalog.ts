@@ -43,7 +43,6 @@ export interface ResolvedProviderSettings {
   readonly vendor: string;
   readonly apiType: ApiType;
   readonly url: string;
-  readonly secretRef?: string;
   readonly headers: Readonly<Record<string, string>>;
 }
 
@@ -90,7 +89,6 @@ export interface ModelCatalog {
 
 export interface ConfiguredModelCatalogOptions {
   readonly supportedApiTypes?: readonly ApiType[];
-  readonly hasSecret?: (secretRef: string) => boolean;
   readonly defaultModelId?: string;
   readonly adapterCapabilities?: Partial<Record<CapabilityName, boolean>>;
 }
@@ -207,17 +205,6 @@ export class ConfiguredModelCatalog implements ModelCatalog {
       );
       return undefined;
     }
-    if (provider.apiKey && this.options.hasSecret && !this.options.hasSecret(provider.apiKey)) {
-      diagnostics.push(
-        diagnostic(
-          `${path}/apiKey`,
-          "MODEL_SECRET_UNAVAILABLE",
-          "ProviderのSecretを利用できません。",
-        ),
-      );
-      return undefined;
-    }
-
     const capabilityResolution = createCapabilities(
       model,
       this.options.adapterCapabilities,
@@ -252,7 +239,6 @@ export class ConfiguredModelCatalog implements ModelCatalog {
         vendor: provider.vendor,
         apiType: provider.apiType,
         url: model.url,
-        ...(provider.apiKey ? { secretRef: provider.apiKey } : {}),
         headers: Object.freeze({ ...(provider.headers ?? {}) }),
       }),
       capabilities: capabilityResolution.configured,

@@ -366,11 +366,17 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
             : {}),
         };
       }
-      resolvedState = await this.threadModelStore.updateThreadModel(
-        threadId,
-        state.revision,
-        defaultModel.id,
-      );
+      try {
+        resolvedState = await this.threadModelStore.updateThreadModel(
+          threadId,
+          state.revision,
+          defaultModel.id,
+        );
+      } catch {
+        // A storage failure must not hide an otherwise valid model list from the UI.
+        // The explicit selection can be retried after the storage problem is resolved.
+        resolvedState = state;
+      }
     }
 
     const selectedModelId =

@@ -7,6 +7,24 @@ export interface ModelCatalogDiagnosticSummary {
   readonly message: string;
 }
 
+export type ReasoningEffort = "none" | "low" | "medium" | "high" | "xhigh";
+
+export const REASONING_EFFORT_OPTIONS: readonly [ReasoningEffort, string][] = [
+  ["none", "なし"],
+  ["low", "低"],
+  ["medium", "中"],
+  ["high", "高"],
+  ["xhigh", "非常に高い"],
+];
+
+/** Matches Copilot's default resolution for a model's supported effort levels. */
+export function getDefaultReasoningEffort(
+  efforts: readonly ReasoningEffort[],
+): ReasoningEffort | undefined {
+  if (efforts.length === 1) return efforts[0];
+  return efforts.includes("high") ? "high" : undefined;
+}
+
 export type ModelSelectorPhase = "loading" | "ready" | "selecting" | "error";
 
 export interface ModelSelectorState {

@@ -20,6 +20,16 @@
   ],
   "main": "./out/extension/extension.js",
   "contributes": {
+    "commands": [
+      {
+        "command": "byokAgent.setApiKey",
+        "title": "BYOK Agent: Set API Key"
+      },
+      {
+        "command": "byokAgent.deleteApiKey",
+        "title": "BYOK Agent: Delete API Key"
+      }
+    ],
     "viewsContainers": {
       "activitybar": [
         {

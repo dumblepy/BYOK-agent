@@ -1,13 +1,18 @@
 import type { SecretStorage } from "vscode";
 
 import { DisposableStore, ManagedService } from "../extension/service-lifecycle";
+import { ExtensionSecretStore, type SecretStore } from "./secret-store";
 
 export interface ProviderService extends ManagedService {
   readonly serviceName: "provider";
+  getApiKey(providerId: string): Promise<string | undefined>;
+  setApiKey(providerId: string, value: string): Promise<void>;
+  deleteApiKey(providerId: string): Promise<void>;
 }
 
 export interface ProviderServiceDependencies {
   readonly secretStorage: SecretStorage;
+  readonly secretStore?: SecretStore;
 }
 
 interface ActiveRequest {
@@ -22,13 +27,29 @@ export class DefaultProviderService extends ManagedService implements ProviderSe
   private readonly disposables = new DisposableStore();
   private readonly activeRequests = new Set<ActiveRequest>();
 
+  private readonly secretStore: SecretStore;
+
   public constructor(private readonly dependencies: ProviderServiceDependencies) {
     super();
+    this.secretStore =
+      dependencies.secretStore ?? new ExtensionSecretStore(dependencies.secretStorage);
   }
 
   protected override onInitialize(): void {
-    // Keep the SecretStorage dependency inside the Extension Host. Adapter setup is added later.
+    // Keep SecretStorage inside the Extension Host. Adapter setup is added later.
     void this.dependencies.secretStorage;
+  }
+
+  public getApiKey(providerId: string): Promise<string | undefined> {
+    return this.secretStore.get(providerId);
+  }
+
+  public setApiKey(providerId: string, value: string): Promise<void> {
+    return this.secretStore.set(providerId, value);
+  }
+
+  public deleteApiKey(providerId: string): Promise<void> {
+    return this.secretStore.delete(providerId);
   }
 
   public registerActiveRequest(controller: AbortController, completion: PromiseLike<void>): void {

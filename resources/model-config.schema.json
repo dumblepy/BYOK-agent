@@ -29,10 +29,7 @@
       "properties": {
         "name": { "type": "string", "minLength": 1, "maxLength": 128 },
         "vendor": { "type": "string", "minLength": 1, "maxLength": 128 },
-        "apiKey": {
-          "type": "string",
-          "pattern": "^(\\$\\{input:[^}]+\\}|secret://[^\\s/][^\\s]*)$"
-        },
+        "apiKey": {},
         "apiType": { "enum": ["chat-completions", "responses", "messages"] },
         "headers": {
           "type": "object",

@@ -1,54 +1,54 @@
 ---
-description: 17-milestone-2-モデル設定とbyokブランチでModel Capabilities管理を設計するときに読み込む
+description: 17-milestone-2-モデル設定とbyokブランチでProvider別APIキー管理を実装するときに読み込む
 alwaysApply: false
 ---
-# Model Capabilities管理の実装方針と設計
+# SecretStorageによるProvider別APIキー管理の実装方針と設計
 
-このブランチでは、モデルの能力を設定値として明示的に管理し、モデル名の推測に依存せず、実行可能なツールとUIを能力に応じて安全に切り替える設計を確定する。
+このブランチでは、ProviderごとのAPIキーを`ExtensionContext.secrets`だけで管理し、設定ファイル・Webview・ログ・会話保存へ秘密値が流出しない構造を実装する。
 
 ## 実装方針
 
-- CapabilitiesはModel Definitionに属する不変の設定値として扱い、Extension Hostでのみ解決する。
-- `false`または未指定の能力は利用不可とし、モデル名・Provider名・APIエンドポイントから補完しない。
-- 設定値が`true`でも、選択されたProvider Adapterがその能力を実行できない場合は実効能力を`false`として扱い、診断を記録する。
-- Tool Registry、Agent Runtime、Prompt Composer、Webview UIは、同じ`EffectiveCapabilities`スナップショットを参照する。各層が独自にモデル名を解析してはならない。
-- 能力不足は送信時に検出してからツール定義・入力UI・実行経路を無効化する。無効化した機能をモデルへ説明する必要がある場合は、安全な capability summary だけを渡す。
-- Run開始時に能力スナップショットを固定し、設定再読み込みやモデル変更で実行中の能力を変えない。
-- WebviewにはAPIキー、URL、ヘッダー、内部診断詳細を渡さず、表示に必要な能力フラグと利用可能機能だけを渡す。
+- APIキーの正本はVS Codeの`SecretStorage`とし、ファイルシステム、VS Code設定、環境変数、Webview状態には保存しない。
+- Providerの識別子をSecretStorageのキーに対応付け、Provider単位で保存・取得・削除する。APIキー本体はProvider設定やModel定義から分離する。
+- APIキー入力はExtension Hostのコマンドからだけ受け付け、パスワード入力UIで入力する。WebviewからAPIキー本体を送受信しない。
+- Provider通信直前にHost内でだけ取得し、リクエスト完了後もキャッシュ・診断・ログ・エラーへ値を渡さない。
+- 未設定Providerは利用可能モデル一覧から除外または認証未設定として扱い、APIキーを推測・自動生成・環境変数展開しない。
+- `get`は内部サービス専用とし、UIへは設定済みかどうかだけを返す。APIキーのマスク値や長さも返さない。
+- 既存のモデル設定にある`apiKey`項目は互換性のため受け付けるが、値を解決・保存・出力せず、正規化済み設定から除去する。環境変数参照や外部Secret参照など、`apiKey`以外の認証項目は設定全体を無効化し、値を診断へ出さない。
 
 ## 進捗
 
 - [x] `AGENTS.md`、プロジェクトルール、共通ブランチルール、既存ブランチルールを確認する
-- [x] 既存のモデル設定・Catalog・Provider・Tool・モデル選択UIの境界を調査する
-- [x] 既存のブランチルールを削除し、Capabilities管理向けに新規作成する
-- [x] Capabilitiesの定義、設定優先順位、実効能力の解決規則を設計する
-- [x] 能力不足時のTool・Agent・UIの無効化契約を設計する
+- [x] 現在のProvider、モデル設定、サービス初期化、ログ、Webview境界を調査する
+- [x] 既存のブランチルールを削除し、APIキー管理向けに新規作成する
+- [x] Provider別SecretStorageの保存・取得・削除契約を設計する
+- [x] APIキー入力コマンドと安全なUI・権限境界を設計する
+- [x] ログ・設定ファイル・会話保存・Webviewへの非出力契約を設計する
 - [x] `documents/design.md`へ実装方針と詳細設計を追記する
-- [x] Capabilities型と設定Schemaを実装する
-- [x] Tool・Agent・Provider・UIへ実効能力を接続する
-- [x] Capabilitiesの単体・Provider契約・Agentシミュレーション・Extension統合テストを実装する
+- [x] SecretStorageサービス、コマンド、Provider通信への接続を実装する
+- [x] APIキーの単体・コマンド・Extension統合テストを実装する
 
 ## 完了条件
 
-1. Tool Calling、Streaming、Vision、Reasoningを含む能力の意味と設定形式が定義されている。
-2. 設定値を最優先し、モデル名による推測を実行経路に使わないことが明記されている。
-3. 能力不足時に、ツール送信・画像添付・Reasoning設定・ストリーミング表示がどう無効化されるか決まっている。
-4. Host、Provider、Agent、Tool、Webview間で参照する実効能力の境界と固定タイミングが決まっている。
-5. 上記の切り替えを検証するテスト観点が定義されている。
+1. Provider識別子から一意のSecretStorageキーを決定でき、Providerごとに保存・取得・削除できる。
+2. APIキー入力コマンドがHost側で入力を受け、保存後も値をUI・設定・ログへ返さない。
+3. Providerリクエストには必要な瞬間だけHost内のAPIキーを渡し、通信以外の永続化先へ値が流れない。
+4. 未設定、空文字、削除後、SecretStorage障害、Provider不在を安全に処理できる。
+5. テストで`ExtensionContext.secrets`以外にAPIキー本体が書き込まれないことを検証できる。
 
 ## 対象外
 
-- Capabilities管理の実装
-- Provider API通信やストリーム変換の実装
-- APIキー入力・SecretStorageの実装
-- モデル名からの能力自動推測機能
-- 新しいUIコンポーネントの実装
+- Provider API通信そのものの実装
+- APIキーのローテーション・有効性確認API
+- 環境変数や`.env`からの読み込み
+- WebviewへのAPIキー表示・コピー機能
 - `git add`、`git commit`
 
 ## 調査結果・設計まとめ
 
-- 現在のSchemaは`toolCalling`、`vision`、`thinking`、`supportsReasoningEffort`を持つが、Streamingを明示していない。設計上は`reasoning`へ名称を統一し、既存の`thinking`からの暗黙変換は行わず、移行時に明示的な変換規則を定める。
-- 既存のModel Catalogは設定値をHost側で解決する境界を持つため、Capabilitiesの正本をCatalogの解決済みModel Definitionへ置く。
-- 既存のモデル選択UIは表示用要約だけを受け取るため、能力情報を表示する場合も安全な表示フラグに限定し、Provider接続情報は渡さない。
-- Tool Registryは実行環境やPermission Profileも加味するが、モデル能力による制約を先に適用し、能力不足のツールをモデルへ公開しない。
-- `streaming=false`の場合はUIの逐次表示を待機表示へ切り替え、Providerが非ストリーム応答しか返せないことをユーザーへ明示する。
+- 既存の`ApplicationServices`はProviderへ`context.secrets`を注入できるため、SecretStorageをProviderサービスの内部実装へ閉じ込める境界が適切である。
+- 既存の`documents/design.md`にはSecret参照形式の記述があるが、完了条件「`ExtensionContext.secrets`にのみ保存」と衝突するため、ワークスペース・ユーザー設定からSecret参照を指定する方式は採用しない。
+- Provider設定は`name`、`vendor`、`apiType`、`models`などの接続メタデータだけを持ち、認証状態はHostでProvider名から解決する。
+- SecretStorageのキー名は秘密値ではないが、衝突防止のため固定プレフィックス、バージョン、正規化済みProvider IDで構成する。Provider IDの正規化後に衝突する設定は登録不可とする。
+- コマンドの成功通知は「保存済み」「削除済み」の状態だけとし、入力値、マスク値、文字数、SecretStorage内部エラー詳細を表示・記録しない。
+- `SecretStorage.onDidChange`を購読する場合も、変更されたProvider IDを再評価するだけにし、Secret値をイベントやログへ載せない。

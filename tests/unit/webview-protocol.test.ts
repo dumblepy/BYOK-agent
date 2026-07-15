@@ -112,7 +112,7 @@ describe("Webview protocol schemas", () => {
         {
           id: "coding-primary",
           label: "Coding Primary",
-          provider: "primary",
+          provider: "Open Router",
           capabilities: {
             toolCalling: true,
             streaming: true,

@@ -37,6 +37,35 @@ describe("model config validator", () => {
     expect(result.config?.[0]?.models[0]?.id).toBe("gpt-5");
   });
 
+  it("Open Routerのモデル設定を受理する", () => {
+    const result = validateModelConfig({
+      providers: [
+        {
+          name: "Open Router",
+          vendor: "openrouter",
+          apiType: "responses",
+          models: [
+            {
+              id: "gpt-5.4-nano",
+              name: "GPT-5.4 Nano(0.16)",
+              url: "https://openrouter.ai/api/v1/chat/completions",
+              toolCalling: true,
+              vision: false,
+              thinking: true,
+              supportsReasoningEffort: ["none", "low", "medium", "high", "xhigh"],
+              maxInputTokens: 400000,
+              maxOutputTokens: 128000,
+            },
+          ],
+        },
+      ],
+    });
+
+    expect(result.valid).toBe(true);
+    expect(result.config).toHaveLength(1);
+    expect(result.config?.[0]?.models).toHaveLength(1);
+  });
+
   it("JSON構文エラーを構造化して返す", () => {
     const result = parseAndValidateModelConfig("{");
     expect(result.issues[0]).toMatchObject({ code: "CONFIG_INVALID_JSON", path: "/" });
@@ -50,11 +79,11 @@ describe("model config validator", () => {
     });
   });
 
-  it("秘密情報をエラー出力へ含めない", () => {
+  it("互換性のためapiKey項目を無視し、設定結果へ残さない", () => {
     const result = validateModelConfig(document([{ ...minimal[0], apiKey: "plain-secret-value" }]));
-    expect(result.valid).toBe(false);
-    expect(JSON.stringify(result.issues)).not.toContain("plain-secret-value");
-    expect(result.issues[0]?.path).toBe("/providers/0/apiKey");
+    expect(result.valid).toBe(true);
+    expect(result.config?.[0]).not.toHaveProperty("apiKey");
+    expect(JSON.stringify(result.config)).not.toContain("plain-secret-value");
   });
 
   it("意味制約とworkspace制約を検証する", () => {
@@ -62,15 +91,12 @@ describe("model config validator", () => {
       document([
         {
           ...minimal[0],
-          apiKey: "secret://openai",
           models: [{ ...minimal[0].models[0], maxOutputTokens: 20000 }],
         },
       ]),
       "workspace",
     );
-    expect(result.issues.map((issue) => issue.code)).toEqual(
-      expect.arrayContaining(["CONFIG_WORKSPACE_POLICY_VIOLATION", "CONFIG_SEMANTIC_INVALID"]),
-    );
+    expect(result.issues.map((issue) => issue.code)).toContain("CONFIG_SEMANTIC_INVALID");
   });
 
   it("HTTPはlocalhostだけを許可し、reasoningの関係を検証する", () => {

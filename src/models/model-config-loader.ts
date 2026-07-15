@@ -283,13 +283,6 @@ export class ModelConfigLoader {
     const baseline = flattenModels([lowerSources]);
     value.forEach((provider, providerIndex) => {
       if (!isRecord(provider)) return;
-      if ("apiKey" in provider) {
-        issues.push({
-          code: "CONFIG_WORKSPACE_POLICY_VIOLATION",
-          path: `/${providerIndex}/apiKey`,
-          message: "ワークスペース設定からSecret参照を変更できません。",
-        });
-      }
       if ("headers" in provider) {
         const headers = provider.headers;
         if (isRecord(headers)) {

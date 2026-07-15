@@ -163,7 +163,7 @@ const modelSummarySchema = z
   .object({
     id: identifierSchema,
     label: z.string().min(1).max(256),
-    provider: identifierSchema,
+    provider: z.string().min(1).max(256),
     capabilities: z
       .object({
         toolCalling: z.boolean(),

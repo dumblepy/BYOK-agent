@@ -7,6 +7,7 @@ import {
   type ModelConfigDiagnostic,
 } from "../models/model-config-loader";
 import { ConfiguredModelCatalog } from "../models/model-catalog";
+import type { ProviderService } from "../providers/provider-service";
 
 let applicationServices: ApplicationServices | undefined;
 let activationPromise: Promise<void> | undefined;
@@ -32,6 +33,7 @@ export function activate(context: ExtensionContext): Promise<void> {
     .then(() => createApplicationServices(context, undefined, modelCatalog))
     .then((services) => {
       applicationServices = services;
+      registerApiKeyCommands(context, services.provider, modelCatalog);
     });
 
   return activationPromise.finally(() => {
@@ -39,6 +41,78 @@ export function activate(context: ExtensionContext): Promise<void> {
       activationPromise = undefined;
     }
   });
+}
+
+function registerApiKeyCommands(
+  context: ExtensionContext,
+  providerService: ProviderService,
+  catalog: ConfiguredModelCatalog,
+): void {
+  context.subscriptions.push(
+    vscode.commands.registerCommand("byokAgent.setApiKey", async (providerId?: unknown) => {
+      const selectedProvider = await selectProvider(catalog, providerId);
+      if (!selectedProvider) return;
+
+      const value = await vscode.window.showInputBox({
+        prompt: `${selectedProvider.label} のAPIキーを入力してください`,
+        password: true,
+        ignoreFocusOut: true,
+        validateInput: (input) =>
+          input.trim().length > 0 ? undefined : "APIキーを入力してください。",
+      });
+      if (value === undefined) return;
+
+      try {
+        await providerService.setApiKey(selectedProvider.id, value);
+        void vscode.window.showInformationMessage(
+          `${selectedProvider.label} のAPIキーを保存しました。`,
+        );
+      } catch {
+        void vscode.window.showErrorMessage("APIキーを保存できませんでした。");
+      }
+    }),
+    vscode.commands.registerCommand("byokAgent.deleteApiKey", async (providerId?: unknown) => {
+      const selectedProvider = await selectProvider(catalog, providerId);
+      if (!selectedProvider) return;
+
+      try {
+        await providerService.deleteApiKey(selectedProvider.id);
+        void vscode.window.showInformationMessage(
+          `${selectedProvider.label} のAPIキーを削除しました。`,
+        );
+      } catch {
+        void vscode.window.showErrorMessage("APIキーを削除できませんでした。");
+      }
+    }),
+  );
+}
+
+async function selectProvider(
+  catalog: ConfiguredModelCatalog,
+  requestedProviderId: unknown,
+): Promise<{ readonly id: string; readonly label: string } | undefined> {
+  const providers = new Map<string, { readonly id: string; readonly label: string }>();
+  for (const model of catalog.listAvailable()) {
+    providers.set(model.provider.id, { id: model.provider.id, label: model.provider.id });
+  }
+
+  if (typeof requestedProviderId === "string" && providers.has(requestedProviderId)) {
+    return providers.get(requestedProviderId);
+  }
+
+  const items = [...providers.values()].map((provider) => ({
+    label: provider.label,
+    provider,
+  }));
+  if (items.length === 0) {
+    void vscode.window.showErrorMessage("利用可能なProviderがありません。");
+    return undefined;
+  }
+  const picked = await vscode.window.showQuickPick(items, {
+    placeHolder: "APIキーを管理するProviderを選択",
+    ignoreFocusOut: true,
+  });
+  return picked?.provider;
 }
 
 /**

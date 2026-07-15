@@ -9,7 +9,11 @@ const mocks = vi.hoisted(() => ({
   registration: {
     dispose: vi.fn(),
   },
+  commandRegistration: {
+    dispose: vi.fn(),
+  },
   registerWebviewViewProvider: vi.fn(),
+  registerCommand: vi.fn(),
   output: {
     appendLine: vi.fn(),
     show: vi.fn(),
@@ -17,11 +21,19 @@ const mocks = vi.hoisted(() => ({
   },
 }));
 mocks.registerWebviewViewProvider.mockReturnValue(mocks.registration);
+mocks.registerCommand.mockReturnValue(mocks.commandRegistration);
 
 vi.mock("vscode", () => ({
   window: {
     registerWebviewViewProvider: mocks.registerWebviewViewProvider,
     createOutputChannel: vi.fn(() => mocks.output),
+    showQuickPick: vi.fn(),
+    showInputBox: vi.fn(),
+    showInformationMessage: vi.fn(),
+    showErrorMessage: vi.fn(),
+  },
+  commands: {
+    registerCommand: mocks.registerCommand,
   },
   workspace: {
     workspaceFolders: undefined,

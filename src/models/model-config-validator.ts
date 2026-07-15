@@ -41,7 +41,8 @@ export interface ModelConfigModel {
 export interface ModelConfigProvider {
   name: string;
   vendor: string;
-  apiKey?: string;
+  /** @deprecated Ignored for compatibility. API keys belong in SecretStorage. */
+  apiKey?: unknown;
   apiType: ApiType;
   headers?: Record<string, string>;
   models: ModelConfigModel[];
@@ -322,13 +323,6 @@ function semanticIssues(config: ModelConfig): ModelConfigValidationIssue[] {
 function workspaceIssues(config: ModelConfig): ModelConfigValidationIssue[] {
   const issues: ModelConfigValidationIssue[] = [];
   config.forEach((provider, providerIndex) => {
-    if (provider.apiKey !== undefined) {
-      issues.push({
-        code: "CONFIG_WORKSPACE_POLICY_VIOLATION",
-        path: `/providers/${providerIndex}/apiKey`,
-        message: "ワークスペース設定からSecret参照を変更できません。",
-      });
-    }
     provider.models.forEach((model, modelIndex) => {
       issues.push({
         code: "CONFIG_WORKSPACE_POLICY_VIOLATION",
@@ -374,7 +368,12 @@ export function validateModelConfig(
     const issues = (validate.errors ?? []).map((error) => issueFromAjv(error, value));
     return { valid: false, issues };
   }
-  const config = (value as ModelConfigDocument).providers;
+  const config = (value as ModelConfigDocument).providers.map(
+    ({ apiKey: _ignored, ...provider }) => {
+      void _ignored;
+      return provider;
+    },
+  );
   const issues = [
     ...semanticIssues(config),
     ...(scope === "workspace" ? workspaceIssues(config) : []),

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   createInitialModelSelectorState,
+  getDefaultReasoningEffort,
   modelSelectorReducer,
 } from "../../src/ui/webview/model-selector-state";
 
@@ -11,6 +12,13 @@ const models = [
 ] as const;
 
 describe("model-selector-state", () => {
+  it("Copilot互換の推論強度既定値を解決する", () => {
+    expect(getDefaultReasoningEffort([])).toBeUndefined();
+    expect(getDefaultReasoningEffort(["low"])).toBe("low");
+    expect(getDefaultReasoningEffort(["low", "medium", "high"])).toBe("high");
+    expect(getDefaultReasoningEffort(["low", "medium"])).toBeUndefined();
+  });
+
   it("accepts the current thread model list and displays the selected model", () => {
     const state = modelSelectorReducer(createInitialModelSelectorState("thread-1"), {
       type: "model-list",
