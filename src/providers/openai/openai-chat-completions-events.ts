@@ -350,7 +350,9 @@ function failureEvent(payload: Record<string, unknown>, state: NormalizerState):
     type: "error",
     error: normalizeProviderError(
       {
+        source: "stream",
         code: stringValue(error.code),
+        providerType: stringValue(error.type),
         message: stringValue(error.message),
         status: safeStatus(error.status),
       },

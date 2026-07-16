@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 
-import { normalizeProviderError } from "../../src/providers/provider-error";
+import {
+  normalizeProviderError,
+  normalizeProviderHttpError,
+  normalizeRetryAfter,
+} from "../../src/providers/provider-error";
+import { toAgentError } from "../../src/agent/agent-error";
 import { ToolCallAccumulator } from "../../src/providers/provider-stream";
 import type { ProviderAdapter, ProviderRequest } from "../../src/providers/provider-types";
 
@@ -100,5 +105,100 @@ describe("Provider contract", () => {
     });
     expect(JSON.stringify(error)).not.toContain("secret");
     expect(JSON.stringify(error)).not.toContain("api key");
+  });
+
+  it("Providerコードを有限の共通コードへ分類する", () => {
+    expect(
+      normalizeProviderError({ source: "http", providerCode: "invalid_api_key" }),
+    ).toMatchObject({ code: "auth-failed", retryable: false, providerCode: "invalid_api_key" });
+    expect(
+      normalizeProviderError({ source: "http", providerCode: "context_length_exceeded" }),
+    ).toMatchObject({ code: "context-exceeded", retryable: false });
+    expect(
+      normalizeProviderError({ source: "http", providerCode: "provider_private_detail" }),
+    ).toMatchObject({ code: "unknown", retryable: false });
+  });
+
+  it("HTTPステータスをProviderコードより優先する", () => {
+    expect(
+      normalizeProviderError({
+        source: "http",
+        status: 400,
+        providerCode: "invalid_api_key",
+      }),
+    ).toMatchObject({ code: "bad-request", retryable: false });
+    expect(
+      normalizeProviderError({
+        source: "http",
+        status: 400,
+        providerCode: "context_length_exceeded",
+      }),
+    ).toMatchObject({ code: "context-exceeded", retryable: false });
+  });
+
+  it("HTTPエラーBodyから安全なProviderコードだけを抽出する", async () => {
+    const error = await normalizeProviderHttpError(
+      new Response(
+        JSON.stringify({
+          error: { code: "invalid_api_key", type: "authentication_error", message: "secret" },
+        }),
+        { status: 401, headers: { "x-request-id": "req-401" } },
+      ),
+    );
+
+    expect(error).toMatchObject({
+      code: "auth-failed",
+      providerCode: "invalid_api_key",
+      providerType: "authentication_error",
+      status: 401,
+      requestId: "req-401",
+      source: "http",
+    });
+    expect(JSON.stringify(error)).not.toContain("secret");
+  });
+
+  it("ユーザーAbortを他の分類より優先する", () => {
+    expect(normalizeProviderError({ userAborted: true, status: 401 })).toMatchObject({
+      code: "cancelled",
+      retryable: false,
+      source: "cancelled",
+    });
+  });
+
+  it("Retry-Afterの秒数、HTTP-date、不正値を正規化する", () => {
+    const nowMs = Date.parse("2026-07-16T00:00:00.000Z");
+    expect(normalizeRetryAfter(undefined, undefined, "2", nowMs)).toBe(2_000);
+    expect(normalizeRetryAfter(undefined, undefined, "Thu, 16 Jul 2026 00:00:05 GMT", nowMs)).toBe(
+      5_000,
+    );
+    expect(normalizeRetryAfter(undefined, undefined, "-1", nowMs)).toBeUndefined();
+    expect(normalizeRetryAfter(undefined, undefined, "999999999", nowMs)).toBeUndefined();
+  });
+
+  it("ProviderErrorをAgentErrorへ一度だけ安全に写像する", () => {
+    const providerError = normalizeProviderError({
+      source: "http",
+      status: 429,
+      providerCode: "rate_limit_exceeded",
+      providerType: "rate_limit_error",
+      requestId: "req-123",
+      retryAfterMs: 2_000,
+    });
+    const agentError = toAgentError(providerError);
+
+    expect(agentError).toMatchObject({
+      code: "PROVIDER_RATE_LIMITED",
+      userMessage: "Providerの利用制限に達しました。",
+      retryable: true,
+      retryAfterMs: 2_000,
+      technicalDetails: {
+        providerCode: "rate_limit_exceeded",
+        providerType: "rate_limit_error",
+        status: 429,
+        requestId: "req-123",
+        source: "http",
+      },
+    });
+    expect(JSON.stringify(agentError)).not.toContain("provider response");
   });
 });

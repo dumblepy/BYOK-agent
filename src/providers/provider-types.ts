@@ -74,6 +74,8 @@ export type ProviderErrorCode =
   | "cancelled"
   | "unknown";
 
+export type ProviderErrorSource = "http" | "transport" | "stream" | "timeout" | "cancelled";
+
 export interface ProviderError {
   readonly code: ProviderErrorCode;
   readonly message: string;
@@ -81,6 +83,9 @@ export interface ProviderError {
   readonly retryAfterMs?: number;
   readonly status?: number;
   readonly requestId?: string;
+  readonly providerCode?: string;
+  readonly providerType?: string;
+  readonly source?: ProviderErrorSource;
 }
 
 export interface TokenCountInput {

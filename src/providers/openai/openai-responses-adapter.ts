@@ -1,4 +1,8 @@
-import { createProviderError, normalizeProviderError } from "../provider-error";
+import {
+  createProviderError,
+  normalizeProviderError,
+  normalizeProviderHttpError,
+} from "../provider-error";
 import type { ProviderAdapter, ProviderEvent, ProviderRequest } from "../provider-types";
 import type { ProviderAdapterFactory, ProviderAdapterInit } from "../provider-router";
 import { normalizeResponsesEvents } from "./openai-responses-events";
@@ -59,14 +63,7 @@ export class OpenAIResponsesAdapter implements ProviderAdapter {
       if (!response.ok) {
         yield {
           type: "error",
-          error: normalizeProviderError(
-            {
-              status: response.status,
-              retryAfterMs: retryAfterMilliseconds(response.headers.get("retry-after")),
-              requestId: response.headers.get("x-request-id") ?? request.requestId,
-            },
-            { requestId: request.requestId },
-          ),
+          error: await normalizeProviderHttpError(response, { requestId: request.requestId }),
         };
         return;
       }
@@ -137,15 +134,6 @@ function createHeaders(
     headers.set("authorization", `Bearer ${credential}`);
   }
   return headers;
-}
-
-function retryAfterMilliseconds(value: string | null): number | undefined {
-  if (value === null || !/^\d+$/.test(value.trim())) return undefined;
-  const seconds = Number(value.trim());
-  if (!Number.isSafeInteger(seconds) || seconds > Number.MAX_SAFE_INTEGER / 1000) {
-    return undefined;
-  }
-  return seconds * 1000;
 }
 
 interface OperationSignal {

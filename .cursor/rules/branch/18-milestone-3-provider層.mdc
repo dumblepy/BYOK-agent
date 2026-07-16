@@ -1,254 +1,141 @@
 ---
-description: 18-milestone-3-provider層ブランチでOpenAI互換Chat Completions Adapterを設計・実装するときに読み込む
+description: 18-milestone-3-provider層ブランチでProviderエラー正規化を設計・実装するときに読み込む
 alwaysApply: false
 ---
-# OpenAI互換Chat Completions Adapterの実装方針
+# Providerエラー正規化の実装方針
 
-このブランチでは、既存のProvider共通契約とProvider Routerを利用し、`apiType: "chat-completions"`のOpenAI互換エンドポイントへ接続するAdapterを実装する。Agent RuntimeはChat Completions固有のHTTP形式、SSEデータ、`finish_reason`、Tool Call断片の並びを知らず、共通の`ProviderRequest`と`ProviderEvent`だけを扱う。
+このブランチの対象は、OpenAI Responses、OpenAI互換Chat Completions、Anthropic Messagesなど、Provider Adapterが返すAPI固有エラーを共通エラーへ正規化する設計と実装である。今回の設計では、認証、Rate Limit、Timeout、Bad Requestを必須分類とし、既存の`ProviderError`／`AgentError`契約へ安全に接続する。
 
-対象は、一般的なOpenAI互換サーバーで共通して利用できる最小互換範囲である。OpenAI公式APIを基準にしつつ、vLLM、Ollama、llama.cppなどの実装差を明示的なProfileへ閉じ込める。Providerごとの場当たり的な分岐をAgentや共通契約へ漏らさない。
+## スコープ
 
-このブランチでは設計済みのChat Completions Adapter、HTTP通信、SSE parser、メッセージ／Tool変換、Tool Call accumulator、エラー分類、Contract Testだけを対象とする。Agent Loop、Tool Executor、Permission、Context、Storage、UIの実装へ責務を広げない。
+- HTTPステータス、Providerの許可済みエラーコード、Transport／Timeout／Abortの原因を正規化する。
+- `Retry-After`をdelta-secondsまたはHTTP-dateから有限なミリ秒へ変換する。
+- ユーザー表示用の固定文言と、ログ・再試行判断用の技術情報を別の構造として扱う。
+- Adapterが同じ`ProviderErrorCode`を返し、Agentが同じ`AgentErrorCode`へ変換できる契約を作る。
+- Fake HTTP層と保存済みFixtureによるProvider Contract Testを追加する。
+
+## 非スコープ
+
+- 自動リトライ、指数バックオフ、Retry-Afterに基づく再送の実行。
+- Provider SDKの導入、API固有の生エラー本文のUI表示。
+- Tool実行、引数Schema検証、権限判定、Context圧縮、Agent停止条件の変更。
+- APIキー、Authorization、URL全体、Prompt、Tool Result、生Responseの保存・ログ出力。
+- `git add`、`git commit`。
 
 ## 実装方針
 
-- Adapterの責務は、共通メッセージ・Tool定義・Tool Resultの変換、Chat Completions SSEの正規化、Tool Call IDの保持、Usage／Stop Reasonの正規化、Providerエラー分類、キャンセル、リトライ可否の判定に限定する。
-- Adapterにエージェント判断、Tool実行、AJVによるTool引数検証、権限判定、履歴保存、コンテキスト圧縮、リトライ実行を入れない。
-- Model Catalogで検証済みの完全なChat Completions URLをそのまま`POST`先として使う。Adapterが`/v1/chat/completions`や末尾パスを推測・連結しない。
-- 認証情報はProvider Service／Factoryから初期化境界へ渡し、`Authorization`、APIキー、URL内認証情報、任意ヘッダー値をProviderRequest・ProviderEvent・ログ・Fixture・永続化へ流出させない。
-- Provider差異は有限な`ChatCompletionsProfile`で吸収する。任意JSONや任意ヘッダーをリクエストへ透過させる設定は追加しない。
-- 初期対応はHTTP SSE（`stream: true`）、テキスト、画像入力、Function Tool、単一・並列Tool Call、Tool Result、明示Usage、キャンセルとする。Custom Tool、Audio、File、Hosted Tool、MCP、埋め込み、非ストリーム専用経路は対象外とする。
-- RequestごとのSSE parser、Tool Call accumulator、Usage、完了状態、Abort状態はAdapterインスタンスへ保存せず、各`stream`呼び出しのスコープに閉じ込める。
-- Tool Callは`choice.index`と`tool_calls[].index`（または明示Profileで許可したIDフォールバック）で蓄積する。ID、名前、引数の欠落・矛盾・型の混在を暗黙補完しない。
-- 引数文字列はネットワークChunkやSSEイベントの境界で分割される前提を置かず、Call単位で順序どおりに結合する。JSONとして完全に解析できたCallだけを確定イベントにする。
-- 引数がObjectとして返るサーバーは、Profileで明示的に許可した場合だけ受け付ける。文字列断片とObjectを深くマージして推測しない。混在、重複Objectの不一致、完了時の不正JSONは安全なエラーとする。
-- `tool_calls`を正規経路とし、旧`function_call`形式はProfileで明示的に有効化した場合だけ扱う。IDをサーバーが返さない旧形式では、合成IDを許可する設定なしにTool Callを実行可能なイベントへ昇格させない。
-- Stream中の`finish_reason`を保持し、Usage終端チャンクと`[DONE]`を処理してからUsage、最後にCompletedを発行する。Error、Cancelled、不完全Tool Callの後にCompletedを発行しない。
-- `stream_options.include_usage`は互換サーバーが拒否する可能性があるためProfileで明示する。Usageが返らない場合、0や推定値で補完せずUsageイベント自体を省略する。
-- 推論フィールドはProfileで明示した公開フィールドだけを`reasoning-delta`へ正規化する。通常の`content`から推論を推測したり、非公開推論を保存・表示・代替利用したりしない。
-- `AbortSignal`は開始前・Fetch後・各SSEイベント処理前に検査し、Abort後のデータを破棄する。Reader、SSE parser、タイマー、accumulatorは`finally`で解放する。
-- 実APIテストは明示的な環境変数とユーザー指定がある場合だけ実行する。通常のContract TestはFake Fetchと保存済みSSE Fixtureで完結させる。
-- OpenAI公式仕様と互換サーバーの仕様を確認した日付、採用した差異、非対応範囲を設計書へ記録する。仕様変更時は本ルールと設計書を先に更新する。
+- 分類器の入力は、HTTPステータス、ヘッダー、許可済みのProviderエラーコード／種別、Transport結果、Abort／Timeout状態だけに限定する。生Response Bodyを共通エラーへ保持しない。
+- 分類の優先順位は、ユーザーAbort、内部Timeout、HTTPステータス、許可済みProviderコード、Transport障害、未知の順とする。同じ原因を複数の分類へ推測で重複適用しない。
+- HTTP 401／403は認証、429はRate Limit、408／504およびTransportのTimeoutはTimeout、400／422はBad Request、413または明示的なContext超過はContext Exceededへ分類する。
+- `Retry-After`は大文字小文字を区別せず読み取り、非負整数秒または検証済みHTTP-dateだけを受け付ける。負値、NaN、Infinity、過大値、複数値、解釈不能値は破棄し、再試行可能性そのものは別に判定する。
+- `Retry-After`があっても認証・Bad Requestを再試行可能にはしない。Rate LimitとTimeoutの再試行可否は共通コードのポリシーから決め、実際の再送は上位層へ委譲する。
+- ユーザー向け文言は分類ごとの固定文言と安全な再試行案内だけで構成する。Providerのmessage、param、body、URL、ヘッダー値を直接表示しない。
+- 技術情報は構造化された有限値だけをログ相関用に渡す。Providerコード、HTTPステータス、request ID、Retry-Afterの正規化値を必要最小限記録し、認証情報や生本文を記録しない。
+- `ProviderError`から`AgentError`への変換は一箇所に集約し、UI、Agent、LoggerがProvider固有コードを個別判定しないようにする。
+- Adapter自身はリトライを実行しない。ストリーム中のError後にCompletedやUsageを発行せず、Abort時はCancelledを一度だけ発行する既存契約を維持する。
 
-## 設計
+## 設計の要点
 
-### 境界
+### 分類結果
 
-```text
-Agent Runtime
-  │ ProviderRequest
-  ▼
-ProviderRouter
-  │ ProviderAdapter.stream(request, signal)
-  ▼
-OpenAIChatCompletionsAdapter
-  ├─ ChatCompletionsProfileResolver
-  ├─ ChatCompletionsRequestMapper
-  ├─ FetchTransport
-  ├─ SSEParser
-  ├─ ChatCompletionsEventNormalizer
-  └─ ToolCallAccumulator
-  │ AsyncIterable<ProviderEvent>
-  ▼
-Agent Runtime
-```
+必須の共通コードは次のとおりとする。
 
-Adapterの入力は既存の`ProviderRequest`、出力は既存の`ProviderEvent`とする。Chat Completions固有のRequest／Chunk型は`src/providers/openai/`配下に閉じ込め、共通型へ生JSONを追加しない。
+| Provider固有の入力 | 共通コード | 再試行候補 | ユーザー向けの意味 |
+|---|---|---:|---|
+| 401／403、認証失敗コード | `auth-failed` | いいえ | 認証設定を確認する |
+| 429、Rate Limitコード | `rate-limited` | はい | 利用制限のため待つ |
+| 408／504、通信Timeout | `timeout` | はい | 通信が時間内に完了しなかった |
+| 400／422、入力不正コード | `bad-request` | いいえ | リクエストまたは設定を確認する |
+| 413、Context超過コード | `context-exceeded` | いいえ | 入力を短くする |
+| 404、未対応コード | `unsupported` | いいえ | Providerまたはモデルが未対応 |
+| 接続・DNS・TLS・ソケット等のTransport障害 | `network` | 条件付き | 接続を確認する |
+| 上記以外 | `unknown` | いいえ | 予期しないProviderエラー |
+| ユーザーAbort | `cancelled` | いいえ | リクエストをキャンセルした |
 
-### Profileで吸収する差異
+HTTPステータスがある場合はステータスを第一の根拠とする。ただし400系でも、許可済みコードがContext超過を明示する場合は`context-exceeded`を優先する。Providerコードは全量を通過させず、プロトコルごとの有限なAllowlistから共通コードへ写像する。
 
-既存のModel設定に追加するProfileは、ProviderまたはModel単位で明示する有限の値とする。実装では設定Schema・Validator・Model Catalog・Provider Routerの初期化境界までProfileを接続し、任意のJSON BodyやHeaderを許可しない。
+### 情報分離
+
+正規化結果は表示用と技術用を別の投影として扱う。
 
 ```ts
-interface ChatCompletionsProfile {
-  readonly systemRole: "system" | "developer";
-  readonly maxTokensField: "max_tokens" | "max_completion_tokens";
-  readonly reasoningField: "none" | "reasoning_effort";
-  readonly reasoningDeltaField: "none" | "reasoning_content" | "reasoning";
-  readonly streamUsage: "include" | "omit";
-  readonly parallelToolCalls: "include" | "omit" | "false";
-  readonly toolArguments: "string" | "object" | "auto";
-  readonly toolIndex: "required" | "id-fallback";
-  readonly legacyFunctionCall: "disabled" | "enabled";
-  readonly synthesizeToolCallId: "disabled" | "enabled";
-  readonly allowEofAfterFinish: boolean;
+interface ProviderErrorPresentation {
+  readonly code: ProviderErrorCode;
+  readonly userMessage: string;
+  readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+}
+
+interface ProviderErrorTechnicalInfo {
+  readonly status?: number;
+  readonly providerCode?: string;
+  readonly providerType?: string;
+  readonly requestId?: string;
+  readonly source: "http" | "transport" | "stream" | "timeout" | "cancelled";
+}
+
+interface NormalizedProviderError {
+  readonly presentation: ProviderErrorPresentation;
+  readonly technical: ProviderErrorTechnicalInfo;
 }
 ```
 
-ProfileはProviderの挙動を宣言するためにだけ使用し、任意のBodyフィールド、任意のURL、任意の認証方式、任意のHeaderを注入する用途には使わない。`streamUsage: "include"`を設定しても、サーバーがUsageを返さないことは正常な互換差異として扱う。`synthesizeToolCallId`は旧形式やローカルサーバーでIDが欠落する場合の明示的な危険設定であり、既定値は`disabled`とする。
+`presentation.userMessage`は固定文言とし、`technical`はLoggerとAgentの診断にだけ渡す。`ProviderError.message`を利用する既存経路では、messageをユーザー向け固定文言として扱い、技術情報を別フィールドへ保持する。技術情報を自由形式の文字列へ連結しない。
 
-### 入力の変換
+### AgentErrorへの写像
 
-- `ProviderRequest.modelId` → `model`。Catalogで解決済みの値をそのまま使う。
-- `ProviderMessage` → `messages`。順序を保持し、SystemはProfileの`systemRole`、その他は`user`／`assistant`／`tool`へ変換する。
-- Text → 文字列、またはUserの画像を含む場合は`{ type: "text", text }`／`{ type: "image_url", image_url: { url } }`のContent Partへ変換する。System、Assistant Tool Call、Tool Resultの画像は初期範囲では拒否する。
-- Assistantの`toolCalls` → `{ role: "assistant", content: null, tool_calls: [{ id, type: "function", function: { name, arguments: JSON.stringify(arguments) } }] }`。Tool CallがないAssistantの空ContentはProfileで別形式を許可しない限り空文字列へ正規化する。
-- Tool Message → `{ role: "tool", tool_call_id, content }`。`toolCallId`を必須とし、Resultの圧縮・マスク・JSON化はTool／Context層の責務とする。
-- `ProviderToolDefinition` → `{ type: "function", function: { name, description, parameters } }`。Schemaへ`strict`、`additionalProperties`、必須プロパティを追加・削除しない。
-- Requestには`stream: true`と`n: 1`を設定する。`parallel_tool_calls`、`stream_options`、`reasoning_effort`はProfileで有効なときだけ送信する。未定義のOptionは送信しない。
-- `temperature`と出力Token上限はProfileのフィールド名へ対応付ける。未定義値は送信せず、`max_tokens`と`max_completion_tokens`を同時に送信しない。
-
-### SSE受信とイベント正規化
-
-SSEはネットワークChunk、SSEイベント、JSON Chunkの三層に分けて解析する。`event`名の有無、複数`data:`行、CRLF／LF、Chunk境界を許容するが、JSONの意味フィールドを推測して別イベントへ変換しない。Payload、イベント数、累積Tool引数には上限を設ける。
-
-`data: [DONE]`を正常なストリーム終端として扱う。`allowEofAfterFinish`が有効なProfileでは、`finish_reason`を受信済みで未完了Callがなく、HTTP Bodyが終端した場合も正常終端とする。それ以外の予期しないEOF、SSE構文エラー、JSON構文エラーはCompletedなしの非再試行エラーとする。
-
-| Chat Completions Chunk | 共通イベント | 処理 |
-|---|---|---|
-| `choices[0].delta.content`の文字列 | `text-delta` | 空文字列は無視可能。受信順を保持する |
-| Profile指定の公開推論フィールド | `reasoning-delta` | 指定フィールドの文字列だけを発行する |
-| `delta.tool_calls`のCall情報 | `tool-call-start`／`tool-call-delta` | Call単位で蓄積し、IDと名前が揃った時点で開始イベントを発行する |
-| `choices[0].finish_reason` | 内部完了状態 | `stop`、`tool_calls`、`function_call`、`length`、`content_filter`等を保持し、終端までCompletedを発行しない |
-| 終端Chunkの明示Usage | `usage` | 明示された値だけを正規化する。Usageチャンクの`choices: []`を許容する |
-| `[DONE]`またはProfileで許可された終端 | `completed` | すべてのCall確定後にStop Reasonを決定して最後に1回だけ発行する |
-| Chunk内のErrorまたはSSE `error` | `error` | Error後の後続データを破棄する |
-
-`choices`は`n: 1`で要求する。複数Choice、`choice.index`の不一致、非0 Choiceの混入は共通イベントで表現できないため`unsupported`または`bad-request`とする。Usage専用Chunkの空Choicesだけは例外として受け付ける。
-
-### 不完全Tool Callの安全な結合
-
-Accumulatorは`choice.index + tool_calls[].index`を主キーとし、Indexがない場合だけProfileの`id-fallback`に従って明示IDをキーにする。次の状態をCallごとに保持する。
-
-```text
-PendingToolCall
-├─ key: choiceIndex + toolIndex / toolCallId
-├─ id?: string
-├─ name?: string
-├─ argumentMode: unset | string | object
-├─ argumentText: string
-├─ argumentObject?: unknown
-├─ started: boolean
-└─ closed: boolean
-```
-
-- `id`、`name`、`type`は最初のDeltaにしかない前提を置かない。後続Deltaで補完可能だが、別値への変更、空値への上書き、`type`の非Function化は拒否する。
-- String引数は到着順に連結し、Call終了時にJSON.parseする。解析成功したObject、Array、Primitiveをそのまま共通`arguments`へ渡し、空文字列は自動的に`{}`へ置換しない。
-- Object引数はProfileが`object`または`auto`の場合だけ受け付ける。複数Objectの不一致、Stringとの混在、Objectの途中状態を推測したマージは拒否する。
-- `tool-call`の確定時に、ID・名前・引数・宣言済みTool名がすべて揃い、引数が完全なJSONであることを確認する。未完了Call、ID欠落、名前欠落、不正JSON、未知Tool名が一つでもあればCompletedを発行しない。
-- Call確定イベントを発行した後の同一KeyへのDelta、同じIDへの異なる名前、異なるCallへのIndex再利用は拒否する。
-- 途中の`tool-call-start`／`tool-call-delta`を発行済みでも、最終検証に失敗したRunはErrorで終了する。Agentは確定`tool-call`を受信したCallだけを実行対象とする。
-- 並列Callは受信順を保持し、全Callの確定イベントを発行してから`completed(stopReason: "tool-call")`を発行する。
-
-### Stop ReasonとUsage
-
-標準値は次へ変換する。
-
-| Provider値 | 共通値 |
+| Providerコード | Agentコード |
 |---|---|
-| `stop` | `end-turn` |
-| `tool_calls`／`function_call` | `tool-call` |
-| `length` | `max-tokens` |
-| `content_filter` | `content-filter` |
-| `stop_sequence`／`eos`（Profileで許可した場合） | `end-turn` |
-| 未知または未提供 | `unknown`、または終端要件を満たさない場合はError |
+| `auth-failed` | `PROVIDER_AUTH_FAILED` |
+| `rate-limited` | `PROVIDER_RATE_LIMITED` |
+| `timeout` | `PROVIDER_TIMEOUT` |
+| `bad-request` | `PROVIDER_BAD_REQUEST` |
+| `context-exceeded` | `MODEL_CONTEXT_EXCEEDED` |
+| `unsupported` | `PROVIDER_UNSUPPORTED` |
+| `network` | `PROVIDER_NETWORK` |
+| `unknown` | `PROVIDER_UNKNOWN` |
+| `cancelled` | `USER_CANCELLED` |
 
-`finish_reason`が未提供でも明示的な`[DONE]`と完全なCall状態があれば`unknown`でCompletedを発行できる。Text内容、モデル名、推測したEOS、HTTP切断からStop Reasonを補完してはならない。
-
-Usageは`prompt_tokens`／`completion_tokens`を`inputTokens`／`outputTokens`へ写す。`prompt_tokens_details.cached_tokens`、`completion_tokens_details.reasoning_tokens`等は存在し、数値として検証できた場合だけ任意の内訳へ写す。`total_tokens`だけから入力・出力を逆算しない。終端Usageが欠落した、またはキャンセルされた場合はUsageイベントを発行しない。
-
-### Tool Callingの往復
-
-```text
-ProviderRequest(messages + tools)
-  → Chat Completions SSE
-  → text-delta / reasoning-delta
-  → tool-call(id, name, parsed arguments)
-  → completed(tool-call)
-  → Agentが検証・権限確認・実行
-  → assistant.toolCalls + tool(toolCallId, result)
-  → 次のChat Completions Request
-```
-
-次のRequestではAssistant Tool Callと対応するTool Messageを元の会話順で再送する。Chat CompletionsではTool Resultの`tool_call_id`とAssistantのTool Call `id`を一致させる。AdapterはToolの並列実行、失敗時の再試行、Resultの要約を行わない。
-
-### HTTP、エラー、キャンセル
-
-HTTP 401／403は認証、429はRate Limit、408はTimeout、400／422はBad Request、413またはコンテキスト超過はContext Exceeded、404はUnsupported、接続失敗はNetworkへ分類する。Response JSONの`error.type`、`error.code`、`x-request-id`、`Retry-After`は安全な有限値だけを分類・相関IDへ利用し、生Bodyをユーザー向け文言やログへ渡さない。
-
-リダイレクトは自動追跡せず、検証済みEndpointから別Hostへ転送しない。Content-TypeがSSEでない、Bodyがない、サイズ上限を超えた、SSEが壊れている場合はCompletedなしで安全なErrorにする。タイムアウトは上位層のリトライ判断用に`retryable`を付けるが、Adapter自身は再送しない。
-
-Abort済みの呼び出しは通信を開始せず`cancelled`だけを1回発行する。読込中のAbortはFetch、Reader、Parser、Accumulatorを停止し、Abort後のChunk・Error・Usage・Completedを発行しない。ConsumerがAsyncIterableを早期終了した場合も`finally`でリソースを解放する。
-
-### 実装予定単位
-
-- `src/providers/openai/openai-chat-completions-types.ts`: Chat Completions固有の最小Request／Chunk／Profile型
-- `src/providers/openai/openai-chat-completions-profile.ts`: 有限Profileの既定値・検証・設定解決
-- `src/providers/openai/openai-chat-completions-request.ts`: 共通RequestからChat Completions Requestへの純粋変換
-- `src/providers/openai/openai-chat-completions-sse.ts`: SSEの行・イベント境界とサイズ制限の解析
-- `src/providers/openai/openai-chat-completions-events.ts`: ChunkからProviderEventへの正規化とStop／Usage処理
-- `src/providers/openai/openai-chat-completions-tool-calls.ts`: Tool Call accumulatorと不完全Call検証
-- `src/providers/openai/openai-chat-completions-adapter.ts`: ProviderAdapter境界、Fetch、Abort、Reader解放
-- `tests/provider-contract/fixtures/openai-chat-completions/`: Text、Tool Call、Usage、Error、Cancel、互換差異Fixture
-
-既存の`src/providers/provider-types.ts`、`provider-stream.ts`、`provider-error.ts`、Responses AdapterのHTTP／SSE境界を再利用できる場合は再利用する。ただしResponses固有型やResponsesのイベント名をChat Completionsへ流用しない。
+Agent側でProviderコードを再分類しない。`modelMessage`を生成する場合も、生Responseを含めず、再試行や入力修正に必要な短い共通説明だけを渡す。`retryAfterMs`は安全な数値として保持するが、再送の回数・待機・重複防止は別タスクのRetry Policyが管理する。
 
 ## 進捗
 
-- [x] AGENTS.md、project.mdc、branch.mdc、現在のブランチ固有ルールを確認する
-- [x] Provider共通契約、Router、エラー、Config安全制約、Contract Test方針を確認する
-- [x] OpenAI公式Chat Completions、Function Calling、Streaming仕様を確認する
-- [x] vLLM、Ollama、llama.cppの互換差異とTool Call条件を調査する
-- [x] Chat Completions Request／SSE／Tool Call／Profile／エラーの設計を定義する
-- [x] Chat Completions固有のRequest／Chunk型とProfile検証を実装する
-- [x] SSE parserと不完全Tool Call accumulatorを実装する
-- [x] OpenAIChatCompletionsAdapterのFetch、認証境界、Abort、リソース解放を実装する
-- [x] Text／Reasoning／Tool Call／Usage／Stop ReasonをProviderEventへ正規化する
-- [x] Tool Resultを次のChat Completions Requestへ変換する
-- [x] Provider Contract Test FixtureとAdapterテストを追加する
+- [x] `AGENTS.md`、`project.mdc`、`branch.mdc`、旧ブランチルールを確認する
+- [x] 旧ブランチルールを削除し、Providerエラー正規化用ルールを新規作成する
+- [x] 共通Provider／Agentエラー契約と既存の責務境界を確認する
+- [x] 認証、Rate Limit、Timeout、Bad Request、Retry-Afterの分類設計を定義する
+- [x] ユーザー向け情報と技術情報の分離設計を定義する
+- [x] ProviderError正規化器を実装する
+- [x] AdapterのHTTP／Transport／Streamエラーを正規化器へ接続する
+- [x] AgentErrorへの写像と安全なログ投影を実装する
+- [x] Provider Contract TestとUnit Testを追加する
 - [x] 型検査、Lint、フォーマット、テストを実行する
 
 ## 参考資料
 
 - `AGENTS.md`
-- `.cursor/rules/project.mdc`の`SYW-PROVIDER-001`〜`SYW-PROVIDER-004`
+- `.cursor/rules/project.mdc`の`SYW-PROVIDER-001`〜`SYW-PROVIDER-004`、`SYW-ERR-001`、`SYW-TEST-001`〜`SYW-TEST-002`
 - `.cursor/rules/branch.mdc`
-- `documents/design.md` §6 Provider Adapter
-- `documents/design.md` §6.0 共通契約の詳細設計
-- `documents/design.md` §6.3 Provider Router
-- `documents/design.md` §6.5 OpenAI互換Chat Completions Adapter
-- `documents/design.md` §18 エラー分類
-- `documents/design.md` §19.2 Provider Contract Test
-- `documents/issues.md` Milestone 3「OpenAI互換Chat Completions Adapterを実装する」
-- [OpenAI Chat Completions API Reference](https://developers.openai.com/api/reference/resources/chat)
-- [OpenAI Function Calling](https://developers.openai.com/api/docs/guides/function-calling)
-- [vLLM Tool Calling](https://docs.vllm.ai/en/latest/features/tool_calling/)
-- [Ollama OpenAI Compatibility](https://docs.ollama.com/api/openai-compatibility)
-- [llama.cpp OpenAI-compatible server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
-
-## 完了条件
-
-1. 設定済みの完全Endpointへ`stream: true`のRequestを送り、Text Deltaが受信順に`text-delta`へ正規化される。
-2. System／Developer Role、User／Assistant／Tool Message、画像、Tool定義、Tool ResultをProfileに従って変換できる。
-3. OpenAI、vLLM、Ollama、llama.cpp相当のProfile差異を、Agent側の分岐なしに扱える。
-4. 単一・並列Tool Callで、Indexを主キーにID・名前・引数断片を安全に結合できる。
-5. ID欠落、名前矛盾、Index衝突、引数の不正JSON、String／Object混在、完了後Delta、途中EOFをCompletedなしでErrorにできる。
-6. 有効なTool Callだけが`tool-call`として発行され、Tool Resultの`tool_call_id`が次RequestのAssistant Call IDと一致する。
-7. Usageの明示値だけを正規化し、Usage未提供・中断時に0や推定値を発行しない。
-8. `stop`、`tool_calls`／`function_call`、`length`、`content_filter`と未知の終端を共通Stop Reasonへ安全に分類できる。
-9. HTTP／SSEエラー、Retry-After、Abort前後、Abort後イベント抑止、Reader／Parser解放を検証できる。
-10. APIキー、Authorization、URL、Prompt全文、Tool Result全文、生レスポンスが共通イベント・ログ・Fixtureへ流出しない。
-11. 実APIを使わないContract Testが再現可能に実行できる。
-12. Chat Completions Adapterの完了条件を満たすまで、既存Responses Adapter、Agent Runtime、Tool Executor、Permission、Storage、UIを変更しない。
-
-## 対象外
-
-- OpenAI Responses Adapter、Anthropic Messages Adapter、Gemini Adapterの変更
-- OpenAI SDKへの実行時依存、サーバー側会話状態、`previous_response_id`、Responses固有イベント
-- Custom Tool、Audio、File、Hosted Tool、MCP、Computer Use、Web Search、Code Interpreter
-- SSEでない独自ストリーム、WebSocket、Server Push、非ストリーム専用フォールバック
-- 任意Bodyフィールド、任意Header、URLパス自動推測、認証方式の暗黙切替
-- Tool実行、AJV引数検証、Permission Service、Context Manager、Thread Store、Agent Loop
-- 自動リトライ、指数バックオフ、実APIテストの常時実行
-- `git add`、`git commit`
+- `documents/design.md` §6 Provider Adapter、§6.0.2、§18 エラー分類、§19.2 Provider Contract Test
+- `documents/issues.md` Milestone 3「Providerエラー正規化を実装する」
+- RFC 9110 §10.2.3 Retry-After（delta-seconds／HTTP-date）
 
 ## 調査結果・設計まとめ
 
-- OpenAI Chat CompletionsのStreaming Chunkでは、Tool Callの`id`、`name`、`type`が初回だけ返り、後続Chunkは`index`と引数文字列断片だけになるため、Call単位のAccumulatorが必須である。OpenAI公式例も引数をChunk順に連結してからJSONとして扱う方式を示している。
-- OpenAIのUsageは`stream_options.include_usage`で終端前の空Choices Chunkとして返るが、ストリーム中断時は最終Usageが届かない。Usageを必須イベントにせず、明示値だけを採用する。
-- OpenAI標準のStop Reasonは`stop`、`length`、`tool_calls`、`content_filter`、旧`function_call`を持つ。未知値を意味推測せず、Profileで明示した別名以外は`unknown`またはErrorとする。
-- vLLMはモデルごとにTool parser、Auto Tool Choice、互換Chat Templateの有効化が必要であり、Client側で無条件にTool Callingを保証できない。能力設定とProfileで宣言されたモデルだけへToolを送る。
-- OllamaはChat CompletionsでTools、画像、Reasoning、`stream_options.include_usage`を提供するが、対応フィールドはサーバー実装・モデルに依存する。送信Optionを有限Profileで制御し、未対応値を自動再送しない。
-- llama.cppはOpenAI互換Chat Completions、Function Calling、Reasoning Contentを提供する一方、`--jinja`や対応Chat Templateが必要で、互換性を完全保証していない。Tool引数がObjectで返る実装差も想定し、明示Profileなしに文字列とObjectを混在結合しない。
-- 互換性の正本は共通Provider契約であり、個別サーバーの生JSONをAgentへ持ち込まない。Provider差異を設定で表現できない場合は、暗黙フォールバックではなくUnsupportedとして診断する。
-- 仕様確認日: 2026-07-16。上記公式・一次資料のURLと採用範囲は`documents/design.md` §6.5.9に記録する。
+- 既存の`ProviderErrorCode`はProvider層の共通コードとして再利用し、HTTPステータスやProvider固有コードをAgentへ漏らさない。
+- 認証、Rate Limit、Timeout、Bad RequestはHTTPステータスを主根拠とし、ProviderコードはAllowlistで補助する。400系のContext超過だけは明示コードを優先して`context-exceeded`へ分ける。
+- `Retry-After`はヘッダーから安全に抽出するが、正規化処理は待機・再送を実行しない。認証・Bad Requestへ指定されたRetry-Afterを再試行許可の根拠にしない。
+- `technicalDetails`へProviderの生エラーメッセージを格納しない。診断に必要なProviderコード、ステータス、request ID、発生源だけを有限値として扱う。
+- 仕様確認日: 2026-07-16。Retry-Afterの解釈はRFC 9110を基準とし、各ProviderのHTTPエラー形式はAdapterごとのAllowlistへ閉じ込める。
+
+## 完了条件
+
+1. OpenAI Responses、OpenAI互換Chat Completions、Anthropic Messagesの各Adapterで、同じ原因が同じ`ProviderErrorCode`になる。
+2. 401／403、429、408／504、400／422をそれぞれ認証、Rate Limit、Timeout、Bad Requestとして分類できる。
+3. 413または明示的なContext超過を`context-exceeded`としてBad Requestと区別できる。
+4. `Retry-After`のdelta-secondsとHTTP-dateを有限の`retryAfterMs`へ正規化し、不正値を無視できる。
+5. 認証・Bad Requestは`retryable: false`、Rate Limit・Timeoutは共通ポリシー上の再試行候補として扱える。
+6. UIへは固定されたユーザー向け文言だけを返し、技術情報は構造化された診断経路だけへ渡せる。
+7. APIキー、Authorization、URL全体、Prompt、Tool Result、生ResponseがProviderError、AgentError、ログ、Fixture、永続化へ含まれない。
+8. Error／Cancelled後にCompletedやUsageを発行せず、同じエラーをAgent側で一度だけ共通`AgentErrorCode`へ変換できる。
+9. 実APIなしのUnit／Provider Contract Testで上記分類、Retry-After、情報分離、Abortを自動検証できる。

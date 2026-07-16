@@ -300,7 +300,9 @@ function failureEvent(payload: Record<string, unknown>, state: NormalizerState):
     type: "error",
     error: normalizeProviderError(
       {
+        source: "stream",
         code: code === "invalid_prompt" ? "bad_request" : code,
+        providerType: stringValue(error.type),
         message: stringValue(error.message),
         status,
       },
