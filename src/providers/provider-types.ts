@@ -4,11 +4,18 @@ export interface ProviderMessage {
   readonly role: ProviderRole;
   readonly content: readonly ProviderContentPart[];
   readonly toolCallId?: string;
+  readonly toolCalls?: readonly ProviderToolCall[];
 }
 
 export type ProviderContentPart =
   | { readonly type: "text"; readonly text: string }
   | { readonly type: "image"; readonly mediaType: string; readonly data: string };
+
+export interface ProviderToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly arguments: unknown;
+}
 
 export interface ProviderToolDefinition {
   readonly name: string;

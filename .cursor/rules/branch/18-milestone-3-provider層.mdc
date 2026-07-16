@@ -1,151 +1,186 @@
 ---
-description: 18-milestone-3-provider層ブランチでProvider共通層とProvider Routerを設計・実装するときに読み込む
+description: 18-milestone-3-provider層ブランチでOpenAI Responses Adapterを設計・実装するときに読み込む
 alwaysApply: false
 ---
-# Provider共通層・Provider Routerの実装方針
+# OpenAI Responses Adapterの実装方針
 
-このブランチでは、Agent RuntimeがProvider固有のHTTP API、認証、入力形式、ストリーム形式を意識せずにモデルを呼び出せる共通層を整備する。Provider共通契約に加えて、Model Catalogの論理`modelId`を検証済みの`ModelDefinition`へ解決し、対応するAdapterを選択・初期化・再利用して呼び出しへ渡すProvider Routerを対象とする。
+このブランチでは、既存のProvider共通契約とProvider Routerを利用し、OpenAI Responses互換APIへ接続するAdapterを実装する。Agent RuntimeはResponses固有のHTTP形式、SSEイベント名、Function CallのID形式、Usageの内訳を知らず、共通のProviderRequestとProviderEventだけを扱う。
+
+設計済みのResponses Adapterをこのブランチで実装する。Adapter本体、HTTP通信、SSE parser、Tool Call正規化、Contract Testを対象とし、Agent LoopやTool Executorの実装へ責務を広げない。
 
 ## 実装方針
 
-- `ProviderAdapter`はExtension Host内の境界とし、Agentの判断、Tool実行、権限判定、履歴圧縮、リトライ実行を持たせない。
-- Routerは`modelId`を直接Provider名へ変換しない。必ず同一のModel Catalogスナップショットから`ModelDefinition`を解決し、`provider.apiType`でAdapterを選択する。
-- Adapterの登録は`apiType`をキーとするRegistryへ集約する。初期対応はOpenAI Responses、OpenAI互換Chat Completions、Anthropic Messagesの3プロトコルとし、Geminiは第2段階とする。
-- RouterはCatalogの解決結果、Adapter Registry、Provider設定、Provider Serviceを組み合わせるComposition層とする。メッセージ変換、ストリーム正規化、Provider APIエラー分類はAdapterの責務とする。
-- Provider設定にはURLと検証済みヘッダーを使うが、APIキーやAuthorizationヘッダーの値を`ProviderRequest`、共通型、ログ、永続化へ渡さない。認証情報は呼び出し直前にProvider Service／SecretStorageからExtension Host内で解決する。
-- AdapterはFactoryで生成し、RouterがProvider単位の実行可能インスタンスをキャッシュする。キャッシュキーはCatalog上のProvider IDと、URL・apiType・安全な設定revisionを含むProvider構成の同一性で定める。
-- 同一Providerへの並行呼び出しでは同一インスタンスを再利用する。ただしRun固有のTool Callバッファ、Usage、Abort状態をAdapterインスタンスへ保存せず、各`stream`呼び出しのスコープに閉じ込める。
-- 設定変更時は実行中Runの解決済みAdapterとProvider設定を固定し、次のRunから新しいCatalog revisionを使用する。古いキャッシュは新規Runへ再利用せず、参照がなくなった時点で破棄可能にする。
-- 未登録の`apiType`、Catalogで解決不能な`modelId`、不整合なProvider設定、認証情報未設定は、秘密情報やURL全体を含まない構造化エラーへ変換する。Provider未登録をネットワークエラーやモデル未検出として扱わない。
-- RouterはHTTP通信、リトライ、Tool実行、引数Schema検証、権限確認、履歴保存、コンテキスト圧縮、停止条件の判断を担当しない。Routerの公開結果は共通`ProviderAdapter`契約と安全なRouterエラーに限定する。
+- Adapterの責務は、共通メッセージ・システム指示・Tool定義・Tool Resultの変換、Responses SSEイベントの正規化、Tool Call IDの保持、Usage／Stop Reasonの正規化、Providerエラー分類、キャンセル、リトライ可否の判定に限定する。
+- Agentの判断、Tool実行、AJVによるTool引数検証、Permission Profileの判定、Tool Resultのマスク・短縮、会話保存、コンテキスト圧縮、リトライ実行はAdapterへ入れない。
+- Configured URLはModel Catalogで検証済みの完全なResponsesエンドポイントとして扱う。Adapterが`/v1/responses`を推測してURLへ連結しない。
+- 認証情報はProvider Service／Factoryから初期化境界へ渡し、`Authorization`、APIキー、URL内認証情報、任意ヘッダー値をProviderRequest・ProviderEvent・ログ・Fixture・永続化へ流出させない。
+- OpenAI公式Responses APIとResponses互換APIの差異は、明示的なAdapter Profileまたはtransport境界へ閉じ込める。Agent側にProvider固有分岐を追加しない。
+- 初期対応はHTTP SSE（`stream: true`）とFunction Toolだけとする。Hosted Tool、MCP、Computer Use、File Search、Code Interpreter、Web Search、Background Mode、WebSocket Modeは対象外とする。
+- Run固有のSSE parser、Tool Call accumulator、Usage、Abort状態はAdapterインスタンスへ保存せず、各`stream`呼び出しのスコープに閉じ込める。
+- OpenAI ResponsesのFunction Callでは、Responses固有の項目`id`ではなく`call_id`を内部Tool Call IDとして保持する。次のRequestでは`function_call`と`function_call_output`の双方を同じ`call_id`で対応付ける。
+- Tool Callを受信してもAdapterは実行しない。Agentが権限確認・引数検証・実行を済ませ、`tool`メッセージとして返したResultを次回Requestへ変換する。
+- Responsesの`instructions`は共通`system`メッセージから毎回再構成する。初期実装では`previous_response_id`、`store`、サーバー側会話状態へ依存しない。
+- Reasoningの公開Summaryは共通`reasoning-delta`へ正規化できるが、非公開推論本文を保存・表示・代替利用しない。Reasoning Itemを伴うステートレスTool Callingを有効化する場合は、別途Opaque Continuationの共通契約を先に設計する。
+- UsageはResponsesの完了イベントに明示された値だけを採用する。未提供の値を0や推定値で補完しない。
+- SSEの未知イベントをText、Reasoning、Tool Callへ推測変換しない。不正な順序、欠落ID、未完了JSON、完了後の追加Deltaは安全な非再試行エラーとして扱う。
+- `AbortSignal`は開始前・読込中・完了処理前に検査し、Abort後のイベントを破棄する。Reader、SSE parser、accumulatorは`finally`で解放する。
+- 実APIテストは明示的な環境変数とユーザー指定がある場合だけ実行し、通常のContract TestはFake Fetchと保存済みSSE Fixtureで完結させる。
+- OpenAI公式仕様を確認した日付と参照URLを設計書へ記録し、仕様変更時は本ルールと設計書を先に更新する。
 
 ## 設計
 
-### 境界と依存
+### 境界
 
 ```text
-Agent Service
-    │ modelId + ProviderRequest
-    ▼
-ProviderRouter ──► ModelCatalog.resolve(modelId)
-    │              └─► ModelDefinition(provider.apiType, provider設定)
-    ├────────────► ProviderAdapterRegistry.get(apiType)
-    ├────────────► ProviderAdapterFactory.create(provider設定, credentials)
-    └────────────► adapter.stream(request, signal)
-                         │
-                         └─ AsyncIterable<ProviderEvent>
+Agent Runtime
+  │ ProviderRequest
+  ▼
+ProviderRouter
+  │ ProviderAdapter.stream(request, signal)
+  ▼
+OpenAIResponsesAdapter
+  ├─ ResponsesRequestMapper
+  ├─ FetchTransport
+  ├─ SSEParser
+  ├─ ResponsesEventNormalizer
+  └─ ToolCallAccumulator
+  │ AsyncIterable<ProviderEvent>
+  ▼
+Agent Runtime
 ```
 
-Routerへ注入する依存は、`ModelCatalog`、`ProviderAdapterRegistry`、Provider設定とSecretStorageを扱うProvider Service、Adapterの生成Factory、および必要なら構成revisionの通知源とする。RouterからWebview、Thread Store、Agent Loop、Permission Serviceへ直接依存しない。
+Adapterの入力は既存の`ProviderRequest`、出力は既存の`ProviderEvent`とする。Provider固有のRequest／Event型は`src/providers/openai/`配下に閉じ込め、共通型へResponsesの生JSONを追加しない。
 
-### 想定する契約
+### 入力の変換
 
-```ts
-interface ProviderAdapterRegistry {
-  get(apiType: ApiType): ProviderAdapterFactory | undefined;
-}
+- `ProviderRequest.modelId` → `model`。Catalogで検証済みの値をそのまま使う。
+- `system`メッセージ → `instructions`。テキストを元の順序で結合し、System内画像は拒否する。
+- `user`メッセージ → `{ type: "message", role: "user" }`。Textは`input_text`、画像は`input_image`へ変換する。
+- `assistant`メッセージ → `{ type: "message", role: "assistant" }`。過去のTextを保持し、過去のTool Callは独立した`function_call`入力項目へ変換する。
+- `ProviderToolCall` → `{ type: "function_call", call_id, name, arguments }`。引数はJSON文字列にする。
+- `tool`メッセージ → `{ type: "function_call_output", call_id, output }`。`toolCallId`を必須とし、Tool Resultの意味内容を変更しない。
+- `ProviderToolDefinition` → `{ type: "function", name, description, parameters }`。`inputSchema`を`parameters`へ写し、`strict`やSchema制約を黙って追加・削除しない。
+- Requestには`stream: true`、`parallel_tool_calls: true`、`truncation: "disabled"`を設定する。アプリケーション側のコンテキスト予算を迂回する自動Truncationは許可しない。
+- `temperature`、`maxOutputTokens`、`reasoningEffort`は、未定義値を送らず、Responsesで対応するフィールドへ明示的に対応付ける。
 
-interface ProviderAdapterFactory {
-  readonly apiType: ApiType;
-  create(input: ProviderAdapterInit): Promise<ProviderAdapter>;
-}
+### ストリームの正規化
 
-interface ProviderAdapterInit {
-  readonly providerId: string;
-  readonly vendor: string;
-  readonly apiType: ApiType;
-  readonly url: string;
-  readonly headers: Readonly<Record<string, string>>;
-  // credentialの実値はAdapter初期化の内部境界に限定し、共通Requestには含めない
-  readonly credential?: string;
-}
+- `response.output_text.delta` → `text-delta`
+- `response.reasoning_summary_text.delta` → `reasoning-delta`
+- `response.output_item.added`のFunction Call → `tool-call-start`
+- `response.function_call_arguments.delta` → `tool-call-delta`
+- `response.function_call_arguments.done` → JSON解析後の`tool-call`
+- `response.completed` → 明示されたUsageを先に発行し、最後に`completed`
+- `response.incomplete`または`incomplete_details` → `max-tokens`／`content-filter`
+- `response.failed`またはSSE `error` → `error`
 
-interface ProviderRouter {
-  stream(
-    modelId: string,
-    request: ProviderRequest,
-    signal: AbortSignal,
-  ): AsyncIterable<ProviderEvent>;
-  countTokens?(
-    modelId: string,
-    input: TokenCountInput,
-    signal: AbortSignal,
-  ): Promise<number>;
-}
+Tool Call accumulatorはResponsesの`item_id`を内部キーにし、`call_id`、名前、引数文字列を保持する。Stream終了時に未完了Callが残った場合は`completed`を発行しない。並列CallはCallごとに独立して保持し、受信順を変更しない。
+
+正常な`response.completed`でもFunction CallがあればStop Reasonは`tool-call`、Function Callがなければ`end-turn`とする。`max_output_tokens`は`max-tokens`、`content_filter`は`content-filter`、未定義状態は`unknown`とする。
+
+### Tool Callingの往復
+
+```text
+Request(messages, tools)
+  → stream
+  → tool-call(id=call_id, name, arguments)
+  → Agentが検証・権限確認・実行
+  → assistant.toolCalls + tool(toolCallId, result)
+  → 次のRequest
 ```
 
-実際の型名や認証の受け渡し方法は既存の`src/providers/provider-types.ts`、`src/providers/provider-service.ts`との整合を優先する。公開`ProviderRequest.modelId`はCatalogで解決したModel IDと一致することをRouter入口で検証し、呼び出し側の任意値をそのまま転送しない。
+1回のResponseに複数Callがある場合は、全Callを共通イベントとして発行してから`completed(tool-call)`を発行する。
+2回目以降のRequestでは、Assistantの元Tool CallとTool Resultを会話順に含め、Responsesの`function_call`と`function_call_output`へそれぞれ変換する。
+AdapterはTool実行、並列実行、失敗時の再試行、Resultの要約を行わない。
 
-### 解決・初期化・再利用の手順
+### エラー・キャンセル
 
-1. 呼び出し開始時のCatalog revisionを取得し、`modelId`を`resolve`する。見つからない場合は`MODEL_NOT_AVAILABLE`相当のRouterエラーで終了する。
-2. 解決したProviderの`apiType`をRegistryで検索する。登録がない場合は`MODEL_ADAPTER_UNSUPPORTED`相当の非再試行エラーで終了する。
-3. Provider設定を安全性検証済みの値として確認し、Provider Serviceから必要な認証情報を解決する。Secretの取得失敗・未設定は`MODEL_SECRET_UNAVAILABLE`相当で終了する。
-4. Provider構成のキャッシュキーを計算し、同じ構成の初期化済みAdapterを取得する。未登録ならFactoryを一度だけ呼び出し、同一キーの並行初期化は共有する。
-5. `ProviderRequest`のmodel IDと解決済みModel IDを検証し、解決時点のAdapterへ`stream`または`countTokens`を委譲する。
-6. Catalog revisionが変わっても実行中のAsyncIterableは差し替えない。次回呼び出しで新しい構成キーを使い、旧Adapterは新規呼び出しから隔離する。
+HTTP 401／403は認証、429はRate Limit、408はTimeout、400／422はBad Request、413またはコンテキスト超過はContext Exceeded、404はUnsupported、接続失敗はNetworkへ分類する。HTTP BodyやSSE生データをユーザー向けメッセージへ直接渡さない。
+`Retry-After`は安全な整数だけを`retryAfterMs`へ保持し、実際のリトライはAgent／Provider Service側で判断する。
+Abort前の呼び出しは通信を開始せず、読込中Abortは通信・Reader・bufferを破棄して`cancelled`を1回だけ発行する。Abort後のイベント、Error、Completedは発行しない。
 
-### エラーとライフサイクル
+### 実装予定単位
 
-Router固有のエラーは、少なくとも`model-not-found`、`adapter-not-registered`、`provider-initialization-failed`、`credential-unavailable`、`request-model-mismatch`へ分類する。`ProviderError`との変換境界を明確にし、ユーザー向けには安全な固定文言、ログにはProvider ID・apiType・Model ID・revision・失敗分類だけを記録する。
+- `src/providers/openai/openai-responses-types.ts`: Responses固有の最小入力・SSE判別型
+- `src/providers/openai/openai-responses-request.ts`: 共通RequestからResponses Requestへの純粋変換
+- `src/providers/openai/openai-responses-sse.ts`: SSEの行・イベント境界の解析
+- `src/providers/openai/openai-responses-events.ts`: ResponsesイベントからProviderEventへの正規化
+- `src/providers/openai/openai-responses-adapter.ts`: ProviderAdapter境界、Fetch、Abort、リソース管理
+- `tests/provider-contract/fixtures/openai-responses/`: 正常系・Tool Call・Usage・Error・Cancel Fixture
 
-初期化失敗はキャッシュへ保存せず、同じ構成の次回呼び出しで再試行可能にする。Adapterの`dispose`契約が存在する場合は、旧構成の参照がなくなった後に一度だけ破棄する。Routerの破棄時は新規呼び出しを拒否し、進行中RunのAbortとAdapterの後始末を完了してから依存を解放する。
+上記を実装単位とし、既存の`src/providers/provider-types.ts`、`provider-stream.ts`、`provider-error.ts`を再利用する。Responses固有の型を共通契約へ重複定義しない。
 
 ## 進捗
 
-- [x] `AGENTS.md`、プロジェクトルール、共通ブランチルール、ブランチ固有ルールを確認する
-- [x] `documents/design.md`のModel Catalog、Provider Adapter、エラー、テスト方針を確認する
-- [x] Provider共通契約、イベントライフサイクル、責務境界を設計する
-- [x] Provider Routerの解決・初期化・再利用・設定更新時の一貫性を設計する
-- [x] `documents/design.md`へProvider Routerの設計を追記する
-- [x] このブランチ用ルールファイルへProvider Routerの設計を反映する
-- [x] Provider Routerの型・Registry・Factory境界を実装する
-- [x] Model CatalogからAdapterを選択する解決処理を実装する
-- [x] Provider未登録・未解決Model・初期化失敗・認証情報未設定のエラー処理を実装する
-- [x] ProviderごとのAdapter初期化共有・構成変更時の隔離・破棄を実装する
-- [x] Router単体テスト、Provider Contract Test、Extension Integration Testを実装する
+- [x] AGENTS.md、project.mdc、branch.mdc、現在のブランチ固有ルールを確認する
+- [x] documents/design.mdのProvider共通契約、Router、エラー、Contract Test方針を確認する
+- [x] OpenAI公式のResponses Streaming、Function Calling、Create Response仕様を確認する
+- [x] Responsesのメッセージ、instructions、Tool定義、Tool Call／Result、SSE、Usage、Stop Reasonの変換方針を設計する
+- [x] 既存の共通Provider契約に過去Tool Call再送用の`ProviderToolCall`設計を反映する
+- [x] Responses固有のRequest／SSE型と変換責務を実装する
+- [x] SSE parserとTool Call accumulatorを実装する
+- [x] OpenAIResponsesAdapterのFetch、認証境界、Abort、リソース解放を実装する
+- [x] Text／Reasoning／Tool Call／Usage／Stop ReasonをProviderEventへ正規化する
+- [x] Tool Resultを次のResponses Requestへ変換する
+- [x] Providerエラー、Retry-After、HTTP／SSE失敗を分類する
+- [x] Provider Contract Test FixtureとAdapterテストを追加する
 - [x] 型検査、Lint、フォーマット、テストを実行する
 
 ## 参考資料
 
-- `documents/design.md` §5.5 Model Catalog
+- `AGENTS.md`
+- `.cursor/rules/project.mdc`の`SYW-PROVIDER-001`〜`SYW-PROVIDER-004`
+- `.cursor/rules/branch.mdc`
 - `documents/design.md` §6 Provider Adapter
-- `documents/design.md` §6.3 Provider Router
+- `documents/design.md` §6.0 共通契約の詳細設計
+- `documents/design.md` §6.4 OpenAI Responses Adapter
 - `documents/design.md` §7 エージェント実行方式
 - `documents/design.md` §18 エラー分類
 - `documents/design.md` §19.2 Provider Contract Test
-- `.cursor/rules/project.mdc` の`SYW-PROVIDER-001`〜`SYW-PROVIDER-004`
-- `.cursor/rules/project.mdc` の`SYW-MODEL-001`〜`SYW-MODEL-005`
-- `.cursor/rules/project.mdc` の`SYW-ERR-001`、`SYW-TEST-001`、`SYW-TEST-002`
-- `documents/issues.md` Milestone 3「Provider Routerを実装する」
+- `documents/issues.md` Milestone 3「OpenAI Responses Adapterを実装する」
+- [OpenAI: Streaming API responses](https://developers.openai.com/api/docs/guides/streaming-responses)
+- [OpenAI: Function calling](https://developers.openai.com/api/docs/guides/function-calling)
+- [OpenAI: Create a model response](https://developers.openai.com/api/reference/resources/responses/methods/create)
 
 ## 完了条件
 
-1. 有効なModel IDから、同一Catalog revisionの`ModelDefinition`を解決できる。
-2. `provider.apiType`に対応するAdapter Factoryを選択し、未登録時は安全な構造化エラーを返せる。
-3. Provider設定とSecretStorageをExtension Host内で解決し、秘密情報を共通Request・ログ・保存データへ流出させない。
-4. 同一Provider構成のAdapter初期化を共有・再利用し、構成変更後の新規Runへ旧Adapterを使わない。
-5. 解決済みModel IDを用いた`ProviderRequest`を対象Adapterへ渡し、`ProviderEvent`をAgentへ返せる。
-6. 呼び出し中のCatalog更新、AbortSignal、初期化失敗、Adapter未登録、Model未解決をテストで検証できる。
-7. モデル選択で得たModel IDからProvider呼び出しまで、Provider固有形式をAgentへ漏らさず解決できる。
+1. Responses互換のFake HTTP APIに対して、Text Deltaが受信順に`text-delta`へ正規化される。
+2. System指示が`instructions`へ、User／Assistant／Tool Resultが正しいResponses入力項目へ変換される。
+3. Tool定義の名前、説明、JSON Schemaが保持される。
+4. 単一・並列Function Callで`call_id`が保持され、不完全JSONやID矛盾を安全に拒否できる。
+5. Agentが返したTool Resultが次のRequestの`function_call_output`へ対応付けられる。
+6. 明示されたUsageとStop Reasonが共通形式へ正規化される。
+7. HTTP／SSEエラー分類、Abort前後の通信抑止、Readerとバッファ解放をテストできる。
+8. APIキー、Authorization、URL、Prompt全文、Tool Result全文、生レスポンスが共通イベント・ログ・Fixtureへ流出しない。
+9. 実APIを使わないContract Testが再現可能に実行できる。
+10. OpenAI Responses Adapterの完了条件を満たすまで、Agent Runtime、Tool Executor、Permission、Storage、UIを変更しない。
 
 ## 対象外
 
-- OpenAI、Anthropic等のProvider固有Adapter本体
-- Agent Runtime、Tool Executor、Permission Service、履歴圧縮の実装
-- 自動リトライの実行、指数バックオフの実装
-- 実APIを用いたテスト（明示的な環境変数がある場合を除く）
-- Catalog、SecretStorage、Webview UIの仕様変更を伴う機能追加
+- OpenAI互換Chat Completions Adapter、Anthropic Messages Adapter、Gemini Adapter
+- Hosted Tool、MCP、Computer Use、File Search、Code Interpreter、Web Search
+- Responses APIのサーバー側会話状態、`previous_response_id`、Background Mode、WebSocket Mode
+- Reasoning ItemのOpaque Continuationを共通契約へ追加する変更
+- Agent Loop、Tool Executor、AJV引数検証、Permission Service、Context Manager、Thread Store
+- 自動リトライ、指数バックオフ、実APIテストの常時実行
 - `git add`、`git commit`
 
 ## 調査結果・設計まとめ
 
-- 既存の`ConfiguredModelCatalog`は`ModelDefinition.provider.apiType`を含む利用可能モデルを解決できるため、Routerは別のモデル一覧やProvider名の推測を持たず、このCatalogを唯一の解決元とする。
-- 既存の`ProviderAdapter`は`stream`と任意の`countTokens`を共通契約として定義済みである。Routerはこの契約の前後にある選択・認証・キャッシュだけを担当し、Adapterのイベント正規化責務を重複実装しない。
-- 既存の`DefaultProviderService`はSecretStorageとProvider実行中リクエストのライフサイクル境界を持つ。Router実装ではこの責務を拡張しても、秘密情報をModel Catalogや共通型へ逆流させない。
-- Catalogの既存診断コードにはProvider未登録、Adapter非対応、Secret未設定があるため、Routerエラーはこれらの診断と重複する場合の表示分類を定義する。実行時の未登録・未解決は例外文字列ではなく、同じ安全な分類体系へ変換する。
-- `ProviderAdapter`に初期化・破棄の契約が未定義なため、Router設計ではFactoryとキャッシュを先に境界化し、実装時にAdapterへライフサイクルを追加するか、Factory管理オブジェクトで後始末を包むかを既存Adapter実装との整合で確定する。
-- Provider構成の同一性に秘密値そのものを含めない。Secret更新時はProvider Serviceまたは明示的なcredential revisionをキャッシュキーへ反映し、秘密値をハッシュ・ログ・診断へ出さない。
-- 実装では`ProviderAdapter.dispose`を任意契約として追加し、Router破棄時にキャッシュ済みAdapterを解放できるようにした。初期化失敗はキャッシュせず、同一構成の次回呼び出しで再試行する。
-- Catalogの`getRevision()`とProvider Serviceのcredential revisionをAdapterキャッシュキーへ含めた。設定または認証情報が更新された場合、実行中のAdapterを差し替えず、次の呼び出しだけが新しいAdapterを初期化する。
-- このブランチの達成点は、Agentが`modelId`と共通`ProviderRequest`だけを渡し、Routerが同一スナップショットで適切なAdapterを選び、再利用可能なProvider呼び出しへ到達させることである。
+- 既存の共通イベントにはText Delta、Reasoning Delta、Tool Call開始／断片／確定、Usage、Completed、Error、Cancelledがあり、Responsesの意味イベントを一対一に近く正規化できる。
+- 既存の`ProviderMessage`はTool Resultの`toolCallId`だけを持ち、過去AssistantのFunction Callを再送できなかったため、設計書の共通契約へ`ProviderToolCall[]`を追加した。これによりResponsesの`function_call`と`function_call_output`を同一Requestへ再構成できる。
+- OpenAI ResponsesはSystem／Developer相当の指示を`instructions`で受け取り、入力会話を`input`項目として受け取る。AdapterはSystem指示を毎回再構成し、Thread StoreやAgentへResponses固有の指示配置を漏らさない。
+- Responses Function CallはResponse Itemの`id`とTool Result紐付け用の`call_id`を別に持つ。内部IDには`call_id`を採用し、stream中の断片蓄積キーには一時的な`item_id`を使う。
+- Responses Streamingは意味イベントをSSEで返すため、ネットワークChunk、SSEイベント、JSONイベントの境界を三層に分離する。Function Call引数はDeltaを蓄積して完了時に一度だけJSON解析する。
+- Usageは完了Responseの明示値だけを正規化し、cached tokensとreasoning tokensの内訳を任意値として保持する。未提供値を推定しない。
+- Responsesの正常完了とFunction Callは共存するため、共通Stop Reasonは出力項目にFunction Callがあるかを基準に`tool-call`へ分類する。
+- 初期実装ではステートレスに全会話を再送する。ResponsesのReasoning Item再送が必要なモデルをTool Calling対象にする前に、非公開推論を保存しないOpaque Continuation契約を別途設計する。
+- 仕様確認日: 2026-07-16。OpenAI公式資料のURLは「参考資料」と設計書 §6.4.7に記録した。
+- `src/providers/provider-types.ts`へ`ProviderToolCall`を追加し、過去のAssistant Tool Callを次回Responses Requestへ再送できる共通契約にした。
+- `src/providers/openai/`へResponses Request変換、SSE parser、イベント正規化、Adapter／Factoryを追加した。認証はFactory初期化境界のCredentialからAuthorizationへ組み立て、共通型へ逆流させない。
+- SSE parserはネットワークChunkとSSEイベントの境界を分離し、最大16MiBのストリームサイズ、Abort時のReader解放、未知イベントの非推測処理を行う。
+- Adapterは設定済み完全Endpointをそのまま使用し、`redirect: "error"`、Timeout、Retry-After、HTTP／SSEエラー分類を実装した。Redirect先を自動追跡しないことで、検証されていない外部URLへの転送を防ぐ。
+- Tool Callの蓄積キーはResponsesの`item_id`、内部Tool Resultの紐付けIDは`call_id`とし、単一・並列Call、不完全JSON、重複IDをContract Testで検証した。
+- `tests/provider-contract/openai-responses-adapter.test.ts`で、Request変換、Text／Usage／Stop Reason、Tool Call／Tool Result、HTTP 429、AbortをFake Fetchで検証した。実APIは使用していない。
+- `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`が成功した。
+- このブランチで未実装なのはHosted Tool、Reasoning ItemのOpaque Continuation、Chat Completions／Anthropic Adapter、Agent Loop、実APIテストである。

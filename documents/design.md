@@ -936,6 +936,14 @@ interface ProviderMessage {
   readonly role: ProviderRole;
   readonly content: readonly ProviderContentPart[];
   readonly toolCallId?: string;
+  readonly toolCalls?: readonly ProviderToolCall[];
+}
+
+interface ProviderToolCall {
+  /** Provider間で再利用する論理ID。Responsesではcall_idへ対応付ける。 */
+  readonly id: string;
+  readonly name: string;
+  readonly arguments: unknown;
 }
 
 type ProviderContentPart =
@@ -1013,7 +1021,7 @@ interface ProviderError {
 }
 ```
 
-AdapterはProvider固有のTool Call断片を内部バッファで`id`単位に結合し、JSONとして完全に解析できた場合だけ`tool-call`を発行する。`tool-call-start`や`tool-call-delta`をAgentが再結合する設計にはしない。ストリーム終了時に未完了の引数、ID欠落、名前欠落、同一IDの矛盾が残った場合は`completed`を発行せず、`bad-request`または`unknown`の非再試行エラーとして終了する。並列Tool Callは複数のIDを独立して保持し、受信順を壊さない。
+AdapterはProvider固有のTool Call断片を内部バッファで`id`単位に結合し、JSONとして完全に解析できた場合だけ`tool-call`を発行する。`tool-call-start`や`tool-call-delta`をAgentが再結合する設計にはしない。ストリーム終了時に未完了の引数、ID欠落、名前欠落、同一IDの矛盾が残った場合は`completed`を発行せず、`bad-request`または`unknown`の非再試行エラーとして終了する。並列Tool Callは複数のIDを独立して保持し、受信順を壊さない。`ProviderEvent`のTool Call `id`は、Tool Resultを次のリクエストへ紐付けるための論理IDであり、Responses固有の出力項目`id`ではなく`call_id`へ対応させる。過去のTool Callを再送できるよう、`assistant`メッセージは`toolCalls`を保持し、`tool`メッセージは対応する`toolCallId`を必須とする。
 
 `usage`はProviderが明示的に返した値だけを設定し、未提供の値を0や推定値で埋めない。`completed`は最終イベントとして扱う。ErrorまたはCancelledの後に別の完了イベントを発行してはならず、Agent側はErrorを`AgentErrorCode`へ変換する。Provider固有の生エラー本文はユーザー向けメッセージへ直接渡さず、安全な分類と短い説明に置き換える。
 
@@ -1118,6 +1126,147 @@ Unit TestではModel ID解決、apiTypeごとのFactory選択、未登録Adapter
 完了条件は、利用可能なモデルIDから同一Catalog revisionのProvider設定とAdapterを解決し、共通`ProviderRequest`を対象Adapterへ渡して`ProviderEvent`をAgentへ返せることである。未登録Provider、未解決Model、認証情報未設定、初期化失敗は安全なエラーとして扱えることも含む。
 
 ---
+
+### 6.4 OpenAI Responses Adapter
+
+`OpenAIResponsesAdapter`は、`apiType: "responses"`のモデルに対して、共通`ProviderRequest`をResponses互換APIの`POST <configured-url>`へ変換し、HTTPストリームを共通`ProviderEvent`へ正規化する。Configured URLはModel Catalogで検証済みの完全なエンドポイントを使用する。Adapterが`/v1/responses`などのパスを推測・連結してはならない。既定設定は`https://api.openai.com/v1/responses`とするが、互換サービスのURLは同じSchemaの安全なURL検証を通過したものだけを受け付ける。
+
+#### 6.4.1 対象範囲と非対象
+
+対象はResponses APIのテキスト会話、システム指示、画像入力、Function Tool定義、単一・並列Function Call、Function Call Result、SSEストリーミング、Usage、完了・不完全・エラー・キャンセルの正規化である。AdapterはFunctionを実行せず、引数をAJVで検証せず、権限を判定せず、Tool Resultを短縮・マスクせず、Agent Loopを進めない。
+
+Responses APIの組み込みHosted Tool、MCP、Computer Use、File Search、Code Interpreter、Web Search、Background Mode、WebSocket ModeはこのAdapterの初期実装対象外とする。内部ToolはすべてResponsesの`type: "function"`として送信し、未知のTool種別は暗黙に変換せず`unsupported`または`bad-request`へ分類する。
+
+#### 6.4.2 リクエスト変換
+
+Adapterは呼び出しごとに秘密情報を含まないリクエストを組み立て、次の形式で送信する。`Authorization`はFactory／Provider Serviceが初期化境界で注入し、共通リクエストのJSON、ログ、Fixtureへ出さない。
+
+```ts
+interface ResponsesRequest {
+  readonly model: string;
+  readonly instructions?: string;
+  readonly input: readonly ResponsesInputItem[];
+  readonly tools?: readonly ResponsesFunctionTool[];
+  readonly temperature?: number;
+  readonly max_output_tokens?: number;
+  readonly reasoning?: { readonly effort: string };
+  readonly stream: true;
+  readonly parallel_tool_calls: true;
+  readonly truncation: "disabled";
+}
+
+interface ResponsesFunctionTool {
+  readonly type: "function";
+  readonly name: string;
+  readonly description?: string;
+  readonly parameters: unknown;
+}
+```
+
+変換規則は次のとおりとする。
+
+| 共通入力 | Responses入力 | 規則 |
+|---|---|---|
+| `ProviderRequest.modelId` | `model` | Catalogで解決済みの値をそのまま使う。再推測・別名変換をしない |
+| `system`メッセージ | `instructions` | テキスト部分を元の順序で結合し、空でなければ1つの指示文字列にする。画像を含むSystem指示は拒否する |
+| `user`メッセージ | `type: "message"`, `role: "user"` | テキストを`input_text`、画像を`input_image`へ変換する |
+| `assistant`メッセージ | `type: "message"`, `role: "assistant"` | 過去応答のテキストを保持する。`toolCalls`は後述の`function_call`入力項目へ分離する |
+| `ProviderToolCall` | `type: "function_call"` | `id`を`call_id`、`name`を`name`、`JSON.stringify(arguments)`を`arguments`へ設定する |
+| `tool`メッセージ | `type: "function_call_output"` | `toolCallId`を`call_id`へ設定し、テキストだけなら文字列、画像を含む場合は入力コンテンツ配列へ変換する |
+| `ProviderToolDefinition` | `type: "function"` | `name`、`description`、`inputSchema`をそれぞれ`name`、`description`、`parameters`へ写す。Schemaを独自に削除・書換えしない |
+
+`instructions`と通常の`input`は別の責務として扱う。`instructions`は毎回送信し、`previous_response_id`を使う場合でも省略しない。初期実装は会話を共通メッセージから再構成するステートレス方式とし、Responses APIのサーバー側会話状態、`store`、`previous_response_id`に依存しない。これにより、Provider間でThread Storeの正本を共有できる。
+
+`ProviderMessage`の各Content Partは順序を維持する。画像の`data`は既にData URLならそのまま使い、Base64本体なら`data:<mediaType>;base64,<data>`へ変換する。URL内の認証情報、未知のMedia Type、空の画像データ、System内画像は変換前に安全な`bad-request`へ分類する。入力文字列・Tool Resultの内容をログへ複製しない。
+
+ResponsesのFunction Toolでは`parameters`にJSON Schemaを渡す。Adapterは必須プロパティの補完、`additionalProperties`の追加、`strict`の強制を行わない。厳格Schemaが必要なToolはTool Registry／Agent側の定義として用意し、Provider差異を理由に意味を変えない。空のTool配列は`tools`を省略するか空配列として一貫して送信し、実装では一方に固定する。
+
+#### 6.4.3 SSE受信とイベント正規化
+
+`stream: true`でHTTPレスポンスを要求し、`Content-Type: text/event-stream`のSSEをReader単位で読む。SSEの`event`、複数行`data`、空行によるイベント境界を正しく処理し、JSONの境界がネットワークChunk境界と一致することを仮定しない。JSONイベントの未知フィールドは無視するが、未知の意味イベントをTextやTool Callへ推測変換しない。
+
+主要な変換は次のとおりとする。
+
+| Responsesイベント | 共通イベント | 処理 |
+|---|---|---|
+| `response.output_text.delta` | `text-delta` | `delta`が文字列の場合だけ、その順序で発行する |
+| `response.reasoning_summary_text.delta` | `reasoning-delta` | 公開Summaryだけを発行する。非公開推論本文・暗号化内容はログ・永続化・UIへ渡さない |
+| `response.output_item.added`の`function_call` | `tool-call-start` | Responses項目の内部`item_id`でバッファを作り、`call_id`と名前を確定する |
+| `response.function_call_arguments.delta` | `tool-call-delta` | `item_id`で対応するバッファへ`delta`を追記し、論理ID=`call_id`で発行する |
+| `response.function_call_arguments.done` | `tool-call` | `arguments`全体または蓄積文字列をJSON解析し、完全な`ProviderToolCall`として発行する |
+| `response.completed` | `usage`、`completed` | 明示されたUsageを先に発行し、Tool Callがあれば`tool-call`、なければResponse状態に応じた完了理由を発行する |
+| `response.incomplete`／完了Responseの`incomplete_details` | `completed` | `max_output_tokens`は`max-tokens`、`content_filter`は`content-filter`へ変換する |
+| `response.failed`またはSSE `error` | `error` | HTTP／Responseエラーを`ProviderError`へ分類し、後続イベントを捨てる |
+
+`response.output_item.added`が先に来ないFunction Call、`item_id`・`call_id`・名前の欠落、同一IDでの名前変更、引数完了後の追加Delta、JSONとして不正な引数は不完全Tool Callとする。該当Runでは`completed`を発行せず、`bad-request`の非再試行エラーを1回だけ発行する。並列Tool CallはResponsesの`output_index`または`item_id`で独立管理し、受信順と`call_id`の対応を壊さない。
+
+Responsesの`response.completed.response.status`が`completed`でも、出力にFunction Callが1つ以上含まれる場合は共通のStop Reasonを`tool-call`とする。Function Callがなく正常完了なら`end-turn`とする。`max_output_tokens`は`max-tokens`、`content_filter`は`content-filter`、それ以外の未定義・未対応状態は`unknown`とする。Stop Reasonをモデル名、テキスト内容、推測したFinish Reasonから補完してはならない。
+
+Usageは完了Responseの`usage`に明示された値だけを採用する。`input_tokens`と`output_tokens`を共通の必須値へ写し、`input_tokens_details.cached_tokens`を`cachedTokens`、`output_tokens_details.reasoning_tokens`を`reasoningTokens`へ写す。Usageがない場合は`usage`イベントを発行せず、0や推定値で補完しない。Usageを複数回受信した場合は最終値だけを採用し、重複イベントを発行しない。
+
+#### 6.4.4 Tool Callingの往復
+
+Tool実行をAdapter内へ入れず、Agent Runtimeとの往復を次の順序に固定する。
+
+```text
+ProviderRequest(messages + tools)
+        │
+        ▼
+POST /responses?stream=true
+        │
+        ├─ text-delta / reasoning-delta
+        ├─ tool-call-start / tool-call-delta
+        ├─ tool-call(id=call_id, name, parsed arguments)
+        ├─ usage
+        └─ completed(stopReason=tool-call)
+        │
+        ▼
+Agentが引数を検証し、権限確認後にToolを実行
+        │
+        ▼
+次のProviderRequestへ assistant.toolCalls + tool(toolCallId, result) を追加
+```
+
+Responsesが返すFunction Callは`call_id`を共通IDとして`tool-call`へ保持する。AgentがToolを実行した後は、元のAssistant `toolCalls`と対応する`tool`メッセージを同じ会話順で次のRequestへ渡す。Adapterはこの対を`function_call`と`function_call_output`へ変換する。Resultの`output`は通常文字列とし、共通Tool Resultに画像がある場合だけResponsesの入力画像コンテンツ配列へ変換する。ResultのJSON化・ANSI除去・機密マスク・サイズ制限はTool／Context層の責務であり、このAdapterで二重処理しない。
+
+1回のResponseに複数のFunction Callがある場合、すべてのCallを発行してから`completed(tool-call)`を発行する。Agent側はプロジェクトのTool並列実行ポリシーとPermission Profileに従って処理する。AdapterはResponsesの`parallel_tool_calls`を`true`に固定するが、並列実行そのものを保証・実行しない。ツール定義が空の場合はFunction Callイベントを受け付けず、Providerの契約違反としてエラーにする。
+
+ReasoningモデルでFunction Callの後続Requestを作る場合、Responses APIが要求するReasoning Itemの再送を欠落させない仕組みが別途必要になる。現在の共通`ProviderMessage`にはProvider固有のReasoning Itemを直接持ち込まないため、初期実装の完了対象は、共通履歴だけで再構成できるモデルとする。Reasoning Itemを含むモデルを有効化する前に、暗号化されたOpaque ContinuationをProvider共通契約へ追加する設計変更とContract Testを完了させる。非公開推論本文を代替として保存する設計は禁止する。
+
+#### 6.4.5 HTTP、キャンセル、エラー
+
+HTTPステータスが2xx以外の場合は、レスポンスBodyを安全な分類にだけ使用し、生BodyをそのままMessageやログへ渡さない。401／403は`auth-failed`、429は`rate-limited`、408は`timeout`、400／422は`bad-request`、413または明示的なコンテキスト超過は`context-exceeded`、404は`unsupported`、接続失敗は`network`へ分類する。`Retry-After`は安全な整数ミリ秒へ正規化できた場合だけ保持し、リトライ実行は上位層に委ねる。
+
+`stream`開始前とFetch後の両方で`AbortSignal`を確認する。Abort時はFetch、Response BodyのReader、SSE parser、Tool Call accumulatorを破棄し、`cancelled`を1回だけ発行する。Abort後に読み取ったイベント、Error、Completedは無視する。ConsumerがAsyncIterableを早期終了した場合も`finally`でReaderとバッファを解放する。認証情報、全URL、任意ヘッダー、SSE生行、Prompt全文、Tool Result全文はエラー・ログ・永続化へ含めない。
+
+Fetchはリダイレクトを自動追跡せず、検証済みのConfigured URLから別Hostへ転送しない。SSE本文には最大サイズと既定Timeoutを設け、上限超過・Timeoutはそれぞれ安全な`bad-request`・`timeout`へ分類する。タイマーはRequest完了、Abort、Consumer早期終了のすべてで解放する。
+
+#### 6.4.6 実装単位とContract Test
+
+実装は次の単位へ分割する。HTTP transport、SSE parser、Responses request mapper、Responses event normalizer、Function Call accumulator、Provider error mapperを相互に独立した純粋処理としてテスト可能にする。
+
+最低限のFixtureと検証項目は次のとおりとする。
+
+* System指示1件・複数件、User／Assistant text、画像、空ContentのRequest変換
+* Tool定義の`parameters`保持、未知Schemaの非改変、空Tool配列、Tool名欠落の拒否
+* 正常なText Delta、複数Chunkに分割されたJSON、SSE行・JSON境界の分離
+* 単一Function Call、並列Function Call、`item_id`と`call_id`の対応、Call Resultの再変換
+* Tool Call完了前のストリーム終了、重複ID、名前矛盾、不正JSON、完了後Deltaの拒否
+* Usageのcached／reasoning内訳、Usage未提供、重複Usage、0推定の禁止
+* `end-turn`、`tool-call`、`max-tokens`、`content-filter`、`unknown`のStop Reason
+* HTTP 401／403／408／413／422／429、SSE `error`、Response `failed`、Retry-After
+* Abort前、読込中Abort、Abort後イベント抑止、Consumer早期終了時のReader解放
+* Prompt、Authorization、URL、Tool Result、生レスポンスがイベント・ログへ漏れないこと
+
+実APIテストは明示的な環境変数とユーザーの実行指定がある場合だけ行う。通常のProvider Contract Testは保存済みSSE FixtureとFake Fetchで完結させ、OpenAI公式APIのレスポンスをテスト実行時に取得しない。完了条件は、Responses互換のFake APIに対して、テキストの逐次表示、Function Callの引数完全結合、Agentが返したFunction Call Resultの次ターン送信、Usage取得、Stop Reason取得が同じProvider共通契約で検証できることである。
+
+#### 6.4.7 参照仕様
+
+実装時は、仕様の変動を考慮して次のOpenAI公式資料を確認日とともに記録する。仕様と本設計が異なる場合は、Responsesの公開Schemaを優先し、互換API固有の差異はAdapter内の明示的なProfileへ閉じ込める。
+
+* [Streaming API responses](https://developers.openai.com/api/docs/guides/streaming-responses)
+* [Function calling](https://developers.openai.com/api/docs/guides/function-calling)
+* [Create a model response API reference](https://developers.openai.com/api/reference/resources/responses/methods/create)
 
 ## 7. エージェント実行方式
 
