@@ -11,6 +11,7 @@ import {
   type ThreadEvent,
   type UiToExtensionMessage,
 } from "./webview-protocol";
+import type { DiagnosticLogger } from "../observability/diagnostic-logger";
 
 export interface WebviewMessagePort {
   postMessage(message: ExtensionToUiMessage): Thenable<boolean>;
@@ -18,6 +19,7 @@ export interface WebviewMessagePort {
 }
 
 export interface ExtensionWebviewProtocolHandlers {
+  readonly logger?: DiagnosticLogger;
   readonly onMessage?: (message: UiToExtensionMessage) => void | Promise<void>;
   readonly getModelList?: (threadId: string) => ModelListPayload | Promise<ModelListPayload>;
   readonly getPermissionSummary?: (
@@ -57,6 +59,11 @@ export class ExtensionWebviewProtocolSession {
 
     const validated = this.validateOutgoingMessage(message);
     const delivered = await this.webview.postMessage(validated);
+    this.handlers.logger?.debug("protocol.outgoing", {
+      type: validated.type,
+      messageId: validated.messageId,
+      correlationId: validated.correlationId,
+    });
     if (!delivered) {
       throw new Error("The Webview rejected the protocol message");
     }
@@ -97,11 +104,18 @@ export class ExtensionWebviewProtocolSession {
 
     const message = parseUiToExtensionMessage(value);
     if (!message) {
+      this.handlers.logger?.warn("protocol.incoming.invalid", {
+        valueType: typeof value,
+      });
       await this.sendInvalidMessageError(value);
       return;
     }
 
     if (this.seenMessageIds.has(message.messageId)) {
+      this.handlers.logger?.warn("protocol.incoming.duplicate", {
+        type: message.type,
+        messageId: message.messageId,
+      });
       return;
     }
     this.rememberMessageId(message.messageId);
@@ -117,8 +131,21 @@ export class ExtensionWebviewProtocolSession {
     }
 
     try {
+      this.handlers.logger?.debug("protocol.handler.started", {
+        type: message.type,
+        messageId: message.messageId,
+      });
       await this.handlers.onMessage?.(message);
-    } catch {
+      this.handlers.logger?.debug("protocol.handler.completed", {
+        type: message.type,
+        messageId: message.messageId,
+      });
+    } catch (error) {
+      this.handlers.logger?.error("protocol.handler.failed", {
+        type: message.type,
+        messageId: message.messageId,
+        errorName: error instanceof Error ? error.name : "unknown",
+      });
       await this.sendToUi(
         createExtensionToUiMessage(
           "error",

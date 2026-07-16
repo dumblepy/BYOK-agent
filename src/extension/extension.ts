@@ -8,6 +8,7 @@ import {
 } from "../models/model-config-loader";
 import { ConfiguredModelCatalog } from "../models/model-catalog";
 import type { ProviderService } from "../providers/provider-service";
+import { OutputChannelDiagnosticLogger } from "../observability/diagnostic-logger";
 
 let applicationServices: ApplicationServices | undefined;
 let activationPromise: Promise<void> | undefined;
@@ -30,7 +31,14 @@ export function activate(context: ExtensionContext): Promise<void> {
   }
 
   activationPromise = initializeModelConfig(context)
-    .then(() => createApplicationServices(context, undefined, modelCatalog))
+    .then(() =>
+      createApplicationServices(
+        context,
+        undefined,
+        modelCatalog,
+        modelConfigOutput ? new OutputChannelDiagnosticLogger(modelConfigOutput) : undefined,
+      ),
+    )
     .then((services) => {
       applicationServices = services;
       registerApiKeyCommands(context, services.provider, modelCatalog);

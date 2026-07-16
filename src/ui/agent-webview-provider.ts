@@ -18,6 +18,7 @@ import {
   type UiToExtensionMessage,
 } from "./webview-protocol";
 import type { ModelCatalogChangeSubscription } from "../models/model-catalog";
+import type { DiagnosticLogger } from "../observability/diagnostic-logger";
 
 const WEBVIEW_ROOT = ["out", "webview"] as const;
 
@@ -59,6 +60,7 @@ export interface AgentWebviewProviderOptions {
   readonly prepareAgentRunRequest?: (
     request: AgentRunRequest,
   ) => Promise<AgentRunRequest> | AgentRunRequest;
+  readonly logger?: DiagnosticLogger;
 }
 
 export class AgentWebviewProvider implements vscode.WebviewViewProvider {
@@ -72,6 +74,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   private readonly prepareAgentRunRequest:
     ((request: AgentRunRequest) => Promise<AgentRunRequest> | AgentRunRequest) | undefined;
   private activeThreadId: string | undefined;
+  private readonly logger: DiagnosticLogger | undefined;
 
   public constructor(
     private readonly context: vscode.ExtensionContext,
@@ -84,6 +87,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     this.isWorkspaceTrusted = options.isWorkspaceTrusted ?? (() => true);
     this.onDidGrantWorkspaceTrust = options.onDidGrantWorkspaceTrust;
     this.prepareAgentRunRequest = options.prepareAgentRunRequest;
+    this.logger = options.logger;
   }
 
   public resolveWebviewView(webviewView: vscode.WebviewView): void {
@@ -96,6 +100,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     webviewView.webview.html = this.getHtml(webviewView.webview, webviewRoot);
 
     const protocolSession = new ExtensionWebviewProtocolSession(webviewView.webview, {
+      logger: this.logger,
       getModelList: (threadId) => this.getModelList(threadId),
       getPermissionSummary: (threadId) => this.getPermissionSummary(threadId),
       getProviderCredentials: (providerId) => this.getProviderCredentials(providerId),
@@ -125,6 +130,10 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     message: UiToExtensionMessage,
     protocolSession: ExtensionWebviewProtocolSession,
   ): Promise<void> {
+    this.logger?.debug("ui.message.received", {
+      type: message.type,
+      messageId: message.messageId,
+    });
     if (message.type === "select-model") {
       await this.handleSelectModel(message, protocolSession);
       return;
@@ -156,6 +165,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
 
     const text = message.payload.text.replace(/\r\n?/g, "\n");
+    this.logger?.info("agent.message.accepted-by-host", {
+      threadId: message.payload.threadId,
+      messageId: message.messageId,
+      textLength: text.length,
+    });
     if (text.trim().length === 0) {
       await protocolSession.sendToUi(
         createExtensionToUiMessage(
@@ -173,6 +187,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     if (this.modelCatalog && this.threadModelStore) {
       const modelState = await this.getModelList(message.payload.threadId);
+      this.logger?.debug("agent.model-state.loaded", {
+        threadId: message.payload.threadId,
+        selectedModelId: modelState.selectedModelId,
+        modelCount: modelState.models.length,
+      });
       if (modelState.selectedModelId === undefined) {
         await this.sendModelError(
           protocolSession,
@@ -185,13 +204,27 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
       try {
         const permissionSummary = await this.getPermissionSummary(message.payload.threadId);
+        this.logger?.debug("agent.run-prepare.started", {
+          threadId: message.payload.threadId,
+          modelId: modelState.selectedModelId,
+          permissionProfile: permissionSummary.effectiveProfile,
+        });
         await this.prepareAgentRunRequest?.({
           threadId: message.payload.threadId,
           text,
           modelId: modelState.selectedModelId,
           permissionContext: permissionSummary,
         });
-      } catch {
+        this.logger?.info("agent.run-prepare.completed", {
+          threadId: message.payload.threadId,
+          modelId: modelState.selectedModelId,
+        });
+      } catch (error) {
+        this.logger?.error("agent.run-prepare.failed", {
+          threadId: message.payload.threadId,
+          modelId: modelState.selectedModelId,
+          errorName: error instanceof Error ? error.name : "unknown",
+        });
         await this.sendModelError(
           protocolSession,
           "TOOL_EXECUTION_FAILED",
@@ -202,6 +235,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    this.logger?.debug("ui.thread-event.sending", {
+      threadId: message.payload.threadId,
+      messageId: message.messageId,
+      eventKind: "user-message",
+    });
     await protocolSession.sendThreadEvent(
       message.payload.threadId,
       {
@@ -211,6 +249,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       },
       message.messageId,
     );
+    this.logger?.info("ui.thread-event.sent", {
+      threadId: message.payload.threadId,
+      messageId: message.messageId,
+      eventKind: "user-message",
+    });
   }
 
   private async handleSelectModel(

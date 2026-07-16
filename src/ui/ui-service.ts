@@ -11,6 +11,7 @@ import {
 import type { AgentService } from "../agent/agent-service";
 import type { StorageService } from "../storage/storage-service";
 import type { ProviderService } from "../providers/provider-service";
+import type { DiagnosticLogger } from "../observability/diagnostic-logger";
 
 const AGENT_VIEW_ID = "byokAgent.view";
 type WebviewViewProviderRegistrationOptions = Parameters<
@@ -27,6 +28,7 @@ export interface UIServiceDependencies {
   readonly storage: StorageService;
   readonly provider?: ProviderService;
   readonly modelCatalog?: ModelCatalog;
+  readonly logger?: DiagnosticLogger;
   readonly registerWebviewViewProvider: (
     viewId: string,
     provider: vscode.WebviewViewProvider,
@@ -51,6 +53,7 @@ export class DefaultUIService extends ManagedService implements UIService {
       threadModelStore: this.dependencies.storage,
       isThreadRunActive: (threadId) => this.dependencies.agent.hasActiveRun(threadId),
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,
+      logger: this.dependencies.logger,
       onDidGrantWorkspaceTrust: (listener) => vscode.workspace.onDidGrantWorkspaceTrust(listener),
       prepareAgentRunRequest: (request: AgentRunRequest) =>
         this.dependencies.agent.prepareRunRequest(request),
