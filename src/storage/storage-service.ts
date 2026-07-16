@@ -10,8 +10,16 @@ import {
 } from "./thread-model-store";
 import type { CreateThreadInput, ThreadRecord, ThreadStore, ThreadUpdate } from "./thread-store";
 import type { UserSelectablePermissionProfile } from "../permissions/permission-profile";
+import {
+  FileEventStore,
+  type EventReadResult,
+  type EventSnapshot,
+  type EventStore,
+  type NewPersistedAgentEvent,
+  type PersistedAgentEvent,
+} from "./event-store";
 
-export interface StorageService extends ManagedService, ThreadModelStore, ThreadStore {
+export interface StorageService extends ManagedService, ThreadModelStore, ThreadStore, EventStore {
   readonly serviceName: "storage";
 }
 
@@ -26,6 +34,7 @@ export class DefaultStorageService extends ManagedService implements StorageServ
   private readonly disposables = new DisposableStore();
   private readonly threadModelStore: ThreadModelStore;
   private readonly threadStore: ThreadStore;
+  private readonly eventStore: EventStore;
 
   public constructor(private readonly dependencies: StorageServiceDependencies) {
     super();
@@ -34,6 +43,7 @@ export class DefaultStorageService extends ManagedService implements StorageServ
     );
     this.threadModelStore = modelStore;
     this.threadStore = modelStore.threadStore;
+    this.eventStore = new FileEventStore(getEventStoreFileSystem(dependencies.globalStorageUri));
   }
 
   public create(input?: CreateThreadInput): Promise<ThreadRecord> {
@@ -54,6 +64,28 @@ export class DefaultStorageService extends ManagedService implements StorageServ
   }
   public archive(threadId: string, expectedRevision: number): Promise<ThreadRecord> {
     return this.threadStore.archive(threadId, expectedRevision);
+  }
+
+  public append(threadId: string, event: NewPersistedAgentEvent): Promise<PersistedAgentEvent> {
+    return this.eventStore.append(threadId, event);
+  }
+
+  public appendBatch(
+    threadId: string,
+    events: readonly NewPersistedAgentEvent[],
+  ): Promise<readonly PersistedAgentEvent[]> {
+    return this.eventStore.appendBatch(threadId, events);
+  }
+
+  public read(
+    threadId: string,
+    options?: { readonly afterSequence?: number },
+  ): Promise<EventReadResult> {
+    return this.eventStore.read(threadId, options);
+  }
+
+  public getSnapshot(threadId: string): Promise<EventSnapshot | undefined> {
+    return this.eventStore.getSnapshot(threadId);
   }
 
   public getThreadModelState(threadId: string): Promise<ThreadModelState> {
@@ -94,6 +126,11 @@ export class DefaultStorageService extends ManagedService implements StorageServ
 }
 
 function getThreadModelStoreFileSystem(globalStorageUri: Uri): ThreadModelStoreFileSystem {
+  const rootPath = (globalStorageUri as Uri & { readonly fsPath?: unknown }).fsPath;
+  return typeof rootPath === "string" ? { rootPath } : {};
+}
+
+function getEventStoreFileSystem(globalStorageUri: Uri): { readonly rootPath?: string } {
   const rootPath = (globalStorageUri as Uri & { readonly fsPath?: unknown }).fsPath;
   return typeof rootPath === "string" ? { rootPath } : {};
 }
