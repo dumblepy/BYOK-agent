@@ -3864,7 +3864,168 @@ interface ErrorProjection {
 
 最低限、1回・batch追記後の再起動相当復元、sequence昇順、破損JSON、未知種別、型不正、末尾不完全行、重複eventId／sequence、欠番、逆順、snapshotのatomic更新と破損時フォールバック、I/O失敗時の旧正本保持、機密情報非保存を検証する。完了条件は、Agent実行履歴を`events.jsonl`へ追記し、Store再生成後も有効イベントを順序付きで取得できることである。
 
-## 15.3 保存しないもの
+## 15.3 会話アーティファクト保存
+
+Artifact Storeは、Tool Resultやコマンド出力のうち、会話履歴・モデル入力へ直接入れるには大きすぎるものを、検査済みのローカルアーティファクトとして保存するExtension Host側のStorageコンポーネントである。会話イベントの正本はEvent Storeに残し、`tool-result`イベントには本文を保存せず、安全な要約と`artifact://`参照IDだけを保存する。Artifact StoreはThread metadata、会話順序、ChangeSet、APIキーを管理しない。
+
+### 15.3.1 責務境界と保存フロー
+
+Artifact Storeへの入力は、Tool／Context層で次の処理を完了したものに限定する。
+
+1. ANSIエスケープシーケンスを除去する。
+2. APIキー、Authorization、環境変数、認証トークン、秘密らしい値をマスクする。
+3. バイナリかテキストかを判定する。
+4. 保存上限と正規化後のサイズを検査する。
+5. 大きい出力の場合だけ、完全な正規化済み出力をArtifact Storeへ保存する。
+6. 会話・モデル入力には要約、先頭／末尾の抜粋、終了状態、サイズ、参照IDだけを渡す。
+
+この順序は`SYW-CONTEXT-007`の正本である。文字数制限用の短縮結果をアーティファクトへ保存するのではなく、機密マスク後かつ表示上の短縮前の正規化済み出力を保存する。これにより会話を小さく保ちながら、保存された内容を後から検証できる。生のTool Result、コマンド文字列、cwd、環境変数、Provider生レスポンスはArtifact Storeへ渡さない。
+
+Artifact StoreはExtension Host内の`StorageService`からのみ利用する。Provider AdapterはProvider固有の変換とイベント正規化までを担当し、Tool Resultの圧縮、機密マスク、Artifact化、削除を担当しない。Webviewには保存先URI、ファイル権限、ファイルシステムAPIを渡さず、Hostが生成した安全なプレビューまたは参照状態だけを渡す。
+
+### 15.3.2 保存先とファイル形式
+
+```text
+globalStorage/
+└── threads/
+    └── <thread-id>/
+        └── artifacts/
+            └── <artifact-id>/
+                ├── meta.json
+                ├── content
+                └── chunks/       # 分割保存時だけ存在
+                    ├── 000000
+                    └── 000001
+```
+
+Artifact Storeが管理するのは`artifacts/`配下だけである。`meta.json`を公開済みアーティファクトの正本とし、`content`または`chunks/`を本文の保存先とする。SQLiteや単一の巨大JSONファイルは使用しない。
+
+```ts
+type ArtifactKind = "tool-result" | "command-output" | "diagnostic";
+type ArtifactEncoding = "utf-8" | "binary";
+
+interface ArtifactMetadata {
+  readonly schemaVersion: 1;
+  readonly artifactId: string;
+  readonly threadId: string;
+  readonly kind: ArtifactKind;
+  readonly mediaType: string;
+  readonly encoding: ArtifactEncoding;
+  readonly byteLength: number;
+  readonly chunkCount: number;
+  readonly contentHash: string;
+  readonly createdAt: number;
+}
+```
+
+メタデータには本文、コマンド、引数、パス、環境変数、秘密情報を含めない。`contentHash`は保存内容の整合性確認と重複診断に使うSHA-256値であり、秘密情報の保護や認証の根拠にはしない。テキストはUTF-8、バイナリは安全な検査済み入力に限るopaque bytesとして保存する。バイナリは自動的にMarkdownやモデル入力へ展開しない。
+
+作成はアーティファクト固有の一時ディレクトリへ内容を書き、flush可能な環境ではflush／syncし、内容を再検証してからメタデータを作成する。最後に一時ディレクトリを同一ファイルシステム上で公開名へrenameする。`meta.json`が最後に公開されるため、メタデータのない内容は参照対象にならない。既存の公開済みIDは上書きせず、作成途中で終了した一時ディレクトリ、メタデータのないディレクトリ、サイズ・ハッシュ不一致のディレクトリは起動時または`sweep`時に回収する。
+
+1アーティファクトが個別上限を超える場合は、チャンクに分けても保存せず、部分的な参照IDを発行しない。容量に収まらない場合の会話側の結果は、保存不能の安全な分類と要約にする。これにより、存在しない全文を参照できるかのような履歴を残さない。
+
+### 15.3.3 参照IDとArtifact Store契約
+
+```ts
+interface CreateArtifactInput {
+  readonly threadId: string;
+  readonly kind: ArtifactKind;
+  readonly mediaType: string;
+  readonly encoding: ArtifactEncoding;
+  readonly content: Uint8Array;
+  readonly leaseId?: string;
+}
+
+interface ArtifactReadOptions {
+  readonly offset?: number;
+  readonly limit?: number;
+  readonly expectedHash?: string;
+  readonly leaseId?: string;
+}
+
+interface ArtifactReadResult {
+  readonly metadata: ArtifactMetadata;
+  readonly offset: number;
+  readonly bytes: Uint8Array;
+  readonly complete: boolean;
+}
+
+interface ArtifactSweepReport {
+  readonly scanned: number;
+  readonly deleted: number;
+  readonly invalidated: number;
+  readonly bytesFreed: number;
+  readonly diagnostics: readonly ArtifactErrorCode[];
+}
+
+interface ArtifactStore {
+  create(input: CreateArtifactInput, signal?: AbortSignal): Promise<ArtifactRef>;
+  read(ref: string, options?: ArtifactReadOptions): Promise<ArtifactReadResult>;
+  stat(ref: string): Promise<ArtifactMetadata | undefined>;
+  delete(ref: string, reason: "eviction" | "thread-cleanup"): Promise<void>;
+  sweep(): Promise<ArtifactSweepReport>;
+}
+
+interface ArtifactRef {
+  readonly uri: `artifact://${string}/${string}`;
+  readonly artifactId: string;
+  readonly threadId: string;
+  readonly byteLength: number;
+  readonly mediaType: string;
+  readonly contentHash: string;
+}
+```
+
+正規形は`artifact://<thread-id>/<artifact-id>`とする。各識別子はStoreが生成または厳格に検証するURL-safeな値だけを許可する。query、fragment、追加path、`.`、`..`、制御文字、percent decode後のパス区切り、絶対パス、任意の`file:` URIは拒否する。URIを内部パスへ解決するときは`threadId`と要求コンテキストのスレッドを比較し、シンボリックリンク解決後も対象が`globalStorage/threads/<thread-id>/artifacts/`配下にあることを確認する。別スレッドの存在を推測できないよう、スレッド不一致と不存在は同じ`ARTIFACT_NOT_FOUND`として扱う。
+
+`read`は範囲付き読み取りを基本とし、既定の返却上限を設ける。全量を一度にメモリ、会話履歴、モデル入力へ展開しない。テキストはHost内でUTF-8として検証し、バイナリはメタデータとopaque bytesで返す。読み取り時の`expectedHash`が一致しない場合は破損として扱い、当該Artifactを無効化する。Artifact参照の解決と読み取りは、UIから直接行わず、Hostの現在スレッド・権限・サイズ制限を再検証する。
+
+### 15.3.4 容量設定と削除方針
+
+設定はユーザー設定または安全な既定値から解決する。ワークスペース内設定から保存先、機密検査、容量上限の安全側制約を上書きさせない。初期値と設定キーは次のとおりとする。
+
+| 設定 | 既定値 | 意味 |
+|---|---:|---|
+| `byokAgent.artifacts.maxTotalBytes` | 256 MiB | Extension全体の公開アーティファクト上限 |
+| `byokAgent.artifacts.maxThreadBytes` | 64 MiB | 1スレッドの公開アーティファクト上限 |
+| `byokAgent.artifacts.maxArtifactBytes` | 16 MiB | 1つの論理アーティファクト上限 |
+| `byokAgent.artifacts.chunkBytes` | 1 MiB | チャンク保存時の最大チャンクサイズ |
+| `byokAgent.artifacts.retentionDays` | 30日 | `createdAt`を基準にした期限 |
+| `byokAgent.artifacts.evictionPolicy` | `oldest-first` | 容量超過時の削除順 |
+
+設定値は正の整数、有限の期間、許可済み列挙値としてHostで検証する。`chunkBytes`は`maxArtifactBytes`以下、スレッド上限は個別上限以上、総容量はスレッド上限以上でなければならない。不正設定は安全な既定値へフォールバックし、設定値そのものをArtifact metadataやログへ保存しない。
+
+作成前に期限切れを削除し、容量不足ならleaseされていない公開済みArtifactを`createdAt`の古い順で削除して容量を確保する。期限切れ判定は作成日時だけで行い、読み取りで保持期限を延長しない。削除はArtifact単位で行い、メタデータを正しく検証できない場合も本文を会話へ戻さず、回収対象として診断する。期限切れ・容量削除はイベント履歴を削除しないため、過去の参照は安全な利用不可状態として表示する。
+
+実行中Runが作成または読み取り中のArtifactには短命なleaseを付ける。leaseはプロセス内状態に限定し、ファイルとして永続化しない。プロセス終了後に残るleaseは存在しないものとして扱う。作成処理は容量確保から公開まで同一のStorageロックで直列化し、並行作成が上限を超えないようにする。複数Extension Hostプロセスからの同一Storage更新は初期スコープ外とする。
+
+`sweep`は起動時、Artifact作成前、明示的なStorage管理処理で実行する。処理内容は期限切れの削除、孤児一時ディレクトリの回収、公開メタデータの検証、サイズ・ハッシュ不一致Artifactの無効化、容量集計の再構築とする。Sweep失敗で有効なEvent Storeや他のArtifactを削除してはならない。
+
+### 15.3.5 エラーと情報分離
+
+Artifact操作の内部分類は次の固定コードに写像する。
+
+```ts
+type ArtifactErrorCode =
+  | "ARTIFACT_INVALID_INPUT"
+  | "ARTIFACT_SENSITIVE_CONTENT"
+  | "ARTIFACT_QUOTA_EXCEEDED"
+  | "ARTIFACT_NOT_FOUND"
+  | "ARTIFACT_CORRUPTED"
+  | "ARTIFACT_IO_FAILED";
+```
+
+ユーザー向けには固定文言、モデル向けには再試行可否と要約、ログ向けにはthreadId、artifactId、種別、サイズ、分類、所要時間だけを渡す。ファイル本文、コマンド、cwd、env、URL全体、任意ヘッダー、Provider生レスポンス、秘密値、非公開推論はどの層にも渡さない。保存失敗時に参照IDを先にイベントへ書かず、公開成功後にだけ`tool-result`イベントを追記する。イベント追記が後から失敗した場合でも公開Artifactを無効な参照として残さないよう、履歴接続側は保存結果を受けてからイベントを作る。
+
+### 15.3.6 実装単位と検証
+
+実装時は、`src/storage/artifact-store.ts`に保存・参照・検証・容量・削除を置き、`src/storage/storage-service.ts`から生成・初期化・破棄する。Tool Result整形を担当するContextまたはTool境界で正規化と要約を行い、Agent Event変換境界で`artifactRef`を安全な`tool-result` payloadへ渡す。Provider AdapterへArtifact Store依存を追加しない。
+
+Unit Testでは、URI検証、同一スレッド境界、パストラバーサル拒否、正規化済みテキスト保存、バイナリ方針、atomic publish、再起動復元、範囲付きread、ハッシュ不一致、孤児回収、TTL、総容量・スレッド容量・個別上限、古い順削除、lease保護、I/O失敗、部分保存なしを検証する。Agent Simulationでは、巨大Tool Resultとコマンド出力が会話本文へ入らず、次のモデル入力に要約と参照IDだけが入り、参照取得が明示的な範囲で行われることを検証する。Extension Integrationでは、StorageService再生成後の復元、スレッド間分離、Webviewへ本文・保存先・ファイル権限が漏れないこと、設定変更とsweepを検証する。実APIテストは行わない。
+
+完了条件は、設定容量内の巨大出力を正規化済み完全出力として別ファイルへ保存し、保存成功後に発行した`artifact://`参照をHostから取得でき、会話履歴・モデル入力・UIへ巨大本文を直接渡さず、容量と削除方針を再起動後も一貫して適用できることである。APIキー、Authorization、生環境変数、認証トークン、Provider生レスポンス、非公開推論、未加工出力を保存しないことも必須とする。
+
+## 15.4 保存しないもの
 
 * APIキー
 * Authorizationヘッダー
@@ -4011,6 +4172,18 @@ interface ChangeSetManager {
 }
 ```
 
+```ts
+interface ArtifactStore {
+  create(input: CreateArtifactInput, signal?: AbortSignal): Promise<ArtifactRef>;
+  read(ref: string, options?: ArtifactReadOptions): Promise<ArtifactReadResult>;
+  stat(ref: string): Promise<ArtifactMetadata | undefined>;
+  delete(ref: string, reason: "eviction" | "thread-cleanup"): Promise<void>;
+  sweep(): Promise<ArtifactSweepReport>;
+}
+```
+
+`ArtifactStore`は長大なTool Resultやコマンド出力を会話イベントから分離するHost内の保存境界である。`CreateArtifactInput`は正規化・機密マスク済みのbytesだけを受け取り、URIの形式検証、スレッド所有権、サイズ・ハッシュ検証、atomic publish、容量・TTL・leaseによる削除を内部で行う。`read`は範囲付き取得を基本とし、Webview、Provider Adapter、SecretStorageへ保存先や本文を直接公開しない。
+
 ---
 
 ## 18. エラー分類
@@ -4078,6 +4251,11 @@ interface AgentError {
 * 権限判定
 * Patch Parser
 * 履歴要約
+* Artifact URIの形式・スレッド境界・パストラバーサル拒否
+* Artifactの正規化済み保存、ハッシュ検証、atomic publish、範囲付きread
+* 総容量・スレッド容量・個別上限・TTL・oldest-first削除・lease保護
+* 破損Artifact、孤児一時ディレクトリ、I/O失敗、容量超過時の部分保存なし
+* 機密情報・未加工Tool Result・保存先パスがArtifact metadata、Event、ログ、UIへ漏れないこと
 
 ### 19.2 Provider Contract Test
 
@@ -4135,6 +4313,8 @@ const scenario = [
 * キャンセルが全レイヤーへ伝播する
 * ChangeSet適用前にディスクが変化しない
 * 要約後も目的と未完了事項が保持される
+* 巨大Tool Result／コマンド出力が会話本文に保存されず、保存成功後の`artifact://`参照だけが履歴へ入る
+* Artifact参照の範囲付き読み取り、削除済み参照、別スレッド参照拒否が安全な結果になる
 
 ### 19.4 Extension Integration Test
 
@@ -4150,6 +4330,7 @@ const scenario = [
 * Remote Development環境
 * 複数ルートワークスペース
 * VS Code再起動後のスレッド復元
+* Artifact Storeの再生成後のアーティファクト復元、容量設定、TTL／削除方針、Webview向け安全なプレビュー
 
 ---
 

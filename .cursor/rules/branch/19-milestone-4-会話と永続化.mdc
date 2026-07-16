@@ -2,205 +2,179 @@
 description: 19-milestone-4-会話と永続化ブランチでの開発時に読み込む
 alwaysApply: false
 ---
-# Milestone 4: 追記型Event Store
+# Milestone 4: 会話アーティファクト保存
 
-このブランチでは、スレッド単位のAgent実行履歴を永続化するEvent Storeを設計・実装する。正本は`globalStorage/threads/<thread-id>/events.jsonl`とし、イベントの追記、順序付き読み込み、破損行の部分復元、派生スナップショットの定期作成を対象とする。Thread Storeのメタデータ、会話要約、長大なTool Resultの実体、ChangeSetの実体は本機能の責務外とする。
+このブランチでは、長大なTool Resultやコマンド出力を会話履歴の本文から分離し、Extension Host内のファイルへ安全に保存して参照できるアーティファクト保存機構を設計・実装する。
 
 ## 実装方針
 
-- Event StoreはExtension Host内の`StorageService`から利用する。Webview、Provider Adapter、SecretStorage、Model CatalogはEvent Storeのファイル形式や保存処理へ直接依存させない。
-- SQLiteは使用しない。スレッドディレクトリ内の`events.jsonl`を唯一のイベント正本、`snapshot.json`を再生成可能な派生キャッシュとして扱う。
-- イベントは1行1JSONオブジェクト、UTF-8、末尾改行付きで追記する。通常の履歴更新で既存行を書き換えたり、並べ替えたり、再採番したりしない。
-- `sequence`はスレッド単位でEvent Storeが割り当てる単調増加の正整数とする。順序の正本は`occurredAt`やファイルのmtimeではなく`sequence`であり、同一`runId`内だけに限定しない。
-- 同一Extension Host内の並行追記はスレッド単位のロックで直列化する。追記前に正本を再走査して最大の有効`sequence`を確認し、ID・sequenceの衝突を防ぐ。複数プロセスによる同一スレッド更新は初期スコープ外とする。
-- 追記成功の判定は、行の書き込み完了と、可能な環境ではファイルハンドルの`sync`完了後とする。書き込み途中でプロセスが終了した末尾の不完全行は、次回読み込み時に無視して復元する。
-- 読み込みは行単位で行い、JSON構文、Envelope、イベント種別、payloadのサイズと機密情報ポリシーを検証する。不正行は履歴全体を失敗させず、行番号と分類だけを復元診断へ集計する。
-- 復元時は有効イベントを`sequence`昇順で返す。重複`eventId`は一度だけ採用し、重複`sequence`は先に現れた有効行を採用する。欠番、逆順、重複は自動補正せず診断として報告し、将来の追記sequenceは最大の有効値の次から継続する。
-- `snapshot.json`は一定件数（初期値100件、設定可能）の有効追記ごとに作成する。スナップショットは同一スレッドロック内で生成し、一時ファイルへの書き込みと同一ディレクトリ内の`rename`で原子的に公開する。失敗しても`events.jsonl`の追記成功を取り消さない。
-- スナップショットには`lastSequence`と生成時点のイベント投影を保存するが、正本ではない。欠損、破損、未知schema、イベント正本との不整合がある場合は破棄してイベントを再生する。スナップショットの存在だけでイベントを省略しない。
-- 保存対象は、ユーザー／アシスタントの表示本文、Tool Callの安全な要約、Tool Resultの要約とArtifact参照ID、承認結果、ChangeSetの要約、Usageメタデータ、構造化エラーなどに限定する。プロンプト全文、Provider生レスポンス、Tool Result全文、ファイル内容、非公開推論、APIキー、Authorization、環境変数、認証トークンは保存しない。
-- 生イベントをそのままEvent Storeへ渡さず、永続化境界でサニタイズとサイズ制限を行う。機密情報を安全に除去できないpayloadは保存を拒否するか、機密部分を除いた明示的なredacted表現へ変換する。診断・例外・スナップショットにも元の値を含めない。
-- Event StoreはProviderEventの一時ストリームをそのまま保存する層ではない。Agent Runtimeが意味付けしたAgent Eventを永続化可能なEnvelopeへ変換して渡す。UI向け`thread-event`のsequenceは必要に応じてEvent Storeのsequenceから構築するが、Webviewに保存ファイルアクセスを与えない。
+- Artifact StoreはExtension Host側の`StorageService`からだけ利用する。Webview、Provider Adapter、Tool実装、SecretStorageは保存ファイルへ直接アクセスしない。
+- SQLiteは使用しない。正本はスレッド配下の`artifacts/<artifact-id>/meta.json`と`content`または`chunks/`で構成し、イベント履歴には安全な要約と`artifact://`参照IDだけを保存する。
+- アーティファクトは、ANSI除去、機密マスク、バイナリ判定、安全なサイズ検査を経た正規化済み出力だけを保存する。生のTool Result、コマンド出力、Providerレスポンス、環境変数は永続化しない。
+- 参照IDは`artifact://<thread-id>/<artifact-id>`に固定する。参照IDをパスとして直接連結せず、形式・所有スレッド・存在・メタデータを検証してから内部パスへ解決する。
+- 生成は一時ファイルへの書き込み、内容の検証、メタデータの作成、同一ディレクトリ内のrenameの順に行う。メタデータを最後に公開し、途中終了した不完全アーティファクトは起動時に検出して回収する。
+- 容量制限は総容量、スレッド単位容量、1アーティファクト上限、チャンクサイズで定義する。保存前に期限切れ・未固定の古いアーティファクトを削除し、容量を確保できない場合は部分保存せず、会話には安全な要約と保存失敗分類だけを残す。
+- 既定の削除方針は期限切れを優先し、次に作成日時の古いものから削除する。実行中Runが参照中のアーティファクトはleaseで固定し、削除対象から除外する。履歴イベントは削除せず、参照先が消えた場合は`artifact-unavailable`として扱う。
+- テキストは完全な正規化済み出力を保存し、会話・モデル入力へは要約、先頭末尾の抜粋、サイズ、終了状態、参照IDだけを渡す。モデルやUIが全文を必要とする場合は、Hostの範囲付きread APIを介して取得する。
+- バイナリや機密を安全に検査できない出力は既定で保存しない。保存を許可するToolは安全な媒体種別と機密検査済みであることを明示し、UI・モデルには内容を展開せずメタデータだけを返す。
+- Artifact StoreはAgent RuntimeとContext Managerの間の保存境界として接続する。Provider AdapterはArtifact Storeを知らず、Event Storeはアーティファクト本文を解釈しない。
 
 ## 進捗
 
-- [x] 永続化可能なAgent Event Envelope、イベント種別、エラー契約を定義する
-- [x] スレッド単位の`events.jsonl`追記、sequence採番、並行追記直列化を実装する
-- [x] 破損行、末尾の不完全行、未知イベント、重複sequence／eventIdの部分復元を実装する
-- [x] `snapshot.json`の投影、作成間隔、atomic rename、破損時フォールバックを実装する
-- [x] `StorageService`のExtension Host境界へEvent Storeを接続する
-- [x] Unit Test、Agent Simulation、Extension Integration Testを追加する
+- [x] `ArtifactStore`、`ArtifactRef`、メタデータ、保存・取得・削除エラーの契約を確定する
+- [x] `globalStorage/threads/<thread-id>/artifacts/`のファイル形式、atomic publish、起動時回収を実装する
+- [x] Tool Result／コマンド出力の正規化、機密マスク、要約、参照ID生成の接続点を実装する
+- [x] 総容量・スレッド容量・個別上限・TTL・削除方針・leaseの設定を実装する
+- [x] Artifact URIの範囲付き参照、認可、UI／モデル向けの安全な公開境界を実装する
+- [x] Unit、Agent Simulation、Extension Integration Testを追加する
 - [x] `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`を実行する
-
-本ルール作成時点では設計のみを行う。上記の実装、テスト追加、依存追加、既存コードの変更は開始しない。
 
 ## 参考資料
 
-- `documents/issues.md` — Milestone 4「追記型Event Storeを実装する」の要求と完了条件
-- `documents/design.md` §15 — Thread Store、Event Store、保存禁止データの正式設計
-- `documents/design.md` §17 — 主要サービスのインターフェース
-- `documents/design.md` §18 — `AgentErrorCode`と情報分離
-- `documents/design.md` §19 — Unit / Agent Simulation / Extension Integration Test方針
-- `.cursor/rules/project.mdc` — `SYW-STORAGE-001`〜`003`、`SYW-ERR-001`、`SYW-TEST-001`〜`002`
-- `src/storage/storage-service.ts` — StorageServiceのライフサイクルと公開境界
-- `src/storage/thread-store.ts` — スレッドID検証、スレッド単位の既存ロック、保存先レイアウト
-- `src/agent/agent-service.ts` — Agent ServiceとStorage Serviceの依存方向
-- `src/ui/webview-protocol.ts` — UIへ公開するThread Eventの検証済み境界
+- `documents/issues.md` — Milestone 4「会話アーティファクト保存機構を実装する」の要求と完了条件
+- `documents/design.md` §8.6 — Tool Resultの圧縮順序と`artifact://`参照の既存方針
+- `documents/design.md` §15.1〜§15.2 — Thread Store、Event Store、保存先レイアウトと責務境界
+- `documents/design.md` §15.3 — 本設計で定義するArtifact Store
+- `documents/design.md` §16 — Webview、パス、ネットワーク、ログのセキュリティ設計
+- `documents/design.md` §17〜§19 — 主要インターフェース、エラー分類、テスト設計
+- `.cursor/rules/project.mdc` — `SYW-CONTEXT-007`、`SYW-STORAGE-001`〜`003`、`SYW-SEC-002`、`SYW-SEC-004`、`SYW-TEST-001`〜`002`
+- `src/storage/storage-service.ts` — StorageServiceの公開境界
+- `src/storage/event-store.ts` — Event Storeのイベント保存と復元契約
 
 ## 調査結果・設計まとめ
 
-### 責務と正本
+### 責務と保存対象
 
-Thread Storeは`meta.json`だけを管理し、Event Storeは`events.jsonl`と派生`snapshot.json`を管理する。両者は同じ`threads/<thread-id>/`配下に置くが、互いのJSONを解釈・更新・削除しない。`summary.json`は履歴コンパクション用の要約ストア、`artifacts/`は長大出力の実体、`changes/`はChangeSetストアの責務とする。
+Artifact Storeは、表示・モデル入力に適さない大きさのTool Result、コマンド出力、将来の診断出力を、検査済みのローカルデータとして保存する。会話履歴の正本はEvent Storeに残し、`tool-result`イベントのpayloadには本文を入れず、`artifactRef`と安全な要約だけを記録する。Artifact Storeは会話順序、Thread metadata、ChangeSet、APIキーを管理しない。
+
+保存するのは「機密マスクと正規化を完了した出力」であり、呼び出し元が渡した生データではない。したがって、Artifact Store単体を直接呼び出すAPIではなく、Tool／Context層で出力の出所、媒体種別、機密検査状態を明示した入力を受ける。
+
+### ファイル形式
 
 ```text
 <globalStorageUri>/
-└── threads/
-    └── <thread-id>/
-        ├── meta.json          # Thread Storeの正本
-        ├── events.jsonl       # Event Storeの唯一のイベント正本
-        ├── snapshot.json      # Event Storeの再生成可能な派生スナップショット
-        ├── summary.json       # 履歴要約ストア（別責務）
-        ├── artifacts/         # 長大な出力の実体（別責務）
-        └── changes/           # ChangeSetの実体（別責務）
+└── threads/<thread-id>/
+    └── artifacts/
+        └── <artifact-id>/
+            ├── meta.json       # 公開済みであることを示す正本メタデータ
+            ├── content         # 小さい単一ファイル
+            └── chunks/          # 個別上限を超えない分割保存時だけ作成
+                ├── 000000
+                └── 000001
 ```
 
-Event Storeの読み込み結果は、利用者が復元品質を判断できるよう有効イベントだけでなく、無視した行数と分類を返す。診断分類は`invalid-json`、`invalid-envelope`、`unknown-event-kind`、`oversized-line`、`duplicate-event-id`、`duplicate-sequence`、`sequence-gap`、`out-of-order`、`unreadable`などの固定値とし、本文・payload・秘密情報は含めない。
+`meta.json`は次の情報を持つ。`artifactId`、`threadId`、`kind`、`mediaType`、`encoding`、`byteLength`、`chunkCount`、SHA-256の`contentHash`、`createdAt`、schemaVersionだけを保存し、出力本文、コマンド文字列、環境変数、URIの元パス、秘密値は含めない。`contentHash`は内容の同一性検査に使うが、認証や秘密情報の代替にはしない。
 
-### 保存Envelope
+書き込みは、アーティファクト固有の一時ディレクトリへ内容とメタデータを書き、内容を再読してバイト数・ハッシュを検証した後、`meta.json`を最後に公開する。親の`artifacts/`直下へアーティファクトディレクトリをrenameして公開する方式を基本とする。既存IDは再利用せず、途中終了した一時ディレクトリ、メタデータのないディレクトリ、ハッシュ不一致の成果物は利用不可として回収する。既存の公開済みアーティファクトは上書きしない。
+
+テキストはUTF-8として保存し、`encoding: "utf-8"`と`mediaType: "text/plain"`を付ける。改行の正規化など表示に影響する変換を行った場合は、メタデータではなく固定の正規化契約で扱う。バイナリは安全な検査済み入力に限りopaque bytesとして保存し、モデル入力やMarkdown表示へ自動展開しない。
+
+### 参照IDと読み取り
 
 ```ts
-type PersistedAgentEventKind =
-  | "user-message"
-  | "assistant-text"
-  | "tool-call"
-  | "tool-result"
-  | "approval"
-  | "context-snapshot"
-  | "change-set"
-  | "usage"
-  | "error";
+type ArtifactKind = "tool-result" | "command-output" | "diagnostic";
 
-interface PersistedAgentEvent<TPayload = unknown> {
-  readonly schemaVersion: 1;
-  readonly eventId: string;
+interface ArtifactRef {
+  readonly uri: `artifact://${string}/${string}`;
+  readonly artifactId: string;
   readonly threadId: string;
-  readonly runId: string;
-  readonly sequence: number;
-  readonly occurredAt: number;
-  readonly kind: PersistedAgentEventKind;
-  readonly payload: TPayload;
+  readonly byteLength: number;
+  readonly mediaType: string;
+  readonly contentHash: string;
+}
+
+interface ArtifactSweepReport {
+  readonly scanned: number;
+  readonly deleted: number;
+  readonly invalidated: number;
+  readonly bytesFreed: number;
+  readonly diagnostics: readonly ArtifactErrorCode[];
+}
+
+interface ArtifactStore {
+  create(input: CreateArtifactInput, signal?: AbortSignal): Promise<ArtifactRef>;
+  read(ref: string, options?: ArtifactReadOptions): Promise<ArtifactReadResult>;
+  stat(ref: string): Promise<ArtifactMetadata | undefined>;
+  delete(ref: string, reason: "eviction" | "thread-cleanup"): Promise<void>;
+  sweep(): Promise<ArtifactSweepReport>;
 }
 ```
 
-`eventId`はイベント単位のUUID、`runId`は実行単位の検証済み識別子、`sequence`はStoreが割り当てるスレッド単位の連番である。`occurredAt`は表示・診断用であり順序決定には使わない。payloadは種別ごとの安全なSchemaを持ち、未知フィールドや未知のschemaVersionは採用しない。
+正規形は`artifact://<thread-id>/<artifact-id>`とする。`thread-id`と`artifact-id`はStoreが生成・検証するURL-safeな識別子だけを許可し、query、fragment、追加path、percent decode後の区切り文字、`.`、`..`、制御文字を拒否する。URIから解決したスレッドIDと要求コンテキストのスレッドIDが一致しない場合は、存在の有無を明かさずNot Foundへ分類する。絶対パス、任意のファイルURI、シンボリックリンクを参照IDとして受け付けない。
 
-payloadの最小契約は次の通りとする。
+`read`はHost内部だけのAPIとし、`offset`、`limit`、`expectedHash`、`leaseId`を受け取れる範囲付き読み取りにする。既定の最大返却量を設け、全量要求でも一度にメモリやモデル入力へ展開しない。読み取り結果は、テキストならUTF-8の安全なチャンク、バイナリならメタデータとopaque bytesとして返す。WebviewへはHostが再度サニタイズしたプレビューだけを渡し、WebviewにglobalStorageのURIやファイル権限を渡さない。
 
-- `user-message` / `assistant-text`: 表示本文、メッセージ識別子、ストリーミング完了状態。ただし機密マスク後の本文だけを保存する。
-- `tool-call`: tool名、toolCallId、安全な引数要約。引数JSON全文や秘密値を保存しない。
-- `tool-result`: 成否、toolCallId、表示用要約、実行時間、`artifact://`参照ID。完全出力は保存しない。
-- `approval`: 提案操作の安全な要約、承認／拒否／キャンセル結果。
-- `context-snapshot`: URIの安全な識別子、範囲、内容ハッシュ、項目数。ファイル本文は保存しない。
-- `change-set`: ChangeSet ID、対象パスの安全な要約、状態。パッチ本文やファイル内容は保存しない。
-- `usage`: 入出力Token数、推定値かどうか、Provider／modelの論理ID。認証情報やレスポンス本文は保存しない。
-- `error`: `AgentErrorCode`、安全な固定メッセージ、retryableなどの分類情報。生例外、URL、ヘッダー、Providerレスポンスは保存しない。
+### Tool Result／コマンド出力の流れ
 
-### Event Store契約
-
-```ts
-interface EventStore {
-  append(
-    threadId: string,
-    event: NewPersistedAgentEvent,
-  ): Promise<PersistedAgentEvent>;
-  appendBatch(
-    threadId: string,
-    events: readonly NewPersistedAgentEvent[],
-  ): Promise<readonly PersistedAgentEvent[]>;
-  read(
-    threadId: string,
-    options?: { readonly afterSequence?: number },
-  ): Promise<EventReadResult>;
-  getSnapshot(threadId: string): Promise<EventSnapshot | undefined>;
-}
-
-interface NewPersistedAgentEvent {
-  readonly eventId?: string;
-  readonly runId: string;
-  readonly occurredAt?: number;
-  readonly kind: PersistedAgentEventKind;
-  readonly payload: unknown;
-}
-
-interface EventReadResult {
-  readonly events: readonly PersistedAgentEvent[];
-  readonly recovery: EventRecoveryReport;
-}
-
-interface EventRecoveryReport {
-  readonly scannedLines: number;
-  readonly acceptedLines: number;
-  readonly ignoredLines: number;
-  readonly diagnostics: readonly EventRecoveryDiagnostic[];
-}
-
-interface EventSnapshot {
-  readonly schemaVersion: 1;
-  readonly threadId: string;
-  readonly lastSequence: number;
-  readonly eventCount: number;
-  readonly generatedAt: number;
-  readonly state: EventProjection;
-}
+```text
+Tool実行
+  ↓ 生出力（メモリ上のみ）
+ANSI除去 → 機密マスク → バイナリ判定 → 正規化済みサイズ判定
+  ├─ 小さい: 制限済み本文を通常のTool Resultへ
+  └─ 大きい: Artifact Storeへ完全な正規化済み出力を保存
+                  ↓
+        要約 + 先頭／末尾抜粋 + byteLength + artifact://参照
+                  ↓
+              Event Store／次のモデル入力
 ```
 
-`appendBatch`は同一ロック内でsequenceを連続採番し、1回の追記として扱う。入力検証またはサニタイズに失敗した場合はbatch全体を保存しない。ファイル書き込みの途中で失敗した場合は、次回読み込みで有効な行だけを採用し、呼び出し元へ永続化失敗を返す。既にディスクへ到達した行を取り消すための上書き・再採番は行わない。
+Tool Resultの共通処理は、既存の`SYW-CONTEXT-007`どおり、ANSI除去、機密マスク、バイナリ判定、文字数制限、先頭末尾保持、重要行抽出、完全出力のArtifact化、要約と参照ID渡しの順序を崩さない。Artifact化する完全出力は、文字数制限前の「マスク済み・正規化済み」データとする。これにより、会話本文は小さく保ちながら、利用者が検証可能な出力を保持できる。
 
-`read`の`afterSequence`は返却対象を絞るためだけに使い、復元検証は常にファイル全体を対象とする。これにより、途中の破損行、欠番、重複を見逃さない。`getSnapshot`はスナップショット単体を無条件に信頼せず、schema、threadId、lastSequence、eventCount、状態の型を検証する。破損・不整合なら`undefined`を返し、呼び出し元は`read`のイベント再生へフォールバックする。
+`CreateArtifactInput`には、`threadId`、`kind`、正規化済みのtextまたは検査済みbytes、媒体種別、作成時刻、実行中Runのlease情報を渡す。生のコマンド、cwd、env、Tool引数は渡さず、Event Storeへ保存する安全な要約は別途生成する。保存に失敗した場合は、履歴に参照IDを発行したことにせず、`ARTIFACT_PERSISTENCE_FAILED`または`ARTIFACT_QUOTA_EXCEEDED`の安全な分類と要約だけを保存する。
 
-### 追記・復元・スナップショットの手順
+### 容量・保持・削除
 
-1. `threadId`、`runId`、種別、payload、サイズ、保存禁止データを検証する。
-2. スレッドロックを取得し、`events.jsonl`を走査して有効イベントの最大`sequence`を求める。
-3. 新しいEnvelopeへ`maxSequence + 1`（batchなら連番）を割り当て、各Envelopeを1行のJSONへシリアライズする。
-4. `events.jsonl`へ末尾改行付きで追記し、可能な環境ではflush／syncする。成功後にのみ呼び出し元へEnvelopeを返す。
-5. 有効追記数がスナップショット間隔へ到達したら、同じロック内で安全なイベント投影を生成し、一時ファイルを`rename`して`snapshot.json`を置換する。
-6. 読み込みではファイルを行単位で走査し、不正行をスキップして有効行をsequence順へ整列する。最後の不完全行も不正行として扱い、既存ファイルを自動修復しない。
-7. snapshotの`lastSequence`より後ろのイベントだけを使う最適化は、snapshotが検証済みであり、正本のsequenceが連続している場合に限る。初期実装では安全性を優先して全行検証を行ってよい。
+設定はユーザー設定またはExtensionの安全な既定値から解決し、ワークスペース内設定で保持上限や削除を弱めたり、外部保存先へ変更したりしない。初期値は次のとおりとする。
 
-スナップショットの`state`はイベントの完全コピーではなく、UIと履歴復元に必要な安全な投影とする。最低限、表示メッセージ、Tool Activity要約、runごとの開始・終了・状態、最新の安全なエラー、最新sequenceを保持する。`EventProjection`のサイズにも上限を設け、超過した本文はArtifact参照または要約へ置き換える。
+| 設定 | 既定値 | 意味 |
+|---|---:|---|
+| `byokAgent.artifacts.maxTotalBytes` | 256 MiB | Extension全体の公開アーティファクト上限 |
+| `byokAgent.artifacts.maxThreadBytes` | 64 MiB | 1スレッドの公開アーティファクト上限 |
+| `byokAgent.artifacts.maxArtifactBytes` | 16 MiB | 1つの論理アーティファクト上限 |
+| `byokAgent.artifacts.chunkBytes` | 1 MiB | チャンク保存時の最大チャンクサイズ |
+| `byokAgent.artifacts.retentionDays` | 30日 | 作成日時を基準にした期限 |
+| `byokAgent.artifacts.evictionPolicy` | `oldest-first` | 容量超過時の削除順 |
 
-### エラー・診断・安全性
+`maxArtifactBytes`を超える出力は複数チャンクに分けても保存せず、部分的な参照を発行しない。保存容量の範囲で完全な出力を維持することを優先し、呼び出し元には安全な要約と保存不能理由を返す。総容量またはスレッド容量を超える場合は、まず期限切れ、次にleaseされていない最古の公開済みアーティファクトを削除してから再試行する。削除後も足りない場合は保存を拒否する。
 
-ファイルが存在しない場合は空の履歴として扱い、親スレッドが存在しない場合は`ThreadNotFoundError`相当へ分類する。ファイルを開けない、権限がない、ディスク容量が不足している等のI/O障害は、破損行の部分復元とは別の永続化エラーとして返す。有効行が1件もない場合も、破損行だけだったのか空ファイルだったのかを非機密診断で区別できるようにする。
+期限切れ判定は`createdAt + retentionDays`で行い、アクセスしただけでは期限を延長しない。`oldest-first`以外を追加する場合も、初期実装では`lru`のようにアクセス時刻更新を伴う方式を既定にせず、メタデータ書き込みの競合と秘密情報漏えい面を別途検証する。`sweep()`は起動時、作成前、明示的なStorage管理処理で実行し、削除はメタデータを確認した上でアーティファクト単位に行う。
 
-ログ、`EventRecoveryReport`、スナップショット、UI通知にはファイル内容、行本文、payload、APIキー、Authorization、環境変数、認証トークン、プロンプト全文、非公開推論を含めない。復元で無視した行は自動削除・自動修復せず、ユーザーがデータ損失を認識できる診断イベントだけを発行する。
+実行中Runが作成・読み取り中のArtifactはleaseで固定する。leaseはメモリ上の短命な参照状態とし、プロセス終了後に残らない。孤児化したleaseファイルは保存しない。Evictionで削除された参照はEvent Storeから消さず、stat/readをNot Foundへ分類し、履歴表示では「保存期限または容量方針により利用できません」と固定文言で示す。
 
-### 実装単位とテスト
+### エラー、整合性、セキュリティ
 
-- `src/storage/event-store.ts`: Envelope型、入力検証、サニタイズ境界、追記、sequence採番、ロック、復元診断、snapshot検証
-- `src/storage/storage-service.ts`: Event Storeの生成・初期化・破棄とApplication Serviceへの公開
-- `src/agent/agent-service.ts`またはAgent Runtime接続箇所: Agent Eventを永続化可能なイベントへ変換する薄い接続（Provider Adapterへ保存責務を逆流させない）
-- `tests/unit/event-store.test.ts`: 追記、順序、batch、再起動復元、破損JSON、途中行、未知種別、重複、欠番、snapshotのatomic更新とフォールバック
-- `tests/agent-simulation/event-persistence.test.ts`: Fake Modelの実行、Tool Call／Result、承認、エラー、キャンセルを順序付きで復元できること
-- `tests/extension-integration/event-store-persistence.test.ts`: StorageService再生成、複数イベント追記、スナップショット生成、Webviewへ安全な要約だけが渡ること
+次の分類をユーザー向け固定文言、モデル向け安全なTool Result、ログ向けメタデータに分離する。
 
-最低限、次を検証する。
+| 分類 | 意味 | リトライ |
+|---|---|---|
+| `ARTIFACT_INVALID_INPUT` | 形式、媒体、識別子、サイズの入力不正 | 不可 |
+| `ARTIFACT_SENSITIVE_CONTENT` | 安全に機密除去できない | 不可 |
+| `ARTIFACT_QUOTA_EXCEEDED` | 削除後も設定容量に収まらない | 設定変更後のみ可 |
+| `ARTIFACT_NOT_FOUND` | URI不正、別スレッド、削除済み、未公開 | 不可 |
+| `ARTIFACT_CORRUPTED` | メタデータ、サイズ、ハッシュが不一致 | 不可。再生成可 |
+| `ARTIFACT_IO_FAILED` | 読み書き、rename、容量不足などのI/O障害 | 条件付き |
 
-- 1回およびbatch追記後に、再起動相当のStoreから`sequence`昇順で同じ履歴を取得できる。
-- 有効行の前後に不正JSON、未知種別、型不正、末尾の不完全行があっても有効イベントを可能な範囲で取得できる。
-- 重複eventId／sequence、欠番、逆順を黙って修正せず、採用規則と診断が決定的である。
-- snapshotが一定件数で作成され、破損・不整合・atomic更新失敗時にevents.jsonlから復元できる。
-- 書き込み失敗時に既存の正本と直前のsnapshotを壊さない。
-- APIキー、Authorization、環境変数、プロンプト全文、Tool Result全文、ファイル内容、非公開推論がイベント、snapshot、診断、UIメッセージへ漏れない。
-- I/O障害と破損行を別のエラー分類として扱い、破損行の存在だけで有効履歴を失敗させない。
+ログと診断にはthreadId、artifactId、種別、サイズ、分類、経過時間だけを記録し、URI以外のパス、本文、コマンド、cwd、env、ヘッダー、Providerレスポンス、秘密値を含めない。ハッシュ不一致や破損時は当該Artifactだけを無効化し、他のArtifactとEvent Storeの履歴復元を失敗させない。読み取り結果を新たなEventへ保存する場合も、本文ではなく参照・範囲・結果分類だけを残す。
+
+### 実装単位と検証方針
+
+実装時は次の単位へ分ける。
+
+- `src/storage/artifact-store.ts`: Artifact URI、メタデータ、入力検証、atomic publish、chunk read、hash検証、lease、quota、sweep
+- `src/storage/storage-service.ts`: Artifact Storeの生成・初期化・破棄とExtension Host公開
+- `src/context/`またはTool Result整形箇所: ANSI除去、機密マスク、バイナリ判定、要約、閾値判定、Artifact Store呼び出し
+- `src/storage/event-store.ts`またはAgent Event変換境界: `tool-result` payloadへの参照と安全な要約の保存
+- `tests/unit/artifact-store.test.ts`: URI、保存、読み取り範囲、hash、再起動、quota、TTL、eviction、lease、破損、孤児回収
+- `tests/agent-simulation/artifact-persistence.test.ts`: 巨大Tool Result／コマンド出力が会話本文に入らず、次のモデル入力と履歴に参照だけが渡ること
+- `tests/extension-integration/artifact-store-persistence.test.ts`: StorageService再生成、スレッド分離、UIプレビュー境界、設定、削除方針
+
+実API、実ワークスペースの秘密情報、実環境変数はテストに使用しない。Fake filesystemと固定時刻・固定UUIDを注入し、再現可能なテストにする。
 
 ### 完了条件
 
-1. Agent Eventを`globalStorage/threads/<thread-id>/events.jsonl`へ追記できる。
-2. Store再生成後も有効イベントをsequence順に取得でき、Agent実行履歴を順序付きで永続化できる。
-3. 破損行、末尾の不完全行、未知イベントがあっても、他の有効行を可能な範囲で復元できる。
-4. 一定件数ごとにsnapshotをatomicに更新でき、snapshotが壊れていてもevents.jsonlから再構築できる。
-5. 機密情報・保存禁止データが正本、snapshot、診断、UI境界へ保存・出力されない。
-6. Unit、Agent Simulation、Extension Integrationのテストと既存のtypecheck／lint／format／testが成功する。
+1. 閾値を超えるTool Resultとコマンド出力について、正規化済み完全出力を会話履歴と別ファイルへ保存できる。
+2. 保存成功時だけ`artifact://<thread-id>/<artifact-id>`を発行し、同一スレッドのHost APIから範囲付きで参照できる。
+3. Event Storeの会話イベント、モデル入力、Webviewメッセージに巨大な本文を直接含めず、安全な要約と参照IDだけを渡せる。
+4. 総容量、スレッド容量、個別上限、TTL、削除方針、実行中leaseを適用し、容量不足時に部分Artifactを残さない。
+5. 再起動後も公開済みArtifactを検証して復元でき、途中終了・破損・削除済み参照を安全に扱える。
+6. APIキー、Authorization、環境変数、認証トークン、Provider生レスポンス、非公開推論、未加工出力が保存・ログ・UI境界へ漏れない。

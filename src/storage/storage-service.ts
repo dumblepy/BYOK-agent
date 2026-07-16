@@ -18,16 +18,37 @@ import {
   type NewPersistedAgentEvent,
   type PersistedAgentEvent,
 } from "./event-store";
+import {
+  FileArtifactStore,
+  type ArtifactLease,
+  type ArtifactReadOptions,
+  type ArtifactReadResult,
+  type ArtifactRef,
+  type ArtifactStoreOptions,
+  type ArtifactSweepReport,
+  type ArtifactMetadata,
+} from "./artifact-store";
 
 export interface StorageService extends ManagedService, ThreadModelStore, ThreadStore, EventStore {
   readonly serviceName: "storage";
+  readonly artifacts: FileArtifactStore;
+  createArtifact(
+    input: Parameters<FileArtifactStore["create"]>[0],
+    signal?: AbortSignal,
+  ): Promise<ArtifactRef>;
+  readArtifact(ref: string, options?: ArtifactReadOptions): Promise<ArtifactReadResult>;
+  statArtifact(ref: string): Promise<ArtifactMetadata | undefined>;
+  deleteArtifact(ref: string, reason: "eviction" | "thread-cleanup"): Promise<void>;
+  sweepArtifacts(): Promise<ArtifactSweepReport>;
+  acquireArtifactLease(ref: string): Promise<ArtifactLease>;
 }
 
 export interface StorageServiceDependencies {
   readonly globalStorageUri: Uri;
+  readonly artifactOptions?: Omit<ArtifactStoreOptions, "rootPath">;
 }
 
-/** Lifecycle boundary for the JSONL-based storage layer. Persistence is implemented later. */
+/** Lifecycle boundary for JSONL conversation and file-based artifact storage. */
 export class DefaultStorageService extends ManagedService implements StorageService {
   public readonly serviceName = "storage" as const;
 
@@ -35,6 +56,7 @@ export class DefaultStorageService extends ManagedService implements StorageServ
   private readonly threadModelStore: ThreadModelStore;
   private readonly threadStore: ThreadStore;
   private readonly eventStore: EventStore;
+  public readonly artifacts: FileArtifactStore;
 
   public constructor(private readonly dependencies: StorageServiceDependencies) {
     super();
@@ -44,6 +66,10 @@ export class DefaultStorageService extends ManagedService implements StorageServ
     this.threadModelStore = modelStore;
     this.threadStore = modelStore.threadStore;
     this.eventStore = new FileEventStore(getEventStoreFileSystem(dependencies.globalStorageUri));
+    this.artifacts = new FileArtifactStore({
+      ...dependencies.artifactOptions,
+      rootPath: getRootPath(dependencies.globalStorageUri),
+    });
   }
 
   public create(input?: CreateThreadInput): Promise<ThreadRecord> {
@@ -88,6 +114,33 @@ export class DefaultStorageService extends ManagedService implements StorageServ
     return this.eventStore.getSnapshot(threadId);
   }
 
+  public createArtifact(
+    input: Parameters<FileArtifactStore["create"]>[0],
+    signal?: AbortSignal,
+  ): Promise<ArtifactRef> {
+    return this.artifacts.create(input, signal);
+  }
+
+  public readArtifact(ref: string, options?: ArtifactReadOptions): Promise<ArtifactReadResult> {
+    return this.artifacts.read(ref, options);
+  }
+
+  public statArtifact(ref: string): Promise<ArtifactMetadata | undefined> {
+    return this.artifacts.stat(ref);
+  }
+
+  public deleteArtifact(ref: string, reason: "eviction" | "thread-cleanup"): Promise<void> {
+    return this.artifacts.delete(ref, reason);
+  }
+
+  public sweepArtifacts(): Promise<ArtifactSweepReport> {
+    return this.artifacts.sweep();
+  }
+
+  public acquireArtifactLease(ref: string): Promise<ArtifactLease> {
+    return this.artifacts.acquireLease(ref);
+  }
+
   public getThreadModelState(threadId: string): Promise<ThreadModelState> {
     return this.threadModelStore.getThreadModelState(threadId);
   }
@@ -118,6 +171,7 @@ export class DefaultStorageService extends ManagedService implements StorageServ
 
   protected override async onInitialize(): Promise<void> {
     await this.threadStore.list();
+    await this.artifacts.sweep();
   }
 
   protected override onDispose(): Promise<void> {
@@ -126,11 +180,16 @@ export class DefaultStorageService extends ManagedService implements StorageServ
 }
 
 function getThreadModelStoreFileSystem(globalStorageUri: Uri): ThreadModelStoreFileSystem {
-  const rootPath = (globalStorageUri as Uri & { readonly fsPath?: unknown }).fsPath;
-  return typeof rootPath === "string" ? { rootPath } : {};
+  const rootPath = getRootPath(globalStorageUri);
+  return rootPath ? { rootPath } : {};
 }
 
 function getEventStoreFileSystem(globalStorageUri: Uri): { readonly rootPath?: string } {
+  const rootPath = getRootPath(globalStorageUri);
+  return rootPath ? { rootPath } : {};
+}
+
+function getRootPath(globalStorageUri: Uri): string | undefined {
   const rootPath = (globalStorageUri as Uri & { readonly fsPath?: unknown }).fsPath;
-  return typeof rootPath === "string" ? { rootPath } : {};
+  return typeof rootPath === "string" ? rootPath : undefined;
 }
