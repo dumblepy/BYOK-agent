@@ -7,6 +7,7 @@ import type {
   ModelConfigProvider,
   ReasoningEffort,
 } from "./model-config-validator";
+import type { ChatCompletionsProfile } from "../providers/openai/openai-chat-completions-types";
 
 export type CapabilityName = "toolCalling" | "streaming" | "vision" | "reasoning";
 
@@ -44,6 +45,7 @@ export interface ResolvedProviderSettings {
   readonly apiType: ApiType;
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
+  readonly chatCompletionsProfile?: Readonly<Partial<ChatCompletionsProfile>>;
 }
 
 export interface ModelDefinition {
@@ -245,6 +247,16 @@ export class ConfiguredModelCatalog implements ModelCatalog {
         apiType: provider.apiType,
         url: model.url,
         headers: Object.freeze({ ...(provider.headers ?? {}) }),
+        ...(provider.apiType === "chat-completions" &&
+        (provider.chatCompletionsProfile !== undefined ||
+          model.chatCompletionsProfile !== undefined)
+          ? {
+              chatCompletionsProfile: Object.freeze({
+                ...(provider.chatCompletionsProfile ?? {}),
+                ...(model.chatCompletionsProfile ?? {}),
+              }),
+            }
+          : {}),
       }),
       capabilities: capabilityResolution.configured,
       effectiveCapabilities: capabilityResolution.effective,

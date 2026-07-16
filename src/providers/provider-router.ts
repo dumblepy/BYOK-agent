@@ -6,6 +6,7 @@ import type {
   ProviderRequest,
   TokenCountInput,
 } from "./provider-types";
+import type { ChatCompletionsProfile } from "./openai/openai-chat-completions-types";
 
 export interface ProviderCredentialResolver {
   getApiKey(providerId: string): Promise<string | undefined>;
@@ -20,6 +21,8 @@ export interface ProviderAdapterInit {
   readonly headers: Readonly<Record<string, string>>;
   /** Secret values are confined to this initialization boundary. */
   readonly credential?: string;
+  /** Provider-specific behavior is finite, validated configuration, never arbitrary request JSON. */
+  readonly chatCompletionsProfile?: Partial<ChatCompletionsProfile>;
 }
 
 export interface ProviderAdapterFactory {
@@ -241,6 +244,7 @@ export class DefaultProviderRouter implements ProviderRouter {
           url: model.provider.url,
           headers: model.provider.headers,
           credential,
+          chatCompletionsProfile: model.provider.chatCompletionsProfile,
         }),
         references: 0,
       };
@@ -273,6 +277,7 @@ function createAdapterKey(
     model.provider.apiType,
     model.provider.url,
     headers,
+    model.provider.chatCompletionsProfile ?? null,
     credentialRevision,
   ]);
 }

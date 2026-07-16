@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import Ajv2020, { type ErrorObject, type ValidateFunction } from "ajv/dist/2020.js";
+import type { ChatCompletionsProfile } from "../providers/openai/openai-chat-completions-types";
 
 const schema = JSON.parse(
   readFileSync(join(__dirname, "../../resources/model-config.schema.json"), "utf8"),
@@ -35,6 +36,7 @@ export interface ModelConfigModel {
   supportsReasoningEffort?: readonly ReasoningEffort[];
   maxInputTokens: number;
   maxOutputTokens: number;
+  chatCompletionsProfile?: Partial<ChatCompletionsProfile>;
   agent?: AgentSettings;
 }
 
@@ -45,6 +47,7 @@ export interface ModelConfigProvider {
   apiKey?: unknown;
   apiType: ApiType;
   headers?: Record<string, string>;
+  chatCompletionsProfile?: Partial<ChatCompletionsProfile>;
   models: ModelConfigModel[];
 }
 
@@ -261,6 +264,15 @@ function semanticIssues(config: ModelConfig): ModelConfigValidationIssue[] {
     if (provider.headers !== undefined) {
       issues.push(...headerIssues(provider.headers, `/providers/${providerIndex}/headers`));
     }
+    if (provider.chatCompletionsProfile !== undefined && provider.apiType !== "chat-completions") {
+      issues.push({
+        code: "CONFIG_SEMANTIC_INVALID",
+        path: `/providers/${providerIndex}/chatCompletionsProfile`,
+        message: "Chat Completions Profileはchat-completions Providerでだけ指定できます。",
+        expected: "apiType=chat-completions",
+        actual: provider.apiType,
+      });
+    }
     provider.models.forEach((model, modelIndex) => {
       const path = `/providers/${providerIndex}/models/${modelIndex}`;
       if (modelIds.has(model.id)) {
@@ -313,6 +325,15 @@ function semanticIssues(config: ModelConfig): ModelConfigValidationIssue[] {
           code: "CONFIG_SEMANTIC_INVALID",
           path: `${path}/reasoningEfforts`,
           message: "reasoningEffortsと旧supportsReasoningEffortの値を一致させてください。",
+        });
+      }
+      if (model.chatCompletionsProfile !== undefined && provider.apiType !== "chat-completions") {
+        issues.push({
+          code: "CONFIG_SEMANTIC_INVALID",
+          path: `${path}/chatCompletionsProfile`,
+          message: "Chat Completions Profileはchat-completions Providerでだけ指定できます。",
+          expected: "apiType=chat-completions",
+          actual: provider.apiType,
         });
       }
     });
