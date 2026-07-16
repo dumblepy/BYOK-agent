@@ -331,6 +331,7 @@ export const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
       .strict(),
   ),
   messageSchema("request-thread-list", z.object({}).strict()),
+  messageSchema("create-thread", z.object({}).strict()),
   messageSchema(
     "select-thread",
     z

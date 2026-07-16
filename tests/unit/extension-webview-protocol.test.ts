@@ -146,4 +146,17 @@ describe("ExtensionWebviewProtocolSession", () => {
     });
     session.dispose();
   });
+
+  it("dispatches a validated create-thread action", async () => {
+    const webview = new FakeWebview();
+    const onMessage = vi.fn();
+    const session = new ExtensionWebviewProtocolSession(webview, { onMessage });
+    const message = createUiToExtensionMessage("create-thread", {});
+
+    webview.emit(message);
+    await flush();
+
+    expect(onMessage).toHaveBeenCalledWith(message);
+    session.dispose();
+  });
 });

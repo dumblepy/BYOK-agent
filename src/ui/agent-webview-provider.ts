@@ -172,6 +172,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (message.type === "create-thread") {
+      await this.handleCreateThread(message, protocolSession);
+      return;
+    }
+
     if (message.type !== "send-message") {
       // Agent execution and cancellation are connected by the Agent Runtime task.
       return;
@@ -333,6 +338,35 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
         message.messageId,
       );
       await protocolSession.sendThreadList(message.messageId);
+    }
+  }
+
+  private async handleCreateThread(
+    message: Extract<UiToExtensionMessage, { type: "create-thread" }>,
+    protocolSession: ExtensionWebviewProtocolSession,
+  ): Promise<void> {
+    if (!this.storage) {
+      await this.sendModelError(
+        protocolSession,
+        "TOOL_EXECUTION_FAILED",
+        "新しいスレッドを作成できません。",
+        message.messageId,
+      );
+      return;
+    }
+
+    try {
+      const thread = await this.storage.create();
+      this.activeThreadId = thread.id;
+      await protocolSession.sendThreadList(message.messageId);
+      await protocolSession.sendThreadSnapshotForSelection(thread.id, message.messageId);
+    } catch {
+      await this.sendModelError(
+        protocolSession,
+        "TOOL_EXECUTION_FAILED",
+        "新しいスレッドを作成できません。再試行してください。",
+        message.messageId,
+      );
     }
   }
 

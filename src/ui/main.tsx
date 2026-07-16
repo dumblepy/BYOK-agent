@@ -236,6 +236,18 @@ function App() {
     }
   };
 
+  const handleNewThread = (): void => {
+    setIsThreadListOpen(false);
+    try {
+      protocolClient.send("create-thread", {});
+    } catch {
+      dispatchComposer({
+        type: "error",
+        message: "新しいスレッドを作成できませんでした。",
+      });
+    }
+  };
+
   const handleComposerSubmit = (): void => {
     if (
       composerState.phase === "submitting" ||
@@ -397,7 +409,12 @@ function App() {
           <button type="button" class="agent-header-button" aria-label="設定">
             <i class="codicon codicon-settings-gear" aria-hidden="true" />
           </button>
-          <button type="button" class="agent-header-button" aria-label="新しいスレッド">
+          <button
+            type="button"
+            class="agent-header-button"
+            aria-label="新しいスレッド"
+            onClick={handleNewThread}
+          >
             <i class="codicon codicon-edit" aria-hidden="true" />
           </button>
         </nav>
