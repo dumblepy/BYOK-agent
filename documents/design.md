@@ -3598,7 +3598,45 @@ Codiconのサイズ調整が必要な場合、CSSで `font-size` を指定する
 
 ## 15. 会話・イベント保存
 
-## 15.1 保存形式
+## 15.1 Thread Store
+
+Thread Storeは、会話イベントそのものではなく、スレッドのライフサイクルと実行に必要なメタデータの正本を管理するExtension Host側のStorageコンポーネントである。Webviewは一覧・選択要求を表示するだけで、ファイルシステムや保存形式へ直接アクセスしない。Model Catalog、Permission Policy、SecretStorageはThread Storeへ注入しない。
+
+### 15.1.1 責務と契約
+
+```ts
+interface ThreadRecord {
+  readonly id: string;
+  readonly title: string;
+  readonly workspaceId?: string;
+  readonly modelId?: string;
+  readonly permissionProfile: "read-only" | "confirm-writes" | "workspace-write";
+  readonly revision: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly archived: boolean;
+}
+
+interface ThreadStore {
+  create(input?: CreateThreadInput): Promise<ThreadRecord>;
+  get(threadId: string): Promise<ThreadRecord | undefined>;
+  list(options?: { readonly includeArchived?: boolean }): Promise<readonly ThreadRecord[]>;
+  update(
+    threadId: string,
+    expectedRevision: number,
+    patch: ThreadUpdate,
+  ): Promise<ThreadRecord>;
+  archive(threadId: string, expectedRevision: number): Promise<ThreadRecord>;
+}
+```
+
+`CreateThreadInput`はタイトル、ワークスペース識別子、モデルID、要求権限を任意で受け取る。既定値はタイトル`新しいスレッド`、権限`confirm-writes`、アーカイブ`false`とする。`ThreadUpdate`はタイトル、モデルID、要求権限の部分更新だけを許可し、ID、作成時刻、revision、アーカイブ状態の直接変更は許可しない。アーカイブは削除ではなく`archived: true`への更新であり、アーカイブ解除は別Issueで設計する。
+
+モデルはProvider URL・APIキーではなく論理`modelId`だけを保存する。作成時にHostが解決した既定モデルを入力できるが、未選択状態も許容する。保存されたモデルが後からModel Catalogで解決不能になった場合もThread Storeは一覧を復元するが、Agent Runは開始せず、Hostがモデル再選択を要求する。権限プロファイルは`read-only`、`confirm-writes`、`workspace-write`に限定し、`autonomous`は通常API・既定値・UIへ公開しない。実効権限は保存せず、Workspace TrustとPermission PolicyからRun開始時に計算する。
+
+Thread Storeは作成・取得・一覧・更新・アーカイブを提供する。モデルと権限は同一`meta.json`と同一revisionで管理し、どちらかの更新でもrevisionを1つ進める。これにより、モデル選択と権限選択から届いた古いUI要求が互いの更新を上書きしない。
+
+### 15.1.2 保存形式と原子的更新
 
 初期実装はSQLiteではなく、スナップショット＋JSONLとする。
 
@@ -3613,6 +3651,8 @@ globalStorage/
       changes/
 ```
 
+Thread Storeが直接管理するのは各スレッドの`meta.json`だけである。`events.jsonl`、`summary.json`、`artifacts/`、`changes/`は後続のEvent Store、要約、アーティファクト、ChangeSet保存機構が管理し、Thread Storeは作成・削除・解釈しない。
+
 ### meta.json
 
 ```ts
@@ -3620,16 +3660,42 @@ interface ThreadMetadata {
   id: string;
   title: string;
   workspaceId?: string;
-  modelId: string;
+  modelId?: string;
   revision: number;
-  permissionProfile: PermissionProfile;
+  permissionProfile: Exclude<PermissionProfile, "autonomous">;
   createdAt: number;
   updatedAt: number;
   archived: boolean;
 }
 ```
 
-### events.jsonl
+`meta.json`の更新は、対象スレッドのロック取得、最新ファイルの再読込、`expectedRevision`との比較、次revisionと`updatedAt`の生成、一時ファイルへの書き込み、同一ディレクトリ内の`rename`の順序で行う。書き込み・renameに失敗した場合は既存ファイルとメモリキャッシュを維持し、一時ファイルを削除する。作成時のID衝突は別UUIDで再試行する。
+
+スレッドIDはStoreが`randomUUID()`で生成し、既存IDを受け取るAPIでは空文字、`.`、`..`、パス区切り、制御文字、絶対パスを拒否する。タイトル、モデルID、workspaceIdにも長さ上限と制御文字検証を適用する。タイトルは表示用テキストとして扱い、HTML、URI、Command URI、ログテンプレートへ展開しない。保存ファイルにはAPIキー、Authorizationヘッダー、生環境変数、認証トークン、Provider応答、プロンプト全文、非公開推論、明示除外ファイル内容を含めない。
+
+### 15.1.3 起動時の一覧復元
+
+`StorageService.initialize()`または最初の`list()`までに`globalStorageUri/threads/`を作成・走査し、直下のスレッドディレクトリから`meta.json`を検証して一覧を構築する。検証対象はJSONオブジェクト、ディレクトリ名とIDの一致、必須文字列、revision、時刻、権限の列挙値、アーカイブ値である。旧形式で不足する任意の`modelId`や権限は安全な既定値へ補完できるが、未知フィールドや機密値を新しい正本へ取り込まない。
+
+通常一覧は未アーカイブだけを対象とし、`includeArchived: true`のときだけアーカイブ済みを含める。順序は`updatedAt`降順、同値なら`createdAt`降順、さらに`id`昇順で固定する。破損したメタデータはそのエントリだけを除外し、有効な他スレッドの復元を失敗させない。除外はパス、分類、件数などの非機密な診断に限定し、破損ファイルを暗黙に上書きしない。
+
+### 15.1.4 競合とエラー
+
+更新はスレッド単位で直列化し、`expectedRevision`が現在値と一致しない場合は保存せず、`ThreadRevisionConflictError`を返す。エラーには`threadId`、期待revision、実revisionだけを含め、ファイル内容や秘密情報を含めない。取得対象が存在しない場合は`undefined`またはStorage共通のNot Found分類へ変換し、呼び出し元が新規作成と誤認して既存データを上書きしないようにする。
+
+同一プロセス内の並行更新はスレッドロックで保護する。原子的renameは部分的なJSONの読み込みを防ぐが、複数Extension Hostプロセスからの同時更新は初期スコープ外とする。将来その運用を許可する場合はOSファイルロック等を追加設計する。
+
+### 15.1.5 実装単位と検証
+
+実装は`src/storage/thread-store.ts`の型・File実装・検証・一覧復元・atomic write・revision競合、`src/storage/storage-service.ts`のライフサイクル接続、既存`thread-model-store.ts`の互換層または統合に分ける。Thread Storeは`StorageService`の公開境界に置き、UIへはThread Summaryとrevisionだけを渡す。
+
+Unit Testでは作成・取得・更新・アーカイブ、既定値、決定的な一覧順、アーカイブ除外、`includeArchived`、モデル・権限の再起動後復元、破損メタデータの部分復元、revision競合、同時更新、パストラバーサル、原子的更新失敗、機密情報非保存を検証する。Extension Integration TestではThread Store／StorageServiceを再生成し、VS Code再起動相当でも一覧と各スレッドのモデル・権限が復元されることを検証する。実APIは使用しない。
+
+完了条件は、Thread StoreのCRUDとアーカイブが動作し、モデルID・要求権限が保存され、VS Code再起動後に未アーカイブのスレッド一覧とメタデータを復元できることである。Event Store、要約、アーティファクト、ChangeSetの完了は本Issueの条件に含めない。
+
+## 15.2 保存形式
+
+### 15.2.1 events.jsonl
 
 ```ts
 type AgentEvent =
@@ -3646,7 +3712,7 @@ type AgentEvent =
 
 イベントは追記専用にする。一定件数ごとにスナップショットを作成する。
 
-## 15.2 保存しないもの
+## 15.3 保存しないもの
 
 * APIキー
 * Authorizationヘッダー

@@ -1,11 +1,11 @@
-import { randomUUID } from "node:crypto";
-import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
-import { join } from "node:path";
-
 import {
-  isUserSelectablePermissionProfile,
-  type UserSelectablePermissionProfile,
-} from "../permissions/permission-profile";
+  FileThreadStore,
+  ThreadRevisionConflictError,
+  type ThreadStoreFileSystem,
+} from "./thread-store";
+import type { UserSelectablePermissionProfile } from "../permissions/permission-profile";
+
+export type { ThreadStoreFileSystem as ThreadModelStoreFileSystem } from "./thread-store";
 
 export interface ThreadModelState {
   readonly threadId: string;
@@ -34,267 +34,91 @@ export interface ThreadModelStore {
   ): Promise<ThreadPermissionState>;
 }
 
-export class ThreadModelRevisionConflictError extends Error {
-  public constructor(
-    public readonly threadId: string,
-    public readonly expectedRevision: number,
-    public readonly actualRevision: number,
-  ) {
-    super("The thread model revision is stale");
+export class ThreadModelRevisionConflictError extends ThreadRevisionConflictError {
+  public constructor(threadId: string, expectedRevision: number, actualRevision: number) {
+    super(threadId, expectedRevision, actualRevision);
     this.name = "ThreadModelRevisionConflictError";
   }
 }
 
-export class ThreadPermissionRevisionConflictError extends Error {
-  public constructor(
-    public readonly threadId: string,
-    public readonly expectedRevision: number,
-    public readonly actualRevision: number,
-  ) {
-    super("The thread permission revision is stale");
+export class ThreadPermissionRevisionConflictError extends ThreadRevisionConflictError {
+  public constructor(threadId: string, expectedRevision: number, actualRevision: number) {
+    super(threadId, expectedRevision, actualRevision);
     this.name = "ThreadPermissionRevisionConflictError";
   }
 }
 
-interface ThreadMetadataState {
-  readonly threadId: string;
-  readonly modelId?: string;
-  readonly permissionProfile: UserSelectablePermissionProfile;
-  readonly revision: number;
-}
-
-interface PersistedThreadMetadata {
-  readonly title?: unknown;
-  readonly workspaceId?: unknown;
-  readonly permissionProfile?: unknown;
-  readonly createdAt?: unknown;
-  readonly archived?: unknown;
-  readonly modelId?: unknown;
-  readonly revision?: unknown;
-  readonly [key: string]: unknown;
-}
-
-export interface ThreadModelStoreFileSystem {
-  readonly rootPath?: string;
-}
-
-/** JSON meta.json backed storage for thread model and permission selections. */
+/** Backward-compatible facade. Thread metadata is persisted by FileThreadStore. */
 export class FileThreadModelStore implements ThreadModelStore {
-  private readonly memory = new Map<string, ThreadMetadataState>();
-  private readonly locks = new Map<string, Promise<void>>();
+  public readonly threadStore: FileThreadStore;
 
-  public constructor(private readonly fileSystem: ThreadModelStoreFileSystem = {}) {}
+  public constructor(fileSystem: ThreadStoreFileSystem = {}) {
+    this.threadStore = new FileThreadStore(fileSystem);
+  }
 
   public async getThreadModelState(threadId: string): Promise<ThreadModelState> {
-    const state = await this.getThreadMetadataState(threadId);
+    const record = await this.threadStore.ensure(threadId);
     return {
-      threadId: state.threadId,
-      ...(state.modelId ? { modelId: state.modelId } : {}),
-      revision: state.revision,
+      threadId: record.id,
+      ...(record.modelId === undefined ? {} : { modelId: record.modelId }),
+      revision: record.revision,
     };
   }
 
-  public updateThreadModel(
+  public async updateThreadModel(
     threadId: string,
     expectedRevision: number,
     modelId: string,
   ): Promise<ThreadModelState> {
-    return this.withThreadLock(threadId, async () => {
-      const current = await this.getThreadMetadataState(threadId);
-      if (current.revision !== expectedRevision) {
-        throw new ThreadModelRevisionConflictError(threadId, expectedRevision, current.revision);
-      }
-
-      const next: ThreadMetadataState = {
-        ...current,
-        modelId,
-        revision: current.revision + 1,
-      };
-      await this.persist(next);
-      this.memory.set(threadId, next);
-      return {
-        threadId,
-        modelId,
-        revision: next.revision,
-      };
-    });
-  }
-
-  public async getThreadPermissionState(threadId: string): Promise<ThreadPermissionState> {
-    const state = await this.getThreadMetadataState(threadId);
-    return {
-      threadId: state.threadId,
-      permissionProfile: state.permissionProfile,
-      revision: state.revision,
-    };
-  }
-
-  public updateThreadPermission(
-    threadId: string,
-    expectedRevision: number,
-    permissionProfile: UserSelectablePermissionProfile,
-  ): Promise<ThreadPermissionState> {
-    return this.withThreadLock(threadId, async () => {
-      const current = await this.getThreadMetadataState(threadId);
-      if (current.revision !== expectedRevision) {
-        throw new ThreadPermissionRevisionConflictError(
+    await this.threadStore.ensure(threadId);
+    try {
+      const record = await this.threadStore.update(threadId, expectedRevision, { modelId });
+      return { threadId: record.id, modelId: record.modelId, revision: record.revision };
+    } catch (error) {
+      if (error instanceof ThreadRevisionConflictError)
+        throw new ThreadModelRevisionConflictError(
           threadId,
           expectedRevision,
-          current.revision,
+          error.actualRevision,
         );
-      }
-
-      const next: ThreadMetadataState = {
-        ...current,
-        permissionProfile,
-        revision: current.revision + 1,
-      };
-      await this.persist(next);
-      this.memory.set(threadId, next);
-      return {
-        threadId,
-        permissionProfile,
-        revision: next.revision,
-      };
-    });
-  }
-
-  private async getThreadMetadataState(threadId: string): Promise<ThreadMetadataState> {
-    const cached = this.memory.get(threadId);
-    if (cached) {
-      return cached;
-    }
-
-    const filePath = this.getMetaPath(threadId);
-    if (!filePath) {
-      return this.getMemoryState(threadId);
-    }
-
-    try {
-      const value = JSON.parse(await readFile(filePath, "utf8")) as unknown;
-      const state = parsePersistedState(value, threadId);
-      this.memory.set(threadId, state);
-      return state;
-    } catch (error) {
-      if (isFileNotFound(error)) {
-        return this.getMemoryState(threadId);
-      }
       throw error;
     }
   }
 
-  private async persist(state: ThreadMetadataState): Promise<void> {
-    const metaPath = this.getMetaPath(state.threadId);
-    if (!metaPath || !this.fileSystem.rootPath) {
-      return;
-    }
-
-    const directory = join(this.fileSystem.rootPath, "threads", state.threadId);
-    await mkdir(directory, { recursive: true });
-    const temporaryPath = `${metaPath}.${randomUUID()}.tmp`;
-    const existing = await readPersistedMetadata(metaPath);
-    const now = Date.now();
-    const metadata = {
-      id: state.threadId,
-      title: typeof existing?.title === "string" ? existing.title : "新しいスレッド",
-      ...(typeof existing?.workspaceId === "string" ? { workspaceId: existing.workspaceId } : {}),
-      ...(state.modelId ? { modelId: state.modelId } : {}),
-      revision: state.revision,
-      permissionProfile: state.permissionProfile,
-      createdAt: isNonNegativeInteger(existing?.createdAt) ? existing.createdAt : now,
-      updatedAt: now,
-      archived: typeof existing?.archived === "boolean" ? existing.archived : false,
-    };
-
-    try {
-      await writeFile(temporaryPath, `${JSON.stringify(metadata, null, 2)}\n`, {
-        encoding: "utf8",
-        mode: 0o600,
-      });
-      await rename(temporaryPath, metaPath);
-    } finally {
-      await unlink(temporaryPath).catch(() => undefined);
-    }
-  }
-
-  private getMemoryState(threadId: string): ThreadMetadataState {
-    const state = {
-      threadId,
-      permissionProfile: "confirm-writes" as const,
-      revision: 0,
-    } satisfies ThreadMetadataState;
-    this.memory.set(threadId, state);
-    return state;
-  }
-
-  private getMetaPath(threadId: string): string | undefined {
-    return this.fileSystem.rootPath
-      ? join(this.fileSystem.rootPath, "threads", threadId, "meta.json")
-      : undefined;
-  }
-
-  private async withThreadLock<T>(threadId: string, operation: () => Promise<T>): Promise<T> {
-    const previous = this.locks.get(threadId) ?? Promise.resolve();
-    let release!: () => void;
-    const current = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    const queued = previous.then(() => current);
-    this.locks.set(threadId, queued);
-
-    await previous;
-    try {
-      return await operation();
-    } finally {
-      release();
-      if (this.locks.get(threadId) === queued) {
-        this.locks.delete(threadId);
-      }
-    }
-  }
-}
-
-function parsePersistedState(value: unknown, threadId: string): ThreadMetadataState {
-  if (!isRecord(value)) {
+  public async getThreadPermissionState(threadId: string): Promise<ThreadPermissionState> {
+    const record = await this.threadStore.ensure(threadId);
     return {
-      threadId,
-      permissionProfile: "confirm-writes",
-      revision: 0,
+      threadId: record.id,
+      permissionProfile: record.permissionProfile,
+      revision: record.revision,
     };
   }
 
-  return {
-    threadId,
-    ...(typeof value.modelId === "string" ? { modelId: value.modelId } : {}),
-    permissionProfile: isUserSelectablePermissionProfile(value.permissionProfile)
-      ? value.permissionProfile
-      : "confirm-writes",
-    revision: isNonNegativeInteger(value.revision) ? value.revision : 0,
-  };
-}
-
-function isRecord(value: unknown): value is PersistedThreadMetadata {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
-}
-
-function isFileNotFound(error: unknown): boolean {
-  return isRecord(error) && error.code === "ENOENT";
-}
-
-async function readPersistedMetadata(
-  metaPath: string,
-): Promise<PersistedThreadMetadata | undefined> {
-  try {
-    const value = JSON.parse(await readFile(metaPath, "utf8")) as unknown;
-    return isRecord(value) ? value : undefined;
-  } catch (error) {
-    if (isFileNotFound(error)) {
-      return undefined;
+  public async updateThreadPermission(
+    threadId: string,
+    expectedRevision: number,
+    permissionProfile: UserSelectablePermissionProfile,
+  ): Promise<ThreadPermissionState> {
+    await this.threadStore.ensure(threadId);
+    try {
+      const record = await this.threadStore.update(threadId, expectedRevision, {
+        permissionProfile,
+      });
+      return {
+        threadId: record.id,
+        permissionProfile: record.permissionProfile,
+        revision: record.revision,
+      };
+    } catch (error) {
+      if (error instanceof ThreadRevisionConflictError)
+        throw new ThreadPermissionRevisionConflictError(
+          threadId,
+          expectedRevision,
+          error.actualRevision,
+        );
+      throw error;
     }
-    throw error;
   }
 }
+
+export type { ThreadStoreFileSystem } from "./thread-store";
