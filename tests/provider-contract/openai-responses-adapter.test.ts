@@ -6,6 +6,25 @@ import { describe, expect, it, vi } from "vitest";
 import { OpenAIResponsesAdapter } from "../../src/providers/openai/openai-responses-adapter";
 import { toResponsesRequest } from "../../src/providers/openai/openai-responses-request";
 import type { ProviderRequest } from "../../src/providers/provider-types";
+import { runProviderContractSuite } from "./contract-suite";
+import { openAIResponsesContractCases } from "./contract-cases";
+
+runProviderContractSuite({
+  name: "OpenAI Responses",
+  createAdapter: (fetchImpl) =>
+    new OpenAIResponsesAdapter(
+      {
+        providerId: "openai",
+        vendor: "openai",
+        apiType: "responses",
+        url: "https://api.openai.com/v1/responses",
+        headers: {},
+        credential: "fixture-credential",
+      },
+      { fetchImpl },
+    ),
+  cases: openAIResponsesContractCases(),
+});
 
 const baseRequest: ProviderRequest = {
   requestId: "request-1",

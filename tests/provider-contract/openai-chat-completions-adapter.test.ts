@@ -6,6 +6,25 @@ import {
 } from "../../src/providers/openai/openai-chat-completions-adapter";
 import { toChatCompletionsRequest } from "../../src/providers/openai/openai-chat-completions-request";
 import type { ProviderRequest } from "../../src/providers/provider-types";
+import { runProviderContractSuite } from "./contract-suite";
+import { openAIChatCompletionsContractCases } from "./contract-cases";
+
+runProviderContractSuite({
+  name: "OpenAI Chat Completions",
+  createAdapter: (fetchImpl) =>
+    new OpenAIChatCompletionsAdapter(
+      {
+        providerId: "provider-test",
+        vendor: "test",
+        apiType: "chat-completions",
+        url: "https://provider.example.test/v1/chat/completions",
+        headers: {},
+        credential: "fixture-credential",
+      },
+      { fetchImpl },
+    ),
+  cases: openAIChatCompletionsContractCases(),
+});
 
 const baseRequest: ProviderRequest = {
   requestId: "request-1",

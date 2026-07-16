@@ -1,87 +1,192 @@
 ---
-description: 18-milestone-3-provider層ブランチでProviderリトライ方針を設計・実装するときに読み込む
+description: 18-milestone-3-provider層ブランチでProvider Contract Test基盤を作成するときに読み込む
 alwaysApply: false
 ---
-# Providerリトライ方針
+# Provider Contract Test基盤
 
-このブランチの対象は、Provider Adapterが正規化した一時的エラーだけを、実行単位・試行回数・待機時間・重複防止の契約に従って安全に再試行する設計と実装である。Provider Adapterへエージェント判断やTool実行を持ち込まず、Retry PolicyをProvider呼び出しの上位境界へ配置する。
+このブランチでは、保存済みのProviderストリームイベントを入力として、すべてのProvider Adapterが同一の共通契約を満たすことを自動検証できるテスト基盤を作成する。
+
+## 目的
+
+- Provider固有のSSEやレスポンス形式を、Agentが消費する`ProviderEvent`へ同じ意味で正規化できることを検証する。
+- Text、Tool Call、Usage、Error、Cancelの主要な振る舞いをAdapter横断で検証する。
+- Providerを追加したとき、同じ契約テストへAdapterを登録するだけで最低限の互換性を検査できるようにする。
+- 通常のテストではネットワークへ接続せず、実APIテストは明示的な設定時だけ実行する。
 
 ## スコープ
 
-- `rate-limited`、`timeout`、`network`のうち、Adapterが`retryable: true`として正規化したエラーだけを自動再試行候補にする。
-- `Retry-After`をバックオフの下限として扱い、指数バックオフ、ジッター、試行回数、待機時間、累積時間に上限を設ける。
-- `runId`と`requestId`を使ったsingle-flightで同一リクエストの並行送信を1本に制限する。
-- Tool定義を含む要求、またはTool Callを受信した試行について、サーバー処理済みの可能性がある再送を禁止する。
-- Provider Contract TestとUnit Testで、再試行判定、待機計算、Abort、重複抑止、Tool Call安全境界を検証する。
+- `tests/provider-contract/`配下の共通Contract Test Runner、Adapter登録定義、保存済みストリームFixture、Fake HTTP／Transport層。
+- 既存の`ProviderAdapter`、`ProviderRequest`、`ProviderEvent`、`ProviderError`の契約に基づく共通アサーション。
+- OpenAI Responses、OpenAI互換Chat Completions、Anthropic Messagesなど、登録済みAdapterへの共通テスト適用。
+- 正常系、Tool Call、Usage、Provider Error、ユーザーCancel、完了イベントの終端性、秘密情報非混入の検証。
 
 ## 非スコープ
 
-- 実API接続、APIキーやProvider SDKの導入。
-- Toolの実行・再実行、引数Schema検証、権限判定、Tool Resultの要約・保存。
-- Agentの停止条件、Context圧縮、モデル切り替え、別Providerへの自動フォールバック。
+- Provider Adapter本体、Agent Runtime、Tool実行、権限判定、履歴保存、リトライ実行の変更。
+- 実APIを通常のCIで呼び出すこと、APIキーの自動検出、APIキーの保存や表示。
+- Provider固有仕様を共通契約へ追加すること。固有仕様の詳細はAdapter専用テストで検証し、共通Suiteへは正規化後の意味だけを渡す。
 - `git add`、`git commit`。
 
 ## 実装方針
 
-- Adapterはエラー分類と`retryable`、`retryAfterMs`の正規化だけを担当し、待機・再送・重複排除は`ProviderRetryPolicy`側で行う。
-- 自動再試行の許可は`error.retryable === true`、許可されたエラーコード、残り試行回数、累積待機時間、Abort未発生、Tool安全条件をすべて満たす場合に限る。
-- `auth-failed`、`bad-request`、`context-exceeded`、`unsupported`、`cancelled`、`unknown`は自動再試行しない。未分類の5xxも、明示的に一時的エラーへ正規化されるまで再試行しない。
-- 再試行は同一の不変`ProviderRequest`スナップショット、同一の論理`requestId`、同一の会話順序を使う。新しいユーザー要求、メッセージ追加、Tool ID発行、Tool実行を再試行処理から発生させない。
-- 同じ`runId + requestId`の呼び出しが重なった場合、後続の送信を開始せず、既存のsingle-flight結果へ合流する。完了・失敗・キャンセル後に同じキーを再利用しない。
-- Providerがリクエスト受領後の再送を冪等に処理する保証を共通契約へ置かない。Tool定義を含む要求は、送信前失敗またはProviderが処理開始前に拒否したことを示す明示的な失敗だけ自動再試行する。
-- 1回でも外部へストリームイベントを公開した試行が途中で失敗した場合、その試行を再送しない。部分テキストやTool Callの二重発行を避け、エラーを確定する。
-- Abortは待機中・送信中・ストリーム中のすべてで優先し、タイマーとHTTP処理を解放する。Abort後に再試行、イベント、Tool実行を開始しない。
-- ログはRun ID、Request ID、試行番号、エラー分類、待機時間、最終結果だけに限定し、Prompt、Tool定義の機密値、Tool Result、生Response、Authorizationを記録しない。
+### 1. 共通Suiteを一つの正本にする
 
-## 固定する既定値
+共通Suiteは、Adapterを生成するFactoryまたはFixture Harnessを受け取り、同じ`ProviderRequest`と同じ期待値で実行する。Providerごとに同じアサーションを複製しない。
 
-| 項目 | 設計値 | 制約 |
-|---|---:|---|
-| 最大試行回数 | 3回 | 初回1回＋自動再試行2回。Provider・UIから増やせない |
-| 初回バックオフ | 250ms | `Retry-After`が大きい場合はそちらを優先 |
-| 指数係数 | 2 | `250ms × 2^retryIndex` |
-| 1回の待機上限 | 8,000ms | `Retry-After`を含めて超過分は上限へ丸める |
-| 追加ジッター | 0〜20% | テストでは乱数源を注入して固定可能 |
-| 自動再試行の累積待機上限 | 15,000ms | 超過する次の再試行を行わない |
+Adapterごとのテストファイルは、次の二つだけを担当する。
 
-実際の待機時間は、`min(8,000, max(指数バックオフ, retryAfterMs) + ジッター)`とし、累積上限も同時に検査する。`Retry-After`の不正値、負数、非有限値、上限超過値は無視し、サーバー指定を理由に再試行可能性を昇格させない。
+1. Provider固有の保存済みFixtureを読み込むFake Transportを組み立てる。
+2. AdapterとFixtureを共通Suiteへ登録する。
 
-## 調査結果・設計まとめ
+共通SuiteはProvider固有のJSONフィールド、SSEイベント名、HTTP Bodyを検査しない。検査対象はAdapterから返された`ProviderEvent`列、呼び出し回数、Abort状態、秘密情報の非混入だけとする。
 
-- RFC 9110 §10.2.3の`Retry-After`はHTTP-dateまたは0以上の秒数であり、待機時間の提案であって再試行許可そのものではない。
-- OpenAI ResponsesではFunction Callの引数がストリームイベントとして段階的に返され、`call_id`がTool結果との対応に使われるため、再送時に新しいTool CallやIDを生成しない。
-- AnthropicもHTTP 4xx／5xxのAPIエラーと正常な停止理由を分けて扱うため、停止理由をリトライ根拠にしない。
-- Provider横断の冪等性保証を仮定できないため、Tool定義付き要求の再送は「未送信」または「処理開始前に拒否された」と確認できる場合だけ許可する。
-- ストリームの途中で受信したTool Callを再試行すると、同じ副作用Toolを二重実行する危険がある。したがって、公開済みイベントがある試行は再送せず、Tool実行は成功した確定イベントをAgentが一度だけ受け取った後に行う。
+### 2. 保存済みストリームFixtureを正規化する
+
+FixtureはProviderごとの生ストリームを再現する入力資料として保存し、テストコードへ長いインライン文字列を埋め込まない。Fixtureのメタデータと期待する共通イベント列は分離する。
+
+Fixtureには次の情報を持たせる。
+
+- 一意なケースID、Provider／Adapter種別、シナリオ名。
+- Fake HTTPレスポンスのステータス、Content-Type、必要な安全なメタデータ。
+- 保存済みストリーム本文または分割チャンク列。チャンク境界は任意位置に置き、SSE parserが境界に依存しないことを検証する。
+- 期待する`ProviderEvent`列、またはError／Cancel時の終端条件。
+- Tool Callを使う場合の論理Tool定義と、期待するCall ID・名前・完全な引数。
+
+FixtureにはAPIキー、Authorizationヘッダー、実URL、実ユーザーデータ、ファイル内容、Providerの生エラー本文を含めない。既存Fixtureを再利用できる場合は同じ意味を重複保存しない。
+
+### 3. ケースごとに同じ契約を検証する
+
+共通Suiteは最低限、次のケースを各Adapterへ適用する。
+
+| ケース | 検証内容 |
+|---|---|
+| Text | 複数チャンクのTextを順序どおり`text-delta`へ変換し、完了時に`completed`を一度だけ出す |
+| Tool Call | Call IDと名前を保持し、引数断片を結合して完全なJSON引数を一度だけ`tool-call`へ確定する |
+| 並列Tool Call | 複数Call IDを混同せず、各引数を独立して結合し、受信順を保持する |
+| Usage | Providerが明示したInput／Output／Cached／Reasoning Usageだけを正規化し、未提供値を0や推定値で補わない |
+| Error | 認証、Rate Limit、Timeout、Bad Request、Context超過、未対応、Networkなどを安全な`ProviderError`へ分類する |
+| Cancel | 開始前と実行中のAbortを`cancelled`へ変換し、Abort後のText、Tool Call、Usage、Completedを発行しない |
+
+各ケースでは、最終イベントの性質も検証する。`completed`、`error`、`cancelled`のいずれか一つだけを終端とし、終端後に別イベントを出してはならない。途中まで公開したイベントを、テスト終了後に別の成功列として再発行してはならない。
+
+### 4. Fake Transportは観測可能かつ決定的にする
+
+Fake HTTP／Transport層は、保存済みレスポンスを返すだけでなく、次を観測できるようにする。
+
+- リクエスト回数、AbortSignalの受け渡し、Abort後のReader解放。
+- Adapterへ渡されたURL・ヘッダー・Bodyに秘密情報が含まれていないこと。
+- ストリームのチャンク境界、遅延、途中エラー、空Body、異常Content-Type。
+
+テストでは実時間の待機や外部サーバーの状態に依存しない。Timeoutや遅延を検証する場合は注入可能な時計・Scheduler・Fake Readerを使用し、テスト実行時間を固定する。
+
+### 5. Error契約を安全な分類で固定する
+
+Errorの共通アサーションは、Provider固有の生メッセージではなく次だけを検証する。
+
+- `ProviderError.code`、`retryable`、必要なHTTP status、許可されたProvider code/type、request ID。
+- `Retry-After`の有効値が保持され、不正値で再試行可能へ昇格しないこと。
+- APIキー、Authorization、URL全体、生Response Body、秘密を含むProvider messageがイベント・例外・ログへ流れないこと。
+
+認証、入力不正、Context超過、未対応、Cancel、未知エラーは自動再試行不可とし、Rate Limit、Timeout、Networkは既存の正規化契約に従う。再試行の待機や再送そのものはこのContract Test基盤の責務にせず、既存のRetry Policyのテストで検証する。
+
+### 6. 実APIテストは二重の明示設定を要求する
+
+実APIテストは通常のContract Testから分離したSuiteとして定義する。次の条件をすべて満たした場合だけ実行可能にする。
+
+1. 共通の明示フラグ（例：`BYOK_PROVIDER_CONTRACT_LIVE=1`）が設定されている。
+2. 対象Provider専用の実行許可、エンドポイント、SecretStorage等の認証設定が明示されている。
+
+どちらか一方でも欠けている場合は、テストを成功扱いで黙ってスキップせず、設定不足を明示したSkipまたは専用コマンドの対象外として扱う。通常の`pnpm test`とCIの既定ジョブは保存済みFixtureだけを実行し、実APIテストを暗黙に起動しない。実APIテストへ渡す入力は最小限の固定プロンプトとし、結果・レスポンス・認証情報をFixtureやスナップショットへ保存しない。
+
+## 設計
+
+### テスト基盤の構成
+
+```text
+tests/provider-contract/
+  contract-suite.ts       # 全Adapterで共有する契約テスト
+  contract-cases.ts       # 共通Request、期待イベント、ケース定義
+  adapter-harness.ts      # Fake TransportとAbort／観測用Harness
+  fixtures/
+    <provider>/<case>/    # 保存済みストリームとメタデータ
+  <provider>-adapter.test.ts # AdapterとFixtureの登録だけを行う
+  live/                   # 明示設定時だけの実APIテスト
+```
+
+実際のファイル名は既存の構成と命名規則を優先するが、責務分離は維持する。共通SuiteがAdapter内部のprivate状態やProvider固有型へ依存する設計にはしない。
+
+### 共通Suiteの入力と出力
+
+共通Suiteへ渡すHarnessは、概念的に次の情報を提供する。
+
+```ts
+interface ProviderContractHarness {
+  readonly name: string;
+  createAdapter(input: {
+    readonly transport: FakeProviderTransport;
+  }): ProviderAdapter;
+  readonly cases: readonly ProviderContractCase[];
+}
+
+interface ProviderContractCase {
+  readonly id: string;
+  readonly request: ProviderRequest;
+  readonly response: FakeProviderResponse;
+  readonly expected: readonly ProviderEvent[];
+  readonly abort?: "before-request" | "during-stream";
+}
+```
+
+これは実装時の概念設計であり、既存の`ProviderAdapterInit`やテスト用FakeのAPIと重複する場合は、既存の公開型を再利用する。共通Suiteの戻り値はイベント列とTransport観測結果の検証結果であり、Providerの生レスポンスを返さない。
+
+### 契約上の不変条件
+
+- `stream(request, signal)`はAbort済みSignalを受け取った場合、通信を開始せず`cancelled`だけを返す。
+- イベントの順序は入力ストリームの意味を保ち、Text、Reasoning、Tool Call、Usageを別イベントへ混ぜない。
+- Tool Callの論理IDはProvider間で維持し、`tool-call-start`、`tool-call-delta`、`tool-call`で同じIDを使う。
+- Tool Callの引数が完成しない場合は成功完了にせず、ErrorまたはCancelとして終端する。
+- Usageは一つの応答に対して明示値を一度だけ返す。未提供のUsageは省略する。
+- `error`または`cancelled`の後に`completed`、Usage、Text、Tool Callを返さない。
+- `completed`は一つだけで、正常終了の最終イベントである。
+- Adapterの1回のstream実行に属するバッファ、Abort状態、Usageを次の実行へ持ち越さない。
+- Fakeで観測した秘密情報は、イベント、Error、ログ、スナップショット、永続化データに現れない。
+
+### Provider追加時の登録手順
+
+新しいProvider Adapterを追加するときは、次の順でContract Testを追加する。
+
+1. 共通`ProviderRequest`で表現可能な最小の固定入力を定義する。
+2. Text、Tool Call、Usage、Error、Cancelを再現する保存済みFixtureを追加する。
+3. AdapterをFake Transportへ接続する薄いHarnessを追加する。
+4. 共通Suiteを登録し、ProviderEvent列と終端規則を検証する。
+5. Provider固有の変換差分だけをAdapter専用テストへ追加する。
+6. 既定テストで実APIが起動しないこと、Fixtureに秘密がないこと、型検査・Lint・format・テストが通ることを確認する。
 
 ## 進捗
 
-- [x] `AGENTS.md`、`project.mdc`、`branch.mdc`、旧ブランチルールを確認する
-- [x] Provider共通型、エラー正規化、Router、AgentErrorの既存契約を確認する
-- [x] RFC 9110、OpenAI Responses、Anthropic APIエラーの再試行関連仕様を確認する
-- [x] リトライ判定、指数バックオフ、上限、Tool Call重複防止の設計を`documents/design.md`へ追記する
-- [x] `ProviderRetryPolicy`のインターフェースと実装を追加する
-- [x] single-flight、Abort、待機計算、試行上限のUnit Testを追加する
-- [x] Tool定義付き要求の安全境界と重複送信抑止のContract Testを追加する
-- [x] 型検査、Lint、フォーマット、テストを実行する
+- [ ] 共通Contract Test Runnerとケース定義の設計を確定する
+- [ ] 保存済みストリームFixtureの形式とFake Transportの観測項目を確定する
+- [ ] Text、Tool Call、Usage、Error、Cancelの共通アサーションを作成する
+- [ ] 登録済みProvider Adapterを共通Suiteへ接続する
+- [ ] 実APIテストを明示設定時だけ実行するゲートを作成する
+- [ ] 型検査、Lint、format、通常テストで基盤を検証する
 
 ## 参考資料
 
 - `AGENTS.md`
-- `.cursor/rules/project.mdc`の`SYW-PROVIDER-001`〜`SYW-PROVIDER-004`、`SYW-ERR-001`、`SYW-TEST-001`〜`SYW-TEST-002`
+- `.cursor/rules/project.mdc`の`SYW-PROVIDER-001`〜`SYW-PROVIDER-004`、`SYW-TEST-001`〜`SYW-TEST-002`、`SYW-ERR-001`
 - `.cursor/rules/branch.mdc`
-- `documents/design.md` §6 Provider Adapter、§6.0.2〜§6.0.4、§18、§19.2
-- `documents/issues.md` Milestone 3「Providerリトライ方針を実装する」
-- [RFC 9110 §10.2.3 Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3)
-- [OpenAI Responses API streaming events](https://platform.openai.com/docs/api-reference/responses-streaming)
-- [Anthropic API errors](https://docs.anthropic.com/en/api/errors)
+- `documents/design.md` §6 Provider Adapter、§6.0.1〜§6.0.4、§19.2 Provider Contract Test
+- `documents/issues.md` Milestone 3「Provider Contract Test基盤を作成する」
+- `src/providers/provider-types.ts`
+- `src/providers/provider-error.ts`
+- `tests/provider-contract/`の既存FixtureおよびAdapterテスト
 
 ## 完了条件
 
-1. 認証、入力不正、Context超過、未対応、キャンセル、未知エラーが自動再試行されない。
-2. Adapterが安全な一時的エラーとして正規化した場合だけ、最大3試行、指数バックオフ、ジッター、待機・累積時間上限が適用される。
-3. `Retry-After`は有効値だけを指数バックオフの下限として使い、不正値で再試行許可や上限を変更しない。
-4. 同じ`runId + requestId`の同時要求がネットワーク送信を複数開始せず、既存の処理結果へ合流する。
-5. Tool定義付き要求またはTool Call受信後の不確実な再送が発生せず、Tool実行がリトライ層から呼び出されない。
-6. Abort、待機上限、試行上限、公開済みイベント後の失敗が決定的に処理され、Error／Cancelled後に後続イベントを発行しない。
-7. APIキー、Authorization、URL全体、Prompt、Tool Result、生Responseがリトライ状態、ログ、永続化へ含まれない。
+1. 保存済みストリームFixtureだけで、共通Suiteが各Provider Adapterを同じ入力・同じ期待値で検証できる。
+2. Text、Tool Call、Usage、Error、Cancel、および終端後イベント抑止が自動検証される。
+3. Provider固有のストリーム形式を共通Suiteへ露出せず、Adapterの正規化結果だけを検査する。
+4. Errorは安全な共通分類へ正規化され、機密情報や生レスポンスがテスト出力・イベント・保存資料へ含まれない。
+5. 実APIテストは明示的な共通フラグとProvider固有設定の両方がある場合だけ実行され、既定のテスト・CIではネットワーク接続しない。
+6. 新しいProvider Adapterを登録することで同じ契約を自動検証でき、Providerごとの契約アサーション複製が不要である。
