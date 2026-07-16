@@ -30,11 +30,17 @@ export interface ExtensionWebviewProtocolHandlers {
     providerId?: string,
   ) => readonly ProviderCredentialSummary[] | Promise<readonly ProviderCredentialSummary[]>;
   readonly getThreadList?: () => readonly ThreadSummary[] | Promise<readonly ThreadSummary[]>;
-  readonly getThreadSnapshot?: (
-    threadId: string,
-  ) =>
-    | { readonly revision: number; readonly events: readonly ThreadEvent[] }
-    | Promise<{ readonly revision: number; readonly events: readonly ThreadEvent[] }>;
+  readonly getThreadSnapshot?: (threadId: string) =>
+    | {
+        readonly revision: number;
+        readonly eventSequence?: number;
+        readonly events: readonly ThreadEvent[];
+      }
+    | Promise<{
+        readonly revision: number;
+        readonly eventSequence?: number;
+        readonly events: readonly ThreadEvent[];
+      }>;
 }
 
 const MAX_SEEN_MESSAGE_IDS = 2_048;
@@ -224,14 +230,17 @@ export class ExtensionWebviewProtocolSession {
     this.threadSequences.set(threadId, Math.max(currentSequence, 0));
     const snapshot = (await this.handlers.getThreadSnapshot?.(threadId)) ?? {
       revision: 0,
+      eventSequence: 0,
       events: [],
     };
+    this.threadSequences.set(threadId, snapshot.eventSequence ?? 0);
     await this.sendToUi(
       createExtensionToUiMessage(
         "thread-snapshot",
         {
           threadId,
           revision: snapshot.revision,
+          eventSequence: snapshot.eventSequence ?? 0,
           events: [...snapshot.events],
         },
         { correlationId },

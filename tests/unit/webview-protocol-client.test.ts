@@ -100,4 +100,32 @@ describe("WebviewProtocolClient", () => {
     expect(onMessage).not.toHaveBeenCalled();
     client.dispose();
   });
+
+  it("does not compare thread metadata revisions with event sequences", () => {
+    const api: WebviewProtocolApi = { postMessage: vi.fn() };
+    const messageWindow = new FakeWindow();
+    const onMessage = vi.fn();
+    const client = new WebviewProtocolClient(api, messageWindow, { onMessage });
+
+    client.start();
+    messageWindow.emit(
+      createExtensionToUiMessage("thread-snapshot", {
+        threadId: "thread-1",
+        revision: 5,
+        eventSequence: 0,
+        events: [],
+      }),
+    );
+    messageWindow.emit(
+      createExtensionToUiMessage("thread-event", {
+        threadId: "thread-1",
+        sequence: 1,
+        event: { kind: "user-message", text: "送信済み" },
+      }),
+    );
+
+    expect(onMessage).toHaveBeenCalledTimes(2);
+    expect(onMessage.mock.calls[1]?.[0]).toMatchObject({ type: "thread-event" });
+    client.dispose();
+  });
 });

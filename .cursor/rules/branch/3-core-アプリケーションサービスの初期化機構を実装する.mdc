@@ -50,7 +50,7 @@ Provider  Storage
 
 ### StorageService
 
-- `globalStorage`配下の保存先、Thread/Event/Artifactのストア依存、必要なディレクトリ準備を担当する。
+- `~/.byok-agent`配下の保存先、Thread/Event/Artifactのストア依存、必要なディレクトリ準備を担当する。
 - 保存形式はプロジェクト設計書および`SYW-STORAGE-001`に従い、SQLiteを導入しない。
 - 初期化時に保存先の検証・準備を行う。APIキー、Authorizationヘッダー、生環境変数、`.env`内容、非公開推論内容を保存しない。
 - `dispose`時は保留中の書き込み、ファイルハンドル、購読を安全に終了する。ただし、AgentやUIの後処理が完了する前にStorageを解放しない。

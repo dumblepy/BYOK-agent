@@ -99,7 +99,10 @@ export class WebviewProtocolClient {
 
   private acceptSequence(message: ExtensionToUiMessage): boolean {
     if (message.type === "thread-snapshot") {
-      this.lastSequences.set(`thread:${message.payload.threadId}`, message.payload.revision);
+      this.lastSequences.set(
+        `thread-event:${message.payload.threadId}`,
+        message.payload.eventSequence ?? 0,
+      );
       return true;
     }
 
@@ -109,7 +112,7 @@ export class WebviewProtocolClient {
 
     const key =
       message.type === "thread-event"
-        ? `thread:${message.payload.threadId}`
+        ? `thread-event:${message.payload.threadId}`
         : `run:${message.payload.runId}`;
     const previousSequence = this.lastSequences.get(key) ?? 0;
     if (message.payload.sequence <= previousSequence) {

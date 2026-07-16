@@ -367,6 +367,7 @@ export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
       .object({
         threadId: identifierSchema,
         revision: z.number().int().nonnegative(),
+        eventSequence: z.number().int().nonnegative().optional(),
         events: z.array(threadEventSchema).max(1_000),
       })
       .strict(),

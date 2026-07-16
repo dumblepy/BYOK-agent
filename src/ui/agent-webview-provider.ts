@@ -350,7 +350,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private async getThreadSnapshot(threadId: string) {
-    if (!this.storage) return { revision: 0, events: [] as readonly ThreadEvent[] };
+    if (!this.storage) {
+      return { revision: 0, eventSequence: 0, events: [] as readonly ThreadEvent[] };
+    }
     const state = await this.storage.getThreadModelState(threadId);
     const result = await this.storage.read(threadId);
     const events: ThreadEvent[] = result.events.flatMap((event): ThreadEvent[] => {
@@ -376,7 +378,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
             },
           ];
     });
-    return { revision: state.revision, events };
+    return {
+      revision: state.revision,
+      eventSequence: result.events.at(-1)?.sequence ?? 0,
+      events,
+    };
   }
 
   private async handleSelectModel(

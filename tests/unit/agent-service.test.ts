@@ -1,4 +1,7 @@
 import type { SecretStorage, Uri } from "vscode";
+import { mkdtemp } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { DefaultAgentService } from "../../src/agent/agent-service";
@@ -7,11 +10,13 @@ import { DefaultStorageService } from "../../src/storage/storage-service";
 
 describe("DefaultAgentService", () => {
   it("aborts active runs and waits for their completion during disposal", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "byok-agent-unit-"));
     const provider = new DefaultProviderService({
       secretStorage: {} as SecretStorage,
     });
     const storage = new DefaultStorageService({
       globalStorageUri: {} as Uri,
+      rootPath,
     });
     const agent = new DefaultAgentService({ provider, storage });
     await agent.initialize();

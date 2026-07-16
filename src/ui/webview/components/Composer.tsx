@@ -175,6 +175,16 @@ export function Composer({
           </button>
         </div>
       </div>
+      <div class="composer-footer">
+        <button type="button" class="composer-workspace-button" aria-label="作業場所を選択">
+          <i class="codicon codicon-laptop" aria-hidden="true" />
+          <span>ローカルで作業</span>
+          <i class="codicon codicon-chevron-down" aria-hidden="true" />
+        </button>
+        <span class="composer-notifications" role="status">
+          通知はありません
+        </span>
+      </div>
       <p id="composer-status" class="composer-status" aria-live="polite">
         {statusLabel}
       </p>

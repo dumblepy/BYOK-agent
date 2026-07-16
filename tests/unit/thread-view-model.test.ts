@@ -143,6 +143,7 @@ describe("thread view model", () => {
       {
         type: "replace-snapshot",
         revision: 4,
+        eventSequence: 0,
         events: [{ kind: "assistant-text", messageId: "assistant-1", text: "同期済み" }],
       },
     );
@@ -152,5 +153,23 @@ describe("thread view model", () => {
     expect(pending.needsSnapshot).toBe(false);
     expect(pending.snapshotRequestPending).toBe(false);
     expect(pending.messages[0]?.text).toBe("同期済み");
+  });
+
+  it("keeps metadata revision separate from live event sequence", () => {
+    const hydrated = threadViewReducer(INITIAL_THREAD_VIEW_STATE, {
+      type: "replace-snapshot",
+      revision: 5,
+      eventSequence: 0,
+      events: [],
+    });
+    const updated = threadViewReducer(hydrated, {
+      type: "apply-event",
+      sequence: 1,
+      event: { kind: "user-message", messageId: "user-1", text: "即時表示" },
+    });
+
+    expect(updated.messages[0]?.text).toBe("即時表示");
+    expect(updated.lastSequence).toBe(1);
+    expect(updated.needsSnapshot).toBe(false);
   });
 });

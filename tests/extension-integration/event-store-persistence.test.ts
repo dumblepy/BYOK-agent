@@ -36,7 +36,7 @@ describe("Event Store persistence integration", () => {
   it("derives the first user-message title without changing later titles", async () => {
     const rootPath = await mkdtemp(join(tmpdir(), "byok-agent-integration-"));
     const uri = { fsPath: rootPath } as never;
-    const service = new DefaultStorageService({ globalStorageUri: uri });
+    const service = new DefaultStorageService({ globalStorageUri: uri, rootPath });
     await service.initialize();
     const thread = await service.create();
 

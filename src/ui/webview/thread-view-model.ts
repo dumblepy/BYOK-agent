@@ -28,6 +28,7 @@ export type ThreadViewAction =
   | {
       readonly type: "replace-snapshot";
       readonly revision: number;
+      readonly eventSequence?: number;
       readonly events: readonly ThreadEvent[];
     }
   | {
@@ -56,7 +57,7 @@ export function threadViewReducer(
       return {
         messages: normalizeSnapshotEvents(action.events),
         revision: action.revision,
-        lastSequence: action.revision,
+        lastSequence: action.eventSequence ?? 0,
         isHydrated: true,
         needsSnapshot: false,
         snapshotRequestPending: false,

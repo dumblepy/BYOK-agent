@@ -17,7 +17,10 @@ export function ThreadView({ messages, isRestoring = false }: ThreadViewProps): 
             会話を読み込んでいます…
           </p>
         ) : messages.length === 0 ? (
-          <p class="thread-empty-state">メッセージを送ると、ここに会話が表示されます。</p>
+          <div class="thread-empty-state">
+            <i class="codicon codicon-comment-discussion thread-empty-mark" aria-hidden="true" />
+            <p class="thread-empty-state-label">メッセージを送ると、ここに会話が表示されます。</p>
+          </div>
         ) : (
           messages.map((message) => <ThreadMessage key={message.id} message={message} />)
         )}
