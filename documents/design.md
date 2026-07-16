@@ -1065,6 +1065,58 @@ Provider Adapterは次だけを担当する。
 
 エージェントの判断、ツール実行、権限管理、履歴圧縮はProvider Adapterに入れない。
 
+### 6.3 Provider Router
+
+`ProviderRouter`は、Agentが指定した論理`modelId`をModel Catalogで解決し、解決結果の`provider.apiType`に対応する`ProviderAdapter`を選択して呼び出しへ渡すExtension Host側のComposition層である。AgentはProvider名、URL、認証方式、Adapter実装を参照しない。
+
+#### 6.3.1 責務と依存
+
+Routerは次を担当する。
+
+* 呼び出し開始時のCatalog revisionで`modelId`を`ModelDefinition`へ解決する
+* `apiType`をキーにProvider Adapter Registry／Factoryを選択する
+* Provider設定の検証済みURL・ヘッダーとProvider Serviceの認証情報をAdapter初期化境界へ渡す
+* Provider構成ごとのAdapter初期化を共有し、同一構成の呼び出しで再利用する
+* `ProviderRequest`のmodel IDとCatalog解決結果を検証してAdapterへ委譲する
+* 未解決Model、未登録Adapter、認証情報未設定、初期化失敗を構造化エラーへ分類する
+* Catalog更新中もRun単位の解決結果とAdapterを固定し、次のRunへ新しい構成を適用する
+
+RouterはHTTP通信、Provider固有のメッセージ変換、イベント正規化、Tool実行、引数検証、権限判定、履歴保存、コンテキスト圧縮、リトライ実行、停止条件を担当しない。これらはModel Catalog、Provider Adapter、Agentまたは各専門サービスの責務とする。
+
+```text
+Agent Service
+  │ modelId + ProviderRequest
+  ▼
+ProviderRouter ── ModelCatalog.resolve(modelId)
+  │              └─ ModelDefinition(provider.apiType, provider settings)
+  ├─ ProviderAdapterRegistry.get(apiType)
+  ├─ ProviderAdapterFactory.create(provider settings, credential)
+  └─ adapter.stream(request, signal) → AsyncIterable<ProviderEvent>
+```
+
+Factoryは`apiType`、Provider ID、Vendor、URL、検証済みヘッダーを初期化入力として受け取る。APIキー等のSecret実値は初期化境界の内側に限定し、`ProviderRequest`、`ProviderEvent`、Catalog、ログ、永続化へ含めない。既存の`DefaultProviderService`が持つSecretStorageと実行中リクエストのライフサイクル境界を再利用する。
+
+#### 6.3.2 解決とAdapter再利用
+
+Routerの解決手順は次のとおりとする。
+
+1. Catalogの同一revisionで`modelId`を解決する。利用可能でない場合は`model-not-found`／`MODEL_NOT_AVAILABLE`相当で終了する。
+2. `provider.apiType`をRegistryで検索する。登録がない場合は`adapter-not-registered`／`MODEL_ADAPTER_UNSUPPORTED`相当の非再試行エラーとする。
+3. Provider Serviceから認証情報を解決し、未設定・取得不能を`credential-unavailable`／`MODEL_SECRET_UNAVAILABLE`相当とする。
+4. Provider ID、apiType、URL、検証済み設定revision、credential revisionを組み合わせた構成キーでキャッシュを検索する。Secret実値そのものはキーやログに含めない。
+5. キャッシュがなければFactoryを一度だけ実行し、同一キーの並行初期化は同じPromiseを共有する。初期化失敗はキャッシュへ保存しない。
+6. 解決済みModel IDと`ProviderRequest.modelId`を一致検証し、Adapterの`stream`または`countTokens`へ委譲する。
+
+AdapterはRun固有のバッファ、Usage、Abort状態をインスタンスへ保存しない。Catalog更新後も実行中のAsyncIterableを差し替えず、旧構成のAdapterは新規Runから隔離する。破棄可能なAdapterは参照がなくなった後に一度だけ破棄し、Router破棄時は新規呼び出しを拒否して進行中Runを停止する。
+
+#### 6.3.3 Routerエラーとテスト
+
+Router固有の分類は少なくとも`model-not-found`、`adapter-not-registered`、`provider-initialization-failed`、`credential-unavailable`、`request-model-mismatch`を持つ。ユーザー向けメッセージは安全な固定文言または分類済み短文とし、ログにはProvider ID、apiType、Model ID、revision、分類だけを記録する。URL全体、ヘッダー値、Secret ID、APIキー、生レスポンスは記録しない。
+
+Unit TestではModel ID解決、apiTypeごとのFactory選択、未登録Adapter、初期化失敗の再試行、同一Provider構成の初期化共有、credential revision・Catalog revision変更時の隔離、request model ID不一致を検証する。Provider Contract TestではRouter経由でも共通`ProviderEvent`契約が保たれることをFake Adapterで検証する。Extension Integration TestではModel選択後のHost側呼び出しが実際のAdapterへ到達し、実APIを使わずSecretStorageとAdapter RegistryをFakeへ差し替えられることを検証する。
+
+完了条件は、利用可能なモデルIDから同一Catalog revisionのProvider設定とAdapterを解決し、共通`ProviderRequest`を対象Adapterへ渡して`ProviderEvent`をAgentへ返せることである。未登録Provider、未解決Model、認証情報未設定、初期化失敗は安全なエラーとして扱えることも含む。
+
 ---
 
 ## 7. エージェント実行方式

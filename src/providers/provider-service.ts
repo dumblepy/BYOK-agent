@@ -9,6 +9,7 @@ export interface ProviderService extends ManagedService {
   getApiKeyStatus(providerId: string): Promise<"configured" | "not-configured" | "unavailable">;
   setApiKey(providerId: string, value: string): Promise<void>;
   deleteApiKey(providerId: string): Promise<void>;
+  getCredentialRevision?(providerId: string): number;
 }
 
 export interface ProviderServiceDependencies {
@@ -27,6 +28,7 @@ export class DefaultProviderService extends ManagedService implements ProviderSe
 
   private readonly disposables = new DisposableStore();
   private readonly activeRequests = new Set<ActiveRequest>();
+  private readonly credentialRevisions = new Map<string, number>();
 
   private readonly secretStore: SecretStore;
 
@@ -57,11 +59,23 @@ export class DefaultProviderService extends ManagedService implements ProviderSe
   }
 
   public setApiKey(providerId: string, value: string): Promise<void> {
-    return this.secretStore.set(providerId, value);
+    return this.secretStore.set(providerId, value).then(() => {
+      this.bumpCredentialRevision(providerId);
+    });
   }
 
   public deleteApiKey(providerId: string): Promise<void> {
-    return this.secretStore.delete(providerId);
+    return this.secretStore.delete(providerId).then(() => {
+      this.bumpCredentialRevision(providerId);
+    });
+  }
+
+  public getCredentialRevision(providerId: string): number {
+    return this.credentialRevisions.get(providerId) ?? 0;
+  }
+
+  private bumpCredentialRevision(providerId: string): void {
+    this.credentialRevisions.set(providerId, this.getCredentialRevision(providerId) + 1);
   }
 
   public registerActiveRequest(controller: AbortController, completion: PromiseLike<void>): void {

@@ -86,4 +86,5 @@ export interface ProviderAdapter {
   readonly type: string;
   stream(request: ProviderRequest, signal: AbortSignal): AsyncIterable<ProviderEvent>;
   countTokens?(input: TokenCountInput, signal?: AbortSignal): Promise<number>;
+  dispose?(): void | Promise<void>;
 }
