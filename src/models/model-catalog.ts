@@ -7,6 +7,7 @@ import type {
   ModelConfigProvider,
   ReasoningEffort,
 } from "./model-config-validator";
+import type { ChatCompletionsProfile } from "../providers/openai/openai-chat-completions-types";
 
 export type CapabilityName = "toolCalling" | "streaming" | "vision" | "reasoning";
 
@@ -44,6 +45,7 @@ export interface ResolvedProviderSettings {
   readonly apiType: ApiType;
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
+  readonly chatCompletionsProfile?: Readonly<Partial<ChatCompletionsProfile>>;
 }
 
 export interface ModelDefinition {
@@ -79,6 +81,7 @@ export interface ModelCatalogDiagnostic {
 }
 
 export interface ModelCatalog {
+  getRevision(): number;
   listAvailable(): readonly ModelCatalogEntry[];
   findAvailable(modelId: string): ModelCatalogEntry | undefined;
   resolve(modelId: string): ModelDefinition | undefined;
@@ -148,6 +151,10 @@ export class ConfiguredModelCatalog implements ModelCatalog {
     return {
       dispose: () => this.changeListeners.delete(listener),
     };
+  }
+
+  public getRevision(): number {
+    return this.revision;
   }
 
   public listAvailable(): readonly ModelCatalogEntry[] {
@@ -240,6 +247,16 @@ export class ConfiguredModelCatalog implements ModelCatalog {
         apiType: provider.apiType,
         url: model.url,
         headers: Object.freeze({ ...(provider.headers ?? {}) }),
+        ...(provider.apiType === "chat-completions" &&
+        (provider.chatCompletionsProfile !== undefined ||
+          model.chatCompletionsProfile !== undefined)
+          ? {
+              chatCompletionsProfile: Object.freeze({
+                ...(provider.chatCompletionsProfile ?? {}),
+                ...(model.chatCompletionsProfile ?? {}),
+              }),
+            }
+          : {}),
       }),
       capabilities: capabilityResolution.configured,
       effectiveCapabilities: capabilityResolution.effective,
@@ -297,6 +314,10 @@ export class StaticModelCatalog implements ModelCatalog {
 
   public listAvailable(): readonly ModelCatalogEntry[] {
     return [...this.entries].sort(compareEntries);
+  }
+
+  public getRevision(): number {
+    return 0;
   }
 
   public findAvailable(modelId: string): ModelCatalogEntry | undefined {

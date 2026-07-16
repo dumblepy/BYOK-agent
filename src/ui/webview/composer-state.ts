@@ -195,6 +195,12 @@ export function getComposerErrorMessage(code: AgentErrorCode): string {
       return "モデルへの接続がタイムアウトしました。再試行してください。";
     case "PROVIDER_BAD_REQUEST":
       return "メッセージを処理できませんでした。入力を確認してください。";
+    case "PROVIDER_UNSUPPORTED":
+      return "Providerまたはモデルが要求された機能に対応していません。";
+    case "PROVIDER_NETWORK":
+      return "Providerへの接続に失敗しました。再試行してください。";
+    case "PROVIDER_UNKNOWN":
+      return "Providerで予期しないエラーが発生しました。再試行してください。";
     case "MODEL_CONTEXT_EXCEEDED":
       return "入力が長すぎるため処理できませんでした。短くして再試行してください。";
     case "USER_CANCELLED":

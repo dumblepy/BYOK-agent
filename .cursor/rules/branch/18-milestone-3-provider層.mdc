@@ -1,0 +1,192 @@
+---
+description: 18-milestone-3-provider層ブランチでProvider Contract Test基盤を作成するときに読み込む
+alwaysApply: false
+---
+# Provider Contract Test基盤
+
+このブランチでは、保存済みのProviderストリームイベントを入力として、すべてのProvider Adapterが同一の共通契約を満たすことを自動検証できるテスト基盤を作成する。
+
+## 目的
+
+- Provider固有のSSEやレスポンス形式を、Agentが消費する`ProviderEvent`へ同じ意味で正規化できることを検証する。
+- Text、Tool Call、Usage、Error、Cancelの主要な振る舞いをAdapter横断で検証する。
+- Providerを追加したとき、同じ契約テストへAdapterを登録するだけで最低限の互換性を検査できるようにする。
+- 通常のテストではネットワークへ接続せず、実APIテストは明示的な設定時だけ実行する。
+
+## スコープ
+
+- `tests/provider-contract/`配下の共通Contract Test Runner、Adapter登録定義、保存済みストリームFixture、Fake HTTP／Transport層。
+- 既存の`ProviderAdapter`、`ProviderRequest`、`ProviderEvent`、`ProviderError`の契約に基づく共通アサーション。
+- OpenAI Responses、OpenAI互換Chat Completions、Anthropic Messagesなど、登録済みAdapterへの共通テスト適用。
+- 正常系、Tool Call、Usage、Provider Error、ユーザーCancel、完了イベントの終端性、秘密情報非混入の検証。
+
+## 非スコープ
+
+- Provider Adapter本体、Agent Runtime、Tool実行、権限判定、履歴保存、リトライ実行の変更。
+- 実APIを通常のCIで呼び出すこと、APIキーの自動検出、APIキーの保存や表示。
+- Provider固有仕様を共通契約へ追加すること。固有仕様の詳細はAdapter専用テストで検証し、共通Suiteへは正規化後の意味だけを渡す。
+- `git add`、`git commit`。
+
+## 実装方針
+
+### 1. 共通Suiteを一つの正本にする
+
+共通Suiteは、Adapterを生成するFactoryまたはFixture Harnessを受け取り、同じ`ProviderRequest`と同じ期待値で実行する。Providerごとに同じアサーションを複製しない。
+
+Adapterごとのテストファイルは、次の二つだけを担当する。
+
+1. Provider固有の保存済みFixtureを読み込むFake Transportを組み立てる。
+2. AdapterとFixtureを共通Suiteへ登録する。
+
+共通SuiteはProvider固有のJSONフィールド、SSEイベント名、HTTP Bodyを検査しない。検査対象はAdapterから返された`ProviderEvent`列、呼び出し回数、Abort状態、秘密情報の非混入だけとする。
+
+### 2. 保存済みストリームFixtureを正規化する
+
+FixtureはProviderごとの生ストリームを再現する入力資料として保存し、テストコードへ長いインライン文字列を埋め込まない。Fixtureのメタデータと期待する共通イベント列は分離する。
+
+Fixtureには次の情報を持たせる。
+
+- 一意なケースID、Provider／Adapter種別、シナリオ名。
+- Fake HTTPレスポンスのステータス、Content-Type、必要な安全なメタデータ。
+- 保存済みストリーム本文または分割チャンク列。チャンク境界は任意位置に置き、SSE parserが境界に依存しないことを検証する。
+- 期待する`ProviderEvent`列、またはError／Cancel時の終端条件。
+- Tool Callを使う場合の論理Tool定義と、期待するCall ID・名前・完全な引数。
+
+FixtureにはAPIキー、Authorizationヘッダー、実URL、実ユーザーデータ、ファイル内容、Providerの生エラー本文を含めない。既存Fixtureを再利用できる場合は同じ意味を重複保存しない。
+
+### 3. ケースごとに同じ契約を検証する
+
+共通Suiteは最低限、次のケースを各Adapterへ適用する。
+
+| ケース | 検証内容 |
+|---|---|
+| Text | 複数チャンクのTextを順序どおり`text-delta`へ変換し、完了時に`completed`を一度だけ出す |
+| Tool Call | Call IDと名前を保持し、引数断片を結合して完全なJSON引数を一度だけ`tool-call`へ確定する |
+| 並列Tool Call | 複数Call IDを混同せず、各引数を独立して結合し、受信順を保持する |
+| Usage | Providerが明示したInput／Output／Cached／Reasoning Usageだけを正規化し、未提供値を0や推定値で補わない |
+| Error | 認証、Rate Limit、Timeout、Bad Request、Context超過、未対応、Networkなどを安全な`ProviderError`へ分類する |
+| Cancel | 開始前と実行中のAbortを`cancelled`へ変換し、Abort後のText、Tool Call、Usage、Completedを発行しない |
+
+各ケースでは、最終イベントの性質も検証する。`completed`、`error`、`cancelled`のいずれか一つだけを終端とし、終端後に別イベントを出してはならない。途中まで公開したイベントを、テスト終了後に別の成功列として再発行してはならない。
+
+### 4. Fake Transportは観測可能かつ決定的にする
+
+Fake HTTP／Transport層は、保存済みレスポンスを返すだけでなく、次を観測できるようにする。
+
+- リクエスト回数、AbortSignalの受け渡し、Abort後のReader解放。
+- Adapterへ渡されたURL・ヘッダー・Bodyに秘密情報が含まれていないこと。
+- ストリームのチャンク境界、遅延、途中エラー、空Body、異常Content-Type。
+
+テストでは実時間の待機や外部サーバーの状態に依存しない。Timeoutや遅延を検証する場合は注入可能な時計・Scheduler・Fake Readerを使用し、テスト実行時間を固定する。
+
+### 5. Error契約を安全な分類で固定する
+
+Errorの共通アサーションは、Provider固有の生メッセージではなく次だけを検証する。
+
+- `ProviderError.code`、`retryable`、必要なHTTP status、許可されたProvider code/type、request ID。
+- `Retry-After`の有効値が保持され、不正値で再試行可能へ昇格しないこと。
+- APIキー、Authorization、URL全体、生Response Body、秘密を含むProvider messageがイベント・例外・ログへ流れないこと。
+
+認証、入力不正、Context超過、未対応、Cancel、未知エラーは自動再試行不可とし、Rate Limit、Timeout、Networkは既存の正規化契約に従う。再試行の待機や再送そのものはこのContract Test基盤の責務にせず、既存のRetry Policyのテストで検証する。
+
+### 6. 実APIテストは二重の明示設定を要求する
+
+実APIテストは通常のContract Testから分離したSuiteとして定義する。次の条件をすべて満たした場合だけ実行可能にする。
+
+1. 共通の明示フラグ（例：`BYOK_PROVIDER_CONTRACT_LIVE=1`）が設定されている。
+2. 対象Provider専用の実行許可、エンドポイント、SecretStorage等の認証設定が明示されている。
+
+どちらか一方でも欠けている場合は、テストを成功扱いで黙ってスキップせず、設定不足を明示したSkipまたは専用コマンドの対象外として扱う。通常の`pnpm test`とCIの既定ジョブは保存済みFixtureだけを実行し、実APIテストを暗黙に起動しない。実APIテストへ渡す入力は最小限の固定プロンプトとし、結果・レスポンス・認証情報をFixtureやスナップショットへ保存しない。
+
+## 設計
+
+### テスト基盤の構成
+
+```text
+tests/provider-contract/
+  contract-suite.ts       # 全Adapterで共有する契約テスト
+  contract-cases.ts       # 共通Request、期待イベント、ケース定義
+  adapter-harness.ts      # Fake TransportとAbort／観測用Harness
+  fixtures/
+    <provider>/<case>/    # 保存済みストリームとメタデータ
+  <provider>-adapter.test.ts # AdapterとFixtureの登録だけを行う
+  live/                   # 明示設定時だけの実APIテスト
+```
+
+実際のファイル名は既存の構成と命名規則を優先するが、責務分離は維持する。共通SuiteがAdapter内部のprivate状態やProvider固有型へ依存する設計にはしない。
+
+### 共通Suiteの入力と出力
+
+共通Suiteへ渡すHarnessは、概念的に次の情報を提供する。
+
+```ts
+interface ProviderContractHarness {
+  readonly name: string;
+  createAdapter(input: {
+    readonly transport: FakeProviderTransport;
+  }): ProviderAdapter;
+  readonly cases: readonly ProviderContractCase[];
+}
+
+interface ProviderContractCase {
+  readonly id: string;
+  readonly request: ProviderRequest;
+  readonly response: FakeProviderResponse;
+  readonly expected: readonly ProviderEvent[];
+  readonly abort?: "before-request" | "during-stream";
+}
+```
+
+これは実装時の概念設計であり、既存の`ProviderAdapterInit`やテスト用FakeのAPIと重複する場合は、既存の公開型を再利用する。共通Suiteの戻り値はイベント列とTransport観測結果の検証結果であり、Providerの生レスポンスを返さない。
+
+### 契約上の不変条件
+
+- `stream(request, signal)`はAbort済みSignalを受け取った場合、通信を開始せず`cancelled`だけを返す。
+- イベントの順序は入力ストリームの意味を保ち、Text、Reasoning、Tool Call、Usageを別イベントへ混ぜない。
+- Tool Callの論理IDはProvider間で維持し、`tool-call-start`、`tool-call-delta`、`tool-call`で同じIDを使う。
+- Tool Callの引数が完成しない場合は成功完了にせず、ErrorまたはCancelとして終端する。
+- Usageは一つの応答に対して明示値を一度だけ返す。未提供のUsageは省略する。
+- `error`または`cancelled`の後に`completed`、Usage、Text、Tool Callを返さない。
+- `completed`は一つだけで、正常終了の最終イベントである。
+- Adapterの1回のstream実行に属するバッファ、Abort状態、Usageを次の実行へ持ち越さない。
+- Fakeで観測した秘密情報は、イベント、Error、ログ、スナップショット、永続化データに現れない。
+
+### Provider追加時の登録手順
+
+新しいProvider Adapterを追加するときは、次の順でContract Testを追加する。
+
+1. 共通`ProviderRequest`で表現可能な最小の固定入力を定義する。
+2. Text、Tool Call、Usage、Error、Cancelを再現する保存済みFixtureを追加する。
+3. AdapterをFake Transportへ接続する薄いHarnessを追加する。
+4. 共通Suiteを登録し、ProviderEvent列と終端規則を検証する。
+5. Provider固有の変換差分だけをAdapter専用テストへ追加する。
+6. 既定テストで実APIが起動しないこと、Fixtureに秘密がないこと、型検査・Lint・format・テストが通ることを確認する。
+
+## 進捗
+
+- [ ] 共通Contract Test Runnerとケース定義の設計を確定する
+- [ ] 保存済みストリームFixtureの形式とFake Transportの観測項目を確定する
+- [ ] Text、Tool Call、Usage、Error、Cancelの共通アサーションを作成する
+- [ ] 登録済みProvider Adapterを共通Suiteへ接続する
+- [ ] 実APIテストを明示設定時だけ実行するゲートを作成する
+- [ ] 型検査、Lint、format、通常テストで基盤を検証する
+
+## 参考資料
+
+- `AGENTS.md`
+- `.cursor/rules/project.mdc`の`SYW-PROVIDER-001`〜`SYW-PROVIDER-004`、`SYW-TEST-001`〜`SYW-TEST-002`、`SYW-ERR-001`
+- `.cursor/rules/branch.mdc`
+- `documents/design.md` §6 Provider Adapter、§6.0.1〜§6.0.4、§19.2 Provider Contract Test
+- `documents/issues.md` Milestone 3「Provider Contract Test基盤を作成する」
+- `src/providers/provider-types.ts`
+- `src/providers/provider-error.ts`
+- `tests/provider-contract/`の既存FixtureおよびAdapterテスト
+
+## 完了条件
+
+1. 保存済みストリームFixtureだけで、共通Suiteが各Provider Adapterを同じ入力・同じ期待値で検証できる。
+2. Text、Tool Call、Usage、Error、Cancel、および終端後イベント抑止が自動検証される。
+3. Provider固有のストリーム形式を共通Suiteへ露出せず、Adapterの正規化結果だけを検査する。
+4. Errorは安全な共通分類へ正規化され、機密情報や生レスポンスがテスト出力・イベント・保存資料へ含まれない。
+5. 実APIテストは明示的な共通フラグとProvider固有設定の両方がある場合だけ実行され、既定のテスト・CIではネットワーク接続しない。
+6. 新しいProvider Adapterを登録することで同じ契約を自動検証でき、Providerごとの契約アサーション複製が不要である。

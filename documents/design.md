@@ -925,25 +925,311 @@ interface ProviderAdapter {
 }
 ```
 
+### 6.0 共通契約の詳細設計
+
+Provider層は「内部の正規化済み入力をProvider APIへ変換し、Provider APIの応答を正規化済みイベントへ変換する」境界とする。Agent RuntimeはProviderのHTTP方式、認証ヘッダー、メッセージ配置、ストリームイベント名を知らず、`ProviderRequest`を渡して`ProviderEvent`だけを消費する。共通型にはAPIキー、Authorizationヘッダー、生環境変数、プロンプト全文のログ用複製、生レスポンスを含めない。
+
+```ts
+type ProviderRole = "system" | "user" | "assistant" | "tool";
+
+interface ProviderMessage {
+  readonly role: ProviderRole;
+  readonly content: readonly ProviderContentPart[];
+  readonly toolCallId?: string;
+  readonly toolCalls?: readonly ProviderToolCall[];
+}
+
+interface ProviderToolCall {
+  /** Provider間で再利用する論理ID。Responsesではcall_idへ対応付ける。 */
+  readonly id: string;
+  readonly name: string;
+  readonly arguments: unknown;
+}
+
+type ProviderContentPart =
+  | { readonly type: "text"; readonly text: string }
+  | { readonly type: "image"; readonly mediaType: string; readonly data: string };
+
+interface ProviderToolDefinition {
+  readonly name: string;
+  readonly description?: string;
+  readonly inputSchema: unknown;
+}
+
+interface ProviderRequest {
+  readonly requestId: string;
+  readonly modelId: string;
+  readonly messages: readonly ProviderMessage[];
+  readonly tools: readonly ProviderToolDefinition[];
+  readonly options: {
+    readonly temperature?: number;
+    readonly maxOutputTokens?: number;
+    readonly reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+  };
+  readonly metadata?: Readonly<Record<string, string>>;
+}
+```
+
+`ProviderRequest`の`modelId`はCatalogで検証済みの値とし、URLや認証情報は含めない。`metadata`は相関ID等の非秘密情報に限定し、Provider Adapterは許可されていない任意ヘッダーを生成してはならない。Tool定義の`inputSchema`は送信前にAgent側で選定済みだが、Provider側でもAPI形式への変換時に構造を壊さない。
+
+イベントはストリーム順序を保った判別共用体とし、断片と確定値を明確に分ける。
+
 ```ts
 type ProviderEvent =
-  | { type: "text-delta"; text: string }
-  | { type: "reasoning-delta"; text: string }
+  | { readonly type: "text-delta"; readonly text: string }
+  | { readonly type: "reasoning-delta"; readonly text: string }
+  | { readonly type: "tool-call-start"; readonly id: string; readonly name: string }
+  | { readonly type: "tool-call-delta"; readonly id: string; readonly argumentsDelta: string }
   | {
-      type: "tool-call";
-      id: string;
-      name: string;
-      arguments: unknown;
+      readonly type: "tool-call";
+      readonly id: string;
+      readonly name: string;
+      readonly arguments: unknown;
     }
   | {
-      type: "usage";
-      inputTokens: number;
-      outputTokens: number;
-      cachedTokens?: number;
+      readonly type: "usage";
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+      readonly cachedTokens?: number;
+      readonly reasoningTokens?: number;
     }
-  | { type: "completed"; stopReason: string }
-  | { type: "error"; error: ProviderError };
+  | {
+      readonly type: "completed";
+      readonly stopReason: "end-turn" | "tool-call" | "max-tokens" | "content-filter" | "unknown";
+    }
+  | { readonly type: "error"; readonly error: ProviderError }
+  | { readonly type: "cancelled" };
+
+type ProviderErrorCode =
+  | "auth-failed"
+  | "rate-limited"
+  | "timeout"
+  | "bad-request"
+  | "context-exceeded"
+  | "unsupported"
+  | "network"
+  | "cancelled"
+  | "unknown";
+
+interface ProviderError {
+  readonly code: ProviderErrorCode;
+  readonly message: string;
+  readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+  readonly status?: number;
+  readonly requestId?: string;
+}
 ```
+
+AdapterはProvider固有のTool Call断片を内部バッファで`id`単位に結合し、JSONとして完全に解析できた場合だけ`tool-call`を発行する。`tool-call-start`や`tool-call-delta`をAgentが再結合する設計にはしない。ストリーム終了時に未完了の引数、ID欠落、名前欠落、同一IDの矛盾が残った場合は`completed`を発行せず、`bad-request`または`unknown`の非再試行エラーとして終了する。並列Tool Callは複数のIDを独立して保持し、受信順を壊さない。`ProviderEvent`のTool Call `id`は、Tool Resultを次のリクエストへ紐付けるための論理IDであり、Responses固有の出力項目`id`ではなく`call_id`へ対応させる。過去のTool Callを再送できるよう、`assistant`メッセージは`toolCalls`を保持し、`tool`メッセージは対応する`toolCallId`を必須とする。
+
+`usage`はProviderが明示的に返した値だけを設定し、未提供の値を0や推定値で埋めない。`completed`は最終イベントとして扱う。ErrorまたはCancelledの後に別の完了イベントを発行してはならず、Agent側はErrorを`AgentErrorCode`へ変換する。Provider固有の生エラー本文はユーザー向けメッセージへ直接渡さず、安全な分類と短い説明に置き換える。
+
+### 6.0.1 AbortSignalとAsyncIterableの契約
+
+`stream(request, signal)`は呼び出し時点で`signal.aborted`を検査し、Abort済みなら通信を開始せず`cancelled`として終了する。実行中にAbortされた場合はHTTPリクエスト、Reader、Provider SDKの購読を中断し、Adapterが所有する一時バッファを破棄する。Abort後に到着したネットワークデータはイベントへ変換しない。Abortがユーザー操作に由来する場合、`cancelled`は失敗ではなくAgentの`cancelled`状態へ変換する。
+
+`AsyncIterable`のconsumerが早期終了した場合も、Adapterは可能な範囲で内部リソースを解放する。各AdapterはレスポンスReader、タイマー、購読解除を`finally`で解放し、再利用されるAdapterインスタンスにRun固有のTool CallバッファやUsageを残さない。
+
+### 6.0.2 責務境界とエラー変換
+
+Provider Adapterが担当するのはメッセージ・Tool定義・Tool Resultの変換、イベント正規化、Call ID保持、Usage正規化、Providerエラー分類、キャンセル、リトライ可否の判定だけである。Tool実行、引数Schema検証、権限確認、履歴保存、コンテキスト圧縮、リトライの実行、停止条件の判断はAgentまたは各専門サービスが担当する。
+
+`ProviderError`は`AgentError`へ変換する際に、`auth-failed`、`rate-limited`、`timeout`、`bad-request`、`context-exceeded`、`cancelled`を既存の`AgentErrorCode`へ対応付ける。`retryAfterMs`はProviderが返した安全な数値だけを保持し、バックオフの実行判断は上位層で行う。Errorイベント、ログ、永続化にはAPIキー、Authorization、URL全体、プロンプト、Tool Result、生レスポンスを含めない。
+
+### 6.0.3 実装単位と契約テスト
+
+実装時は、共通型（`ProviderRequest`、`ProviderEvent`、`ProviderError`）、Adapter境界、Providerエラー変換、Contract Test Fixtureを分離する。Adapterごとのテストは同じ入力と期待される共通イベント列を使用し、Provider固有のJSON形式をAgentテストへ持ち込まない。
+
+最低限、Text delta、Reasoning delta、単一・並列Tool Call、断片結合、Usage、Stop Reason、認証・Rate Limit・Timeout・Bad Request、Retry-After、Abort前後、Abort後イベント抑止、不完全Tool Call、Error後の完了イベント抑止を検証する。実APIテストは明示的な環境変数がある場合だけ実行し、通常のContract Testは保存済みストリームFixtureとFake HTTP層で完結させる。
+
+### 6.0.4 Providerエラー正規化
+
+Provider Adapterは、API固有のHTTPステータス、許可済みのエラーコード・種別、Transport結果、Timeout、Abort状態を`ProviderError`へ正規化する。生Response Body、Provider固有のmessage、URL、認証情報を共通エラーへ保持せず、AdapterごとのAllowlistで安全な有限値だけを抽出する。Providerエラーの分類はAgent、UI、Loggerが個別に再実装してはならない。
+
+正規化器への入力は次の安全なメタデータに限定する。
+
+```ts
+interface ProviderErrorInput {
+  readonly source: "http" | "transport" | "stream" | "timeout" | "cancelled";
+  readonly status?: number;
+  readonly headers?: Readonly<Record<string, string>>;
+  readonly providerCode?: string;
+  readonly providerType?: string;
+  readonly requestId?: string;
+  readonly userAborted?: boolean;
+}
+```
+
+分類の優先順位は、`userAborted`、内部Timeout、HTTPステータス、Allowlist済みProviderコード、Transport障害、未知の順とする。HTTPステータスが分類と矛盾する場合はステータスを優先する。ただし、400系のレスポンスが`context_length_exceeded`、`input_too_long`などのAllowlist済みContext超過コードを含む場合は`context-exceeded`へ分類する。
+
+| 入力 | `ProviderErrorCode` | `retryable` |
+|---|---|---:|
+| HTTP 401／403、認証系コード | `auth-failed` | `false` |
+| HTTP 429、Rate Limit系コード | `rate-limited` | `true` |
+| HTTP 408／504、内部Timeout | `timeout` | `true` |
+| HTTP 400／422、入力不正系コード | `bad-request` | `false` |
+| HTTP 413、Context超過系コード | `context-exceeded` | `false` |
+| HTTP 404、未対応系コード | `unsupported` | `false` |
+| 接続、DNS、TLS、ソケット等のTransport障害 | `network` | `true` |
+| 上記以外 | `unknown` | `false` |
+| ユーザーAbort | `cancelled` | `false` |
+
+Providerコードは、Responses、Chat Completions、Anthropicそれぞれで認めた有限のAllowlistから共通コードへ変換する。Allowlistにない文字列を正規表現で意味推測して分類しない。HTTPステータスがないTransportエラーは、Timeoutと明示された場合だけ`timeout`、それ以外は`network`または`unknown`とする。
+
+#### Retry-After
+
+`Retry-After`はレスポンスヘッダーを大文字小文字非依存で検索し、次の形式だけを受け付ける。
+
+1. `delay-seconds`: 0以上の整数秒をミリ秒へ変換する。
+2. `HTTP-date`: 注入された現在時刻との差をミリ秒へ変換し、過去の日時は0へ正規化する。
+
+NaN、Infinity、負数、小数、複数値、解釈不能な日時、実装上の上限を超える値は`retryAfterMs`を設定せず破棄する。日付計算に使う時計はテストで固定できるようにし、正規化器が実際の待機や再送を行わない。`Retry-After`の存在は`retryable`を上書きせず、認証・Bad Request・Context超過に付いていても再試行可能にはしない。
+
+#### ユーザー向け情報と技術情報
+
+Providerエラーは表示用と技術用の投影を分離する。表示用は共通コード、固定文言、再試行可能性、安全な待機案内だけで構成し、技術用はLoggerとAgentの診断に限定する。
+
+```ts
+interface ProviderErrorPresentation {
+  readonly code: ProviderErrorCode;
+  readonly userMessage: string;
+  readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+}
+
+interface ProviderErrorTechnicalInfo {
+  readonly status?: number;
+  readonly providerCode?: string;
+  readonly providerType?: string;
+  readonly requestId?: string;
+  readonly source: "http" | "transport" | "stream" | "timeout" | "cancelled";
+}
+
+interface NormalizedProviderError {
+  readonly presentation: ProviderErrorPresentation;
+  readonly technical: ProviderErrorTechnicalInfo;
+}
+```
+
+既存の`ProviderError.message`を使う経路では、messageを分類ごとの固定ユーザー文言として扱う。Provider固有のmessage、param、body、SSEエラー本文は`technicalDetails`へ自由形式の文字列として格納せず、許可済みのProviderコード、ステータス、request ID、発生源だけを構造化して渡す。ログにはProvider ID、apiType、Model ID、request ID、分類、成否、経過時間だけを記録し、URL全体、ヘッダー値、Prompt、Tool Result、生Responseを記録しない。
+
+#### AgentErrorへの変換
+
+Provider層とAgent層の境界で次の写像を一箇所に定義する。Agent、UI、リトライ層はProvider固有のエラーコードを直接判定しない。
+
+| `ProviderErrorCode` | `AgentErrorCode` |
+|---|---|
+| `auth-failed` | `PROVIDER_AUTH_FAILED` |
+| `rate-limited` | `PROVIDER_RATE_LIMITED` |
+| `timeout` | `PROVIDER_TIMEOUT` |
+| `bad-request` | `PROVIDER_BAD_REQUEST` |
+| `context-exceeded` | `MODEL_CONTEXT_EXCEEDED` |
+| `unsupported` | `PROVIDER_UNSUPPORTED` |
+| `network` | `PROVIDER_NETWORK` |
+| `unknown` | `PROVIDER_UNKNOWN` |
+| `cancelled` | `USER_CANCELLED` |
+
+`retryAfterMs`は上位のRetry Policyへ渡せるが、このタスクでは再送しない。ストリーム中のError後にはUsageまたはCompletedを発行せず、Abort時はCancelledを一度だけ発行する。これにより、API固有エラーを共通コードとしてAgentの状態遷移、UI表示、診断ログで一貫して処理できる。
+
+### 6.0.5 Providerリトライ方針
+
+Provider Retry Policyは、Provider Adapterが正規化したエラーを入力として、Provider呼び出しの上位境界で待機と再送を管理する。Adapterはエラー分類、`retryable`、`retryAfterMs`の生成だけを担当し、Tool実行、重複排除、Agentの停止判断を担当しない。
+
+#### 再試行の許可条件
+
+自動再試行は、次の条件をすべて満たす場合だけ行う。
+
+1. `ProviderError.retryable === true`である。
+2. エラーコードが`rate-limited`、`timeout`、`network`のいずれかである。`auth-failed`、`bad-request`、`context-exceeded`、`unsupported`、`cancelled`、`unknown`は再試行しない。
+3. Abortされておらず、最大試行回数と累積待機時間の上限を超えていない。
+4. 直前の試行で外部へイベントを公開していない。
+5. Tool Callを伴う要求では、送信前に失敗したか、Providerが処理開始前に拒否したことをAdapterまたはTransportが明示している。
+
+`ProviderError`が一時的なコードへ正規化されていない5xxや未知のProviderコードは再試行しない。再試行対象を増やす場合は、先にProviderエラー正規化のAllowlist、`ProviderErrorCode`、`AgentErrorCode`、Contract Testを同時に更新し、未知エラーを暗黙に一時的と推測してはならない。
+
+#### 試行と重複防止の契約
+
+Retry PolicyはRunの外側から次の実行情報を受け取る。`ProviderRequest`は初回作成時の不変スナップショットとして扱い、再試行のためにメッセージ、Tool定義、Tool Call ID、Tool Resultを変更しない。
+
+```ts
+type ProviderAttemptOutcome =
+  | "not-sent"
+  | "rejected-before-processing"
+  | "response-started"
+  | "unknown";
+
+interface ProviderRetryExecution {
+  readonly runId: string;
+  readonly request: ProviderRequest;
+  readonly toolRisk: boolean;
+  readonly execute: (
+    request: ProviderRequest,
+    attempt: number,
+    signal: AbortSignal,
+  ) => AsyncIterable<ProviderEvent>;
+}
+
+interface ProviderRetryPolicy {
+  execute(input: ProviderRetryExecution, signal: AbortSignal): AsyncIterable<ProviderEvent>;
+}
+```
+
+`toolRisk`は、要求の`tools`が空でない場合、または履歴に未処理のTool Call／Tool Resultの往復が含まれる場合に真とする。Tool定義が存在する要求は、モデルがまだTool Callを返していなくても、サーバーが受領済みか判定できない再送を副作用リスクとして扱う。
+
+同一Runの同一`requestId`については`runId + requestId`をsingle-flightキーとする。キーが処理中の場合、後続呼び出しは新しいHTTP送信を開始せず、既存の処理結果へ合流する。再試行は同じsingle-flightの内部試行として扱い、試行番号だけを内部メタデータで増加させる。完了、失敗、キャンセル後に同じキーを再利用する場合は新しいユーザー操作として新しい`requestId`を要求する。
+
+Tool Riskのある要求では、`not-sent`または`rejected-before-processing`だけを自動再試行可能とする。`response-started`または`unknown`でのTimeout、接続断、ストリーム切断は、Providerが処理済みの可能性を否定できないため自動再試行せず、Agentへ安全なエラーを返す。Tool Callイベントを1件でも受信した試行は、イベントが確定前の断片であっても再送しない。
+
+Tool Riskのない要求でも、ストリームの途中で一度でも外部へ`text-delta`、`reasoning-delta`、`tool-call-*`、`usage`を公開した後は再送しない。再送を行う場合は、失敗した試行のイベントを先に公開していないことを保証し、同じテキストやTool CallがUI・Agentへ二重に届かないようにする。
+
+Retry PolicyはTool Executorを呼び出さない。成功した試行で`tool-call`と`completed(stopReason: "tool-call")`が確定した後に限り、Agent Runtimeが各Tool Call IDを一度だけ実行する。リトライ層がTool Callを見て新しいIDを作る、Toolを再実行する、Tool Resultを組み替えることは禁止する。
+
+#### バックオフと上限
+
+既定値は初回を含む最大3試行、すなわち自動再試行2回とする。再試行`retryIndex`を0始まりとして、待機時間は次で計算する。
+
+```text
+exponential = 250ms × 2^retryIndex
+baseDelay = max(exponential, retryAfterMs ?? 0)
+jitter = 0〜baseDelay × 0.2
+delay = min(8,000ms, baseDelay + jitter)
+```
+
+累積待機時間が15,000msを超える場合、超過する再試行を行わない。`Retry-After`はRFC 9110 §10.2.3に従う正規化済みの非負ミリ秒だけを使い、指数バックオフの下限として扱う。`Retry-After`の存在は`retryable`を上書きせず、認証・入力不正・Context超過に付いていても再試行を許可しない。
+
+ジッターの乱数源と時計は注入可能にし、テストでは固定値を使用する。待機中にAbortされた場合は残りのタイマーを解放し、次の試行、イベント、ログ上の成功を発生させない。ProviderのRequest Timeoutは試行ごとに適用するが、Retry Policyの累積上限も別に適用し、無制限の待機や試行を許可しない。
+
+#### 状態とイベントの流れ
+
+```text
+idle
+  │ runId + requestIdをsingle-flightへ登録
+  ▼
+attempting
+  ├─ 成功 ───────────────→ eventsを公開 → completed
+  ├─ 非再試行Error ──────→ error
+  ├─ 再試行候補・未公開・安全 ─→ backoff → attempting
+  ├─ Tool Risk + accepted不明 ─→ error
+  ├─ Abort ──────────────→ cancelled
+  └─ 試行／時間上限 ─────→ 最後のerror
+```
+
+各試行はErrorまたはCancelledを終端とし、Error／Cancelled後に次の試行のイベントを外部へ発行しない。再試行しない失敗では、最後に得た共通`ProviderError`を一度だけAgentErrorへ写像する。Providerの生Responseや試行ごとのPrompt／Tool Resultをエラーに付加しない。
+
+#### 実装単位と検証
+
+実装時は、待機計算、再試行判定、single-flight、Abort連携、試行イベント境界を独立した純粋ロジックまたは注入可能なサービスとして分離する。Provider RouterはRetry Policyを呼び出すComposition境界になり得るが、Adapter自身へ待機ループを埋め込まない。
+
+最低限、次をFake Transportと保存済みFixtureで検証する。
+
+* `rate-limited`、`timeout`、`network`だけが再試行候補となり、認証・Bad Request・Context超過・未知エラーが再試行されないこと
+* 初回、2回目、3回目の試行、試行上限、待機上限、累積上限、ジッター固定、`Retry-After`優先順位
+* 同一`runId + requestId`の並行呼び出しが1つのTransport実行へ合流し、異なるRequest IDは独立すること
+* Tool定義付き要求の送信前失敗だけが再試行され、受領済み不明・ストリーム開始後・Tool Call断片受信後は再試行されないこと
+* 成功したTool Callが1回だけAgentへ渡り、Retry PolicyがTool Executorを呼ばないこと
+* 待機中・送信中・ストリーム中のAbortで再試行と後続イベントが抑止されること
+* ログや永続化にAPIキー、Authorization、URL、Prompt、Tool Result、生Responseが含まれないこと
 
 ### 6.1 対応プロトコル
 
@@ -975,7 +1261,416 @@ Provider Adapterは次だけを担当する。
 
 エージェントの判断、ツール実行、権限管理、履歴圧縮はProvider Adapterに入れない。
 
+### 6.3 Provider Router
+
+`ProviderRouter`は、Agentが指定した論理`modelId`をModel Catalogで解決し、解決結果の`provider.apiType`に対応する`ProviderAdapter`を選択して呼び出しへ渡すExtension Host側のComposition層である。AgentはProvider名、URL、認証方式、Adapter実装を参照しない。
+
+#### 6.3.1 責務と依存
+
+Routerは次を担当する。
+
+* 呼び出し開始時のCatalog revisionで`modelId`を`ModelDefinition`へ解決する
+* `apiType`をキーにProvider Adapter Registry／Factoryを選択する
+* Provider設定の検証済みURL・ヘッダーとProvider Serviceの認証情報をAdapter初期化境界へ渡す
+* Provider構成ごとのAdapter初期化を共有し、同一構成の呼び出しで再利用する
+* `ProviderRequest`のmodel IDとCatalog解決結果を検証してAdapterへ委譲する
+* 未解決Model、未登録Adapter、認証情報未設定、初期化失敗を構造化エラーへ分類する
+* Catalog更新中もRun単位の解決結果とAdapterを固定し、次のRunへ新しい構成を適用する
+
+RouterはHTTP通信、Provider固有のメッセージ変換、イベント正規化、Tool実行、引数検証、権限判定、履歴保存、コンテキスト圧縮、リトライ実行、停止条件を担当しない。これらはModel Catalog、Provider Adapter、Agentまたは各専門サービスの責務とする。
+
+```text
+Agent Service
+  │ modelId + ProviderRequest
+  ▼
+ProviderRouter ── ModelCatalog.resolve(modelId)
+  │              └─ ModelDefinition(provider.apiType, provider settings)
+  ├─ ProviderAdapterRegistry.get(apiType)
+  ├─ ProviderAdapterFactory.create(provider settings, credential)
+  └─ adapter.stream(request, signal) → AsyncIterable<ProviderEvent>
+```
+
+Factoryは`apiType`、Provider ID、Vendor、URL、検証済みヘッダーを初期化入力として受け取る。APIキー等のSecret実値は初期化境界の内側に限定し、`ProviderRequest`、`ProviderEvent`、Catalog、ログ、永続化へ含めない。既存の`DefaultProviderService`が持つSecretStorageと実行中リクエストのライフサイクル境界を再利用する。
+
+#### 6.3.2 解決とAdapter再利用
+
+Routerの解決手順は次のとおりとする。
+
+1. Catalogの同一revisionで`modelId`を解決する。利用可能でない場合は`model-not-found`／`MODEL_NOT_AVAILABLE`相当で終了する。
+2. `provider.apiType`をRegistryで検索する。登録がない場合は`adapter-not-registered`／`MODEL_ADAPTER_UNSUPPORTED`相当の非再試行エラーとする。
+3. Provider Serviceから認証情報を解決し、未設定・取得不能を`credential-unavailable`／`MODEL_SECRET_UNAVAILABLE`相当とする。
+4. Provider ID、apiType、URL、検証済み設定revision、credential revisionを組み合わせた構成キーでキャッシュを検索する。Secret実値そのものはキーやログに含めない。
+5. キャッシュがなければFactoryを一度だけ実行し、同一キーの並行初期化は同じPromiseを共有する。初期化失敗はキャッシュへ保存しない。
+6. 解決済みModel IDと`ProviderRequest.modelId`を一致検証し、Adapterの`stream`または`countTokens`へ委譲する。
+
+AdapterはRun固有のバッファ、Usage、Abort状態をインスタンスへ保存しない。Catalog更新後も実行中のAsyncIterableを差し替えず、旧構成のAdapterは新規Runから隔離する。破棄可能なAdapterは参照がなくなった後に一度だけ破棄し、Router破棄時は新規呼び出しを拒否して進行中Runを停止する。
+
+#### 6.3.3 Routerエラーとテスト
+
+Router固有の分類は少なくとも`model-not-found`、`adapter-not-registered`、`provider-initialization-failed`、`credential-unavailable`、`request-model-mismatch`を持つ。ユーザー向けメッセージは安全な固定文言または分類済み短文とし、ログにはProvider ID、apiType、Model ID、revision、分類だけを記録する。URL全体、ヘッダー値、Secret ID、APIキー、生レスポンスは記録しない。
+
+Unit TestではModel ID解決、apiTypeごとのFactory選択、未登録Adapter、初期化失敗の再試行、同一Provider構成の初期化共有、credential revision・Catalog revision変更時の隔離、request model ID不一致を検証する。Provider Contract TestではRouter経由でも共通`ProviderEvent`契約が保たれることをFake Adapterで検証する。Extension Integration TestではModel選択後のHost側呼び出しが実際のAdapterへ到達し、実APIを使わずSecretStorageとAdapter RegistryをFakeへ差し替えられることを検証する。
+
+完了条件は、利用可能なモデルIDから同一Catalog revisionのProvider設定とAdapterを解決し、共通`ProviderRequest`を対象Adapterへ渡して`ProviderEvent`をAgentへ返せることである。未登録Provider、未解決Model、認証情報未設定、初期化失敗は安全なエラーとして扱えることも含む。
+
 ---
+
+### 6.4 OpenAI Responses Adapter
+
+`OpenAIResponsesAdapter`は、`apiType: "responses"`のモデルに対して、共通`ProviderRequest`をResponses互換APIの`POST <configured-url>`へ変換し、HTTPストリームを共通`ProviderEvent`へ正規化する。Configured URLはModel Catalogで検証済みの完全なエンドポイントを使用する。Adapterが`/v1/responses`などのパスを推測・連結してはならない。既定設定は`https://api.openai.com/v1/responses`とするが、互換サービスのURLは同じSchemaの安全なURL検証を通過したものだけを受け付ける。
+
+#### 6.4.1 対象範囲と非対象
+
+対象はResponses APIのテキスト会話、システム指示、画像入力、Function Tool定義、単一・並列Function Call、Function Call Result、SSEストリーミング、Usage、完了・不完全・エラー・キャンセルの正規化である。AdapterはFunctionを実行せず、引数をAJVで検証せず、権限を判定せず、Tool Resultを短縮・マスクせず、Agent Loopを進めない。
+
+Responses APIの組み込みHosted Tool、MCP、Computer Use、File Search、Code Interpreter、Web Search、Background Mode、WebSocket ModeはこのAdapterの初期実装対象外とする。内部ToolはすべてResponsesの`type: "function"`として送信し、未知のTool種別は暗黙に変換せず`unsupported`または`bad-request`へ分類する。
+
+#### 6.4.2 リクエスト変換
+
+Adapterは呼び出しごとに秘密情報を含まないリクエストを組み立て、次の形式で送信する。`Authorization`はFactory／Provider Serviceが初期化境界で注入し、共通リクエストのJSON、ログ、Fixtureへ出さない。
+
+```ts
+interface ResponsesRequest {
+  readonly model: string;
+  readonly instructions?: string;
+  readonly input: readonly ResponsesInputItem[];
+  readonly tools?: readonly ResponsesFunctionTool[];
+  readonly temperature?: number;
+  readonly max_output_tokens?: number;
+  readonly reasoning?: { readonly effort: string };
+  readonly stream: true;
+  readonly parallel_tool_calls: true;
+  readonly truncation: "disabled";
+}
+
+interface ResponsesFunctionTool {
+  readonly type: "function";
+  readonly name: string;
+  readonly description?: string;
+  readonly parameters: unknown;
+}
+```
+
+変換規則は次のとおりとする。
+
+| 共通入力 | Responses入力 | 規則 |
+|---|---|---|
+| `ProviderRequest.modelId` | `model` | Catalogで解決済みの値をそのまま使う。再推測・別名変換をしない |
+| `system`メッセージ | `instructions` | テキスト部分を元の順序で結合し、空でなければ1つの指示文字列にする。画像を含むSystem指示は拒否する |
+| `user`メッセージ | `type: "message"`, `role: "user"` | テキストを`input_text`、画像を`input_image`へ変換する |
+| `assistant`メッセージ | `type: "message"`, `role: "assistant"` | 過去応答のテキストを保持する。`toolCalls`は後述の`function_call`入力項目へ分離する |
+| `ProviderToolCall` | `type: "function_call"` | `id`を`call_id`、`name`を`name`、`JSON.stringify(arguments)`を`arguments`へ設定する |
+| `tool`メッセージ | `type: "function_call_output"` | `toolCallId`を`call_id`へ設定し、テキストだけなら文字列、画像を含む場合は入力コンテンツ配列へ変換する |
+| `ProviderToolDefinition` | `type: "function"` | `name`、`description`、`inputSchema`をそれぞれ`name`、`description`、`parameters`へ写す。Schemaを独自に削除・書換えしない |
+
+`instructions`と通常の`input`は別の責務として扱う。`instructions`は毎回送信し、`previous_response_id`を使う場合でも省略しない。初期実装は会話を共通メッセージから再構成するステートレス方式とし、Responses APIのサーバー側会話状態、`store`、`previous_response_id`に依存しない。これにより、Provider間でThread Storeの正本を共有できる。
+
+`ProviderMessage`の各Content Partは順序を維持する。画像の`data`は既にData URLならそのまま使い、Base64本体なら`data:<mediaType>;base64,<data>`へ変換する。URL内の認証情報、未知のMedia Type、空の画像データ、System内画像は変換前に安全な`bad-request`へ分類する。入力文字列・Tool Resultの内容をログへ複製しない。
+
+ResponsesのFunction Toolでは`parameters`にJSON Schemaを渡す。Adapterは必須プロパティの補完、`additionalProperties`の追加、`strict`の強制を行わない。厳格Schemaが必要なToolはTool Registry／Agent側の定義として用意し、Provider差異を理由に意味を変えない。空のTool配列は`tools`を省略するか空配列として一貫して送信し、実装では一方に固定する。
+
+#### 6.4.3 SSE受信とイベント正規化
+
+`stream: true`でHTTPレスポンスを要求し、`Content-Type: text/event-stream`のSSEをReader単位で読む。SSEの`event`、複数行`data`、空行によるイベント境界を正しく処理し、JSONの境界がネットワークChunk境界と一致することを仮定しない。JSONイベントの未知フィールドは無視するが、未知の意味イベントをTextやTool Callへ推測変換しない。
+
+主要な変換は次のとおりとする。
+
+| Responsesイベント | 共通イベント | 処理 |
+|---|---|---|
+| `response.output_text.delta` | `text-delta` | `delta`が文字列の場合だけ、その順序で発行する |
+| `response.reasoning_summary_text.delta` | `reasoning-delta` | 公開Summaryだけを発行する。非公開推論本文・暗号化内容はログ・永続化・UIへ渡さない |
+| `response.output_item.added`の`function_call` | `tool-call-start` | Responses項目の内部`item_id`でバッファを作り、`call_id`と名前を確定する |
+| `response.function_call_arguments.delta` | `tool-call-delta` | `item_id`で対応するバッファへ`delta`を追記し、論理ID=`call_id`で発行する |
+| `response.function_call_arguments.done` | `tool-call` | `arguments`全体または蓄積文字列をJSON解析し、完全な`ProviderToolCall`として発行する |
+| `response.completed` | `usage`、`completed` | 明示されたUsageを先に発行し、Tool Callがあれば`tool-call`、なければResponse状態に応じた完了理由を発行する |
+| `response.incomplete`／完了Responseの`incomplete_details` | `completed` | `max_output_tokens`は`max-tokens`、`content_filter`は`content-filter`へ変換する |
+| `response.failed`またはSSE `error` | `error` | HTTP／Responseエラーを`ProviderError`へ分類し、後続イベントを捨てる |
+
+`response.output_item.added`が先に来ないFunction Call、`item_id`・`call_id`・名前の欠落、同一IDでの名前変更、引数完了後の追加Delta、JSONとして不正な引数は不完全Tool Callとする。該当Runでは`completed`を発行せず、`bad-request`の非再試行エラーを1回だけ発行する。並列Tool CallはResponsesの`output_index`または`item_id`で独立管理し、受信順と`call_id`の対応を壊さない。
+
+Responsesの`response.completed.response.status`が`completed`でも、出力にFunction Callが1つ以上含まれる場合は共通のStop Reasonを`tool-call`とする。Function Callがなく正常完了なら`end-turn`とする。`max_output_tokens`は`max-tokens`、`content_filter`は`content-filter`、それ以外の未定義・未対応状態は`unknown`とする。Stop Reasonをモデル名、テキスト内容、推測したFinish Reasonから補完してはならない。
+
+Usageは完了Responseの`usage`に明示された値だけを採用する。`input_tokens`と`output_tokens`を共通の必須値へ写し、`input_tokens_details.cached_tokens`を`cachedTokens`、`output_tokens_details.reasoning_tokens`を`reasoningTokens`へ写す。Usageがない場合は`usage`イベントを発行せず、0や推定値で補完しない。Usageを複数回受信した場合は最終値だけを採用し、重複イベントを発行しない。
+
+#### 6.4.4 Tool Callingの往復
+
+Tool実行をAdapter内へ入れず、Agent Runtimeとの往復を次の順序に固定する。
+
+```text
+ProviderRequest(messages + tools)
+        │
+        ▼
+POST /responses?stream=true
+        │
+        ├─ text-delta / reasoning-delta
+        ├─ tool-call-start / tool-call-delta
+        ├─ tool-call(id=call_id, name, parsed arguments)
+        ├─ usage
+        └─ completed(stopReason=tool-call)
+        │
+        ▼
+Agentが引数を検証し、権限確認後にToolを実行
+        │
+        ▼
+次のProviderRequestへ assistant.toolCalls + tool(toolCallId, result) を追加
+```
+
+Responsesが返すFunction Callは`call_id`を共通IDとして`tool-call`へ保持する。AgentがToolを実行した後は、元のAssistant `toolCalls`と対応する`tool`メッセージを同じ会話順で次のRequestへ渡す。Adapterはこの対を`function_call`と`function_call_output`へ変換する。Resultの`output`は通常文字列とし、共通Tool Resultに画像がある場合だけResponsesの入力画像コンテンツ配列へ変換する。ResultのJSON化・ANSI除去・機密マスク・サイズ制限はTool／Context層の責務であり、このAdapterで二重処理しない。
+
+1回のResponseに複数のFunction Callがある場合、すべてのCallを発行してから`completed(tool-call)`を発行する。Agent側はプロジェクトのTool並列実行ポリシーとPermission Profileに従って処理する。AdapterはResponsesの`parallel_tool_calls`を`true`に固定するが、並列実行そのものを保証・実行しない。ツール定義が空の場合はFunction Callイベントを受け付けず、Providerの契約違反としてエラーにする。
+
+ReasoningモデルでFunction Callの後続Requestを作る場合、Responses APIが要求するReasoning Itemの再送を欠落させない仕組みが別途必要になる。現在の共通`ProviderMessage`にはProvider固有のReasoning Itemを直接持ち込まないため、初期実装の完了対象は、共通履歴だけで再構成できるモデルとする。Reasoning Itemを含むモデルを有効化する前に、暗号化されたOpaque ContinuationをProvider共通契約へ追加する設計変更とContract Testを完了させる。非公開推論本文を代替として保存する設計は禁止する。
+
+#### 6.4.5 HTTP、キャンセル、エラー
+
+HTTPステータスが2xx以外の場合は、レスポンスBodyを安全な分類にだけ使用し、生BodyをそのままMessageやログへ渡さない。401／403は`auth-failed`、429は`rate-limited`、408は`timeout`、400／422は`bad-request`、413または明示的なコンテキスト超過は`context-exceeded`、404は`unsupported`、接続失敗は`network`へ分類する。`Retry-After`は安全な整数ミリ秒へ正規化できた場合だけ保持し、リトライ実行は上位層に委ねる。
+
+`stream`開始前とFetch後の両方で`AbortSignal`を確認する。Abort時はFetch、Response BodyのReader、SSE parser、Tool Call accumulatorを破棄し、`cancelled`を1回だけ発行する。Abort後に読み取ったイベント、Error、Completedは無視する。ConsumerがAsyncIterableを早期終了した場合も`finally`でReaderとバッファを解放する。認証情報、全URL、任意ヘッダー、SSE生行、Prompt全文、Tool Result全文はエラー・ログ・永続化へ含めない。
+
+Fetchはリダイレクトを自動追跡せず、検証済みのConfigured URLから別Hostへ転送しない。SSE本文には最大サイズと既定Timeoutを設け、上限超過・Timeoutはそれぞれ安全な`bad-request`・`timeout`へ分類する。タイマーはRequest完了、Abort、Consumer早期終了のすべてで解放する。
+
+#### 6.4.6 実装単位とContract Test
+
+実装は次の単位へ分割する。HTTP transport、SSE parser、Responses request mapper、Responses event normalizer、Function Call accumulator、Provider error mapperを相互に独立した純粋処理としてテスト可能にする。
+
+最低限のFixtureと検証項目は次のとおりとする。
+
+* System指示1件・複数件、User／Assistant text、画像、空ContentのRequest変換
+* Tool定義の`parameters`保持、未知Schemaの非改変、空Tool配列、Tool名欠落の拒否
+* 正常なText Delta、複数Chunkに分割されたJSON、SSE行・JSON境界の分離
+* 単一Function Call、並列Function Call、`item_id`と`call_id`の対応、Call Resultの再変換
+* Tool Call完了前のストリーム終了、重複ID、名前矛盾、不正JSON、完了後Deltaの拒否
+* Usageのcached／reasoning内訳、Usage未提供、重複Usage、0推定の禁止
+* `end-turn`、`tool-call`、`max-tokens`、`content-filter`、`unknown`のStop Reason
+* HTTP 401／403／408／413／422／429、SSE `error`、Response `failed`、Retry-After
+* Abort前、読込中Abort、Abort後イベント抑止、Consumer早期終了時のReader解放
+* Prompt、Authorization、URL、Tool Result、生レスポンスがイベント・ログへ漏れないこと
+
+実APIテストは明示的な環境変数とユーザーの実行指定がある場合だけ行う。通常のProvider Contract Testは保存済みSSE FixtureとFake Fetchで完結させ、OpenAI公式APIのレスポンスをテスト実行時に取得しない。完了条件は、Responses互換のFake APIに対して、テキストの逐次表示、Function Callの引数完全結合、Agentが返したFunction Call Resultの次ターン送信、Usage取得、Stop Reason取得が同じProvider共通契約で検証できることである。
+
+#### 6.4.7 参照仕様
+
+実装時は、仕様の変動を考慮して次のOpenAI公式資料を確認日とともに記録する。仕様と本設計が異なる場合は、Responsesの公開Schemaを優先し、互換API固有の差異はAdapter内の明示的なProfileへ閉じ込める。
+
+* [Streaming API responses](https://developers.openai.com/api/docs/guides/streaming-responses)
+* [Function calling](https://developers.openai.com/api/docs/guides/function-calling)
+* [Create a model response API reference](https://developers.openai.com/api/reference/resources/responses/methods/create)
+
+### 6.5 OpenAI互換Chat Completions Adapter
+
+`OpenAIChatCompletionsAdapter`は、`apiType: "chat-completions"`のModelに対して、共通`ProviderRequest`を設定済みの完全なChat Completions Endpointへ変換し、HTTP SSEを`ProviderEvent`へ正規化する。URLはModel Catalogで検証済みの値をそのまま使用し、Adapterが`/v1/chat/completions`やProvider固有のパスを推測・連結してはならない。
+
+OpenAI公式Chat Completionsを基準形式とするが、OpenAI互換サーバーは同一のAPI名でも、System／Developer Role、`max_tokens`の名称、Usageチャンク、Reasoningフィールド、Tool parser、Tool引数の型、終端Markerを完全には統一していない。差異は明示的な有限Profileへ閉じ込め、Agent Runtimeと共通Provider契約に分岐を持ち込まない。
+
+#### 6.5.1 対象範囲と非対象
+
+対象は、Text会話、User画像、System／Developer指示、Function Tool定義、単一・並列Function Call、Tool Result、SSEストリーミング、Usage、Stop Reason、HTTPエラー、キャンセルの正規化である。AdapterはFunctionを実行せず、引数をAJVで検証せず、権限を判定せず、Tool Resultを短縮・マスクせず、Agent Loopを進めない。
+
+初期実装では、`stream: true`のSSE経路を正本とする。非ストリーム専用サーバー、独自WebSocket、Custom Tool、Audio／File入力、Hosted Tool、MCP、Computer Use、Web Search、Code Interpreterは対象外とする。旧`function_call`形式は、互換性Profileで明示的に有効にした場合に限り、Function Toolの限定的な後方互換として扱う。
+
+#### 6.5.2 Provider差異を吸収するProfile
+
+Model設定へ追加するProfileは、ProviderまたはModelごとの有限な列挙値だけを許可する。任意のJSON Body、任意のHeader、任意の認証方式、URLの自動生成をProfileで指定できるようにしてはならない。
+
+```ts
+interface ChatCompletionsProfile {
+  readonly systemRole: "system" | "developer";
+  readonly maxTokensField: "max_tokens" | "max_completion_tokens";
+  readonly reasoningField: "none" | "reasoning_effort";
+  readonly reasoningDeltaField: "none" | "reasoning_content" | "reasoning";
+  readonly streamUsage: "include" | "omit";
+  readonly parallelToolCalls: "include" | "omit" | "false";
+  readonly toolArguments: "string" | "object" | "auto";
+  readonly toolIndex: "required" | "id-fallback";
+  readonly legacyFunctionCall: "disabled" | "enabled";
+  readonly synthesizeToolCallId: "disabled" | "enabled";
+  readonly allowEofAfterFinish: boolean;
+}
+```
+
+既定Profileは、`systemRole: "system"`、`maxTokensField: "max_tokens"`、`reasoningField: "none"`、`reasoningDeltaField: "none"`、`streamUsage: "omit"`、`parallelToolCalls: "omit"`、`toolArguments: "string"`、`toolIndex: "required"`、`legacyFunctionCall: "disabled"`、`synthesizeToolCallId: "disabled"`、`allowEofAfterFinish: false`とする。Usageを受け取りたいProviderは`streamUsage: "include"`を明示するが、サーバーがUsageを返さないことはエラーにしない。
+
+Profileは設定Schemaへ追加し、Validator、Model Catalog、Provider Routerの初期化境界まで検証済み設定として接続する。ワークスペース由来設定からEndpoint、認証情報、任意Header、Profileの認証・転送挙動を変更できない既存の安全制約は維持する。
+
+#### 6.5.3 Request変換
+
+Adapterは呼び出しごとに秘密情報を含まないRequest JSONを組み立て、`Authorization`はFactory／Provider Serviceが初期化境界で注入する。共通Request、ProviderEvent、ログ、FixtureにはCredentialを含めない。
+
+```ts
+interface ChatCompletionsRequest {
+  readonly model: string;
+  readonly messages: readonly ChatMessage[];
+  readonly tools?: readonly ChatFunctionTool[];
+  readonly stream: true;
+  readonly n: 1;
+  readonly temperature?: number;
+  readonly max_tokens?: number;
+  readonly max_completion_tokens?: number;
+  readonly reasoning_effort?: string;
+  readonly parallel_tool_calls?: boolean;
+  readonly stream_options?: { readonly include_usage: true };
+}
+
+interface ChatFunctionTool {
+  readonly type: "function";
+  readonly function: {
+    readonly name: string;
+    readonly description?: string;
+    readonly parameters: unknown;
+  };
+}
+```
+
+変換規則は次のとおりとする。
+
+| 共通入力 | Chat Completions入力 | 規則 |
+|---|---|---|
+| `ProviderRequest.modelId` | `model` | Catalogで解決済みの値をそのまま使う |
+| `system`メッセージ | `role: system`または`developer` | Profileの`systemRole`で全Systemメッセージを変換し、順序とTextを保持する。System画像は拒否する |
+| `user`メッセージ | `role: user` | Textは文字列、画像を含む場合はText／`image_url` Content Part配列へ変換する |
+| Textのみの`assistant` | `role: assistant`, `content` | Textの順序を保持する。空Contentは空文字列へ正規化する |
+| Assistant `toolCalls` | `role: assistant`, `tool_calls` | `id`、`type: function`、Tool名、`JSON.stringify(arguments)`を保持する。Tool CallだけのContentは`null`を許可する |
+| `tool`メッセージ | `role: tool` | `tool_call_id`へ`toolCallId`を写し、ResultのTextをそのまま送る。画像Resultは初期実装で拒否する |
+| `ProviderToolDefinition` | `type: function` | `name`、`description`、`inputSchema`をそれぞれFunction定義へ写す。Schemaを追加・削除・強制変更しない |
+
+User画像のData URL／Base64変換、未知Media Type、空データ、URL内認証情報の検査は、既存のProvider URL／入力安全規則に従う。`tool_call_id`のないTool Message、Assistant Tool CallのID・名前・引数の欠落はRequest変換時に`bad-request`とする。
+
+Requestには常に`stream: true`と`n: 1`を設定する。`max_tokens`または`max_completion_tokens`、`reasoning_effort`、`parallel_tool_calls`、`stream_options`はProfileに従う。未定義値は送信せず、互換性のために同義フィールドを同時送信しない。`parallel_tool_calls: false`は、Tool Callを直列実行する意味ではなく、Providerへ並列生成を要求しない宣言である。
+
+#### 6.5.4 SSE受信とChunk正規化
+
+HTTP Response BodyはReader単位で読み、SSEの`event`、複数`data:`行、空行区切り、CRLF／LF、ネットワークChunk境界を正しく処理する。SSEイベント境界とJSON境界、JSON境界とTool引数境界が一致することを仮定しない。累積Byte、イベント数、Tool引数長には上限を設ける。
+
+`data: [DONE]`を正常な終端Markerとして扱う。`allowEofAfterFinish`が有効なProfileでは、`finish_reason`を受信済みで未完了Callがなく、HTTP Bodyが終端した場合だけ`[DONE]`なしの完了を許可する。それ以外の予期しないEOF、SSE構文エラー、JSON構文エラーはCompletedなしの非再試行エラーとする。
+
+主要な正規化は次のとおりとする。
+
+| Chat Completions Chunk | 共通イベント | 処理 |
+|---|---|---|
+| `choices[0].delta.content`の文字列 | `text-delta` | 受信順で発行し、`null`や未提供は無視する |
+| Profileで指定した公開Reasoningフィールド | `reasoning-delta` | 指定フィールドの文字列だけを発行する。`content`から推測しない |
+| `choices[0].delta.tool_calls` | `tool-call-start`／`tool-call-delta` | Call単位でAccumulatorへ送り、IDと名前が揃った時点で開始イベントを発行する |
+| 旧`choices[0].delta.function_call` | Tool Callイベント | `legacyFunctionCall: enabled`の場合だけ単一Callとして蓄積する |
+| `choices[0].finish_reason` | 内部完了状態 | 終端まで保持し、Completedを先行発行しない |
+| Usage専用Chunk（`choices: []`を含む） | `usage` | 明示された数値だけを正規化し、終端処理前に発行する |
+| `data: [DONE]` | `completed` | Tool Call確定、Usage発行後にStop Reasonを決定して1回だけ発行する |
+| Chunk内のError／SSE `error` | `error` | Error後のデータ、Usage、Completedを破棄する |
+
+`n: 1`で要求するため、複数Choice、非0 Choiceの混入、Choice間でのDelta混在は共通イベントで表現できない。Usage専用Chunkの空`choices`だけを例外として受け付け、それ以外は`unsupported`または`bad-request`とする。
+
+#### 6.5.5 不完全Tool Callの安全な結合
+
+OpenAI公式のStreaming例では、初回DeltaにTool CallのID・名前・型が入り、後続Deltaでは`index`と引数文字列だけが返る。したがってAccumulatorの主キーは`choice.index + tool_calls[].index`とし、Indexがない場合だけProfileの`toolIndex: "id-fallback"`に従い明示IDを使う。
+
+```text
+PendingToolCall
+├─ key: choiceIndex + toolIndex / toolCallId
+├─ id?: string
+├─ name?: string
+├─ argumentMode: unset | string | object
+├─ argumentText: string
+├─ argumentObject?: unknown
+├─ started: boolean
+└─ closed: boolean
+```
+
+- `id`、名前、`type`は初回Deltaだけに存在する前提を置かず、後続Deltaで補完できる。ただし同一Keyで別ID、別名、非FunctionのTypeへ変化した場合は拒否する。
+- String引数は到着順に連結し、Callの完了時に一度だけJSON解析する。解析前の断片を`arguments`として確定イベントへ渡さない。
+- Object引数はProfileの`object`または`auto`でだけ受け付ける。複数Objectの不一致、Stringとの混在、部分Objectの深いマージ、空文字列からの`{}`推測は禁止する。
+- Call確定時に、ID、名前、完全なJSON引数、宣言済みTool名を検証する。一つでも欠けた場合は`tool-call`とCompletedを発行しない。
+- 確定済みCallへの追加Delta、同一Indexの別Callへの再利用、既知IDと別Indexの矛盾、宣言されていないTool名はErrorとする。
+- 途中で`tool-call-start`／`tool-call-delta`を発行していても、最終検証失敗時はRun全体をErrorで終える。Agentが実行するのは確定`tool-call`だけである。
+- 旧`function_call`やID欠落サーバー向けの合成IDは、Profileで明示的に有効化されている場合だけ許可する。合成IDは`requestId`とCall Indexから決定的に作り、外部へ秘密を含めない。
+
+並列Tool CallはCallごとに独立して保持し、受信順を変更しない。すべてのCallの確定イベントを発行してから`completed(stopReason: "tool-call")`を発行する。Stream終了時に未完了Callが一つでも残っていれば、Completedを発行せず`bad-request`の非再試行Errorを1回だけ発行する。
+
+#### 6.5.6 Stop ReasonとUsage
+
+標準的な終端理由は次へ変換する。
+
+| Provider値 | 共通値 |
+|---|---|
+| `stop` | `end-turn` |
+| `tool_calls`／`function_call` | `tool-call` |
+| `length` | `max-tokens` |
+| `content_filter` | `content-filter` |
+| `stop_sequence`／`eos` | Profileで許可した場合だけ`end-turn` |
+| 未知または未提供 | `unknown`、または完了要件を満たさない場合はError |
+
+`finish_reason`が未提供でも、明示的な`[DONE]`、完全なSSE、未完了Callなしという終端条件を満たす場合は`unknown`でCompletedを発行できる。Text内容、モデル名、HTTP切断、推測したEOSからStop Reasonを補完してはならない。
+
+Usageは`prompt_tokens`／`completion_tokens`を`inputTokens`／`outputTokens`へ写す。`prompt_tokens_details.cached_tokens`、`completion_tokens_details.reasoning_tokens`等の任意内訳は、存在して数値検証できた場合だけ設定する。`total_tokens`から入力・出力を逆算しない。Usage専用Chunkがない、終端Usageが欠落する、またはキャンセルされた場合はUsageイベントを発行しない。Usageの未提供は互換サーバーの正常な差異である。
+
+#### 6.5.7 Tool Callingの往復、HTTP、キャンセル
+
+Tool Callingの往復は次のとおりとする。
+
+```text
+ProviderRequest(messages + tools)
+        │
+        ▼
+POST <configured-chat-completions-url> { stream: true }
+        │
+        ├─ text-delta / reasoning-delta
+        ├─ tool-call(id, name, parsed arguments)
+        ├─ usage（提供時のみ）
+        └─ completed(tool-call)
+        │
+        ▼
+Agentが引数検証・権限確認・Tool実行
+        │
+        ▼
+次のProviderRequestへ assistant.toolCalls + tool(toolCallId, result)
+```
+
+次のRequestではAssistantの`tool_calls[].id`とTool Messageの`tool_call_id`を同じ論理IDにする。AdapterはToolの実行、並列実行、失敗時の再試行、Resultの要約を行わない。Tool ResultのANSI除去、機密マスク、サイズ制限、Artifact化はTool／Context層の責務であり、Adapterで二重処理しない。
+
+HTTP 401／403は`auth-failed`、429は`rate-limited`、408は`timeout`、400／422は`bad-request`、413またはコンテキスト超過は`context-exceeded`、404は`unsupported`、接続失敗は`network`へ分類する。Responseの`error.type`、`error.code`、`x-request-id`、`Retry-After`は安全な分類・相関情報へ利用するが、Bodyをユーザー向け文言、ログ、永続化へ直接渡さない。
+
+Redirectは自動追跡せず、検証済みEndpointから別Hostへ転送しない。Content-TypeがSSEでない、Bodyがない、累積サイズが上限超過、SSEまたはJSONが壊れている場合はCompletedなしでErrorとする。Retry-Afterは安全な整数または許可されたHTTP日付から有限のミリ秒へ変換できた場合だけ保持し、再試行そのものは上位層が判断する。
+
+`stream`開始前、Fetch完了後、各Chunk処理前にAbortを検査する。Abort済みなら通信を開始せず`cancelled`を1回だけ発行し、読込中AbortではFetch、Reader、Parser、Accumulatorを停止する。Abort後のChunk、Error、Usage、Completedを発行してはならない。ConsumerがAsyncIterableを早期終了した場合も`finally`でReader、Timer、Bufferを解放する。
+
+#### 6.5.8 実装単位とContract Test
+
+実装は次の単位へ分割し、HTTP副作用を除く変換処理を純粋関数としてテスト可能にする。
+
+- `src/providers/openai/openai-chat-completions-types.ts`: Chat Completions固有の最小Request／Chunk／Profile型
+- `src/providers/openai/openai-chat-completions-profile.ts`: Profileの既定値、設定検証、実効Profile解決
+- `src/providers/openai/openai-chat-completions-request.ts`: 共通RequestからChat Completions Requestへの変換
+- `src/providers/openai/openai-chat-completions-sse.ts`: SSEの行・イベント境界、サイズ制限、Abort処理
+- `src/providers/openai/openai-chat-completions-events.ts`: ChunkからProviderEventへの正規化、Usage／Stop処理
+- `src/providers/openai/openai-chat-completions-tool-calls.ts`: CallごとのAccumulator、JSON完全性、ID／名前／Index検証
+- `src/providers/openai/openai-chat-completions-adapter.ts`: ProviderAdapter境界、Fetch、認証、Timeout、Reader解放
+- `tests/provider-contract/fixtures/openai-chat-completions/`: Text、Tool Call、Usage、Error、Cancel、Profile差異Fixture
+
+最低限のFixtureと検証項目は次のとおりとする。
+
+- System／Developer、User／Assistant／Tool Message、User画像、空Content、Tool定義、Tool ResultのRequest変換
+- `max_tokens`／`max_completion_tokens`、`stream_options.include_usage`、`parallel_tool_calls`、Reasoning FieldのProfile切替
+- 正常なText Delta、SSE行・JSON・ネットワークChunk境界の分離、`[DONE]`、Profileで許可されたEOF
+- 単一・並列Tool Call、初回だけのID／名前、Index欠落のIDフォールバック、引数の複数断片結合
+- Tool Call完了前のEOF、重複ID、名前矛盾、Index衝突、不正JSON、空引数、String／Object混在、完了後Delta、未知Tool名
+- 旧`function_call`、Object引数、合成IDの既定拒否と明示Profile許可
+- Usageのcached／reasoning内訳、Usage未提供、Usage専用空Choices、Interrupted StreamでのUsage欠落
+- `end-turn`、`tool-call`、`max-tokens`、`content-filter`、`unknown`のStop Reason
+- HTTP 401／403／408／413／422／429、404、SSE Error、Response Error、Retry-After、非SSE Response
+- Abort前、読込中Abort、Abort後イベント抑止、Consumer早期終了時のReader／Timer／Buffer解放
+- Prompt、Authorization、URL、任意Header、Tool Result、生ResponseがEvent・Log・Fixtureへ漏れないこと
+
+実APIテストは明示的な環境変数とユーザーの実行指定がある場合だけ行う。通常のProvider Contract Testは保存済みSSE FixtureとFake Fetchで完結させ、実行時に外部OpenAI互換サーバーへ接続しない。完了条件は、一般的なOpenAI互換Fake APIに対してText、Tool Call、Tool Result往復、Usage取得、Stop Reason、エラー、キャンセルが共通Provider契約で再現できることである。
+
+#### 6.5.9 参照仕様と調査結果
+
+仕様確認日は2026-07-16とする。OpenAIの公式仕様を基準にし、互換サーバー固有の差異は次の一次資料で確認した。
+
+- [OpenAI Chat Completions API Reference](https://developers.openai.com/api/reference/resources/chat): `tool_calls`、Streaming Chunk、`finish_reason`、`stream_options.include_usage`の基準
+- [OpenAI Function Calling](https://developers.openai.com/api/docs/guides/function-calling): Tool Call引数断片の蓄積とTool Resultの`tool_call_id`往復
+- [vLLM Tool Calling](https://docs.vllm.ai/en/latest/features/tool_calling/): Auto Tool Choice、Tool parser、Chat Templateをサーバー側で有効化する必要性
+- [Ollama OpenAI Compatibility](https://docs.ollama.com/api/openai-compatibility): Chat CompletionsでのTools、画像、Reasoning、Usage対応とフィールド差異
+- [llama.cpp OpenAI-compatible server](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md): Chat Template、`--jinja`、Function Calling、Reasoning Content、互換範囲の制約
+
+調査から、OpenAI互換という名称だけではTool Calling、Usage、Reasoning、引数型、終端の完全互換を保証できないことが分かった。よって、能力はModel設定を正本とし、Profileで送信・受信差異を限定的に宣言し、宣言できない差異は暗黙変換せずUnsupportedまたはBad Requestとして扱う。
 
 ## 7. エージェント実行方式
 
@@ -3108,6 +3803,9 @@ type AgentErrorCode =
   | "PROVIDER_RATE_LIMITED"
   | "PROVIDER_TIMEOUT"
   | "PROVIDER_BAD_REQUEST"
+  | "PROVIDER_UNSUPPORTED"
+  | "PROVIDER_NETWORK"
+  | "PROVIDER_UNKNOWN"
   | "MODEL_CONTEXT_EXCEEDED"
   | "MODEL_TOOL_UNSUPPORTED"
   | "INVALID_TOOL_INPUT"
@@ -3128,10 +3826,18 @@ interface AgentError {
   code: AgentErrorCode;
   userMessage: string;
   modelMessage?: string;
-  technicalDetails?: string;
+  technicalDetails?: {
+    providerCode?: string;
+    providerType?: string;
+    status?: number;
+    requestId?: string;
+    source: "http" | "transport" | "stream" | "timeout" | "cancelled";
+  };
   retryable: boolean;
 }
 ```
+
+`userMessage`は分類ごとの固定文言とし、Providerの生エラーメッセージ、レスポンス本文、URL、ヘッダー、認証情報を含めない。`modelMessage`はモデルが次の行動を判断するための短い共通説明が必要な場合だけ設定し、技術情報や秘密情報を含めない。`technicalDetails`は構造化された診断情報だけを保持し、UI、会話保存、ProviderEventの表示本文へ渡さない。
 
 ---
 
@@ -3169,6 +3875,23 @@ interface AgentError {
 * キャンセル
 * 不完全JSON
 * 再接続
+
+Providerエラー正規化については、少なくとも次を追加で検証する。
+
+* HTTP 401／403、429、408／504、400／422、413、404の共通コード写像
+* Responses、Chat Completions、Anthropicの許可済みProviderコード写像と未知コードの`unknown`
+* `Retry-After`のdelta-seconds、HTTP-date、過去日時、不正値、上限超過、ヘッダー名の大文字小文字
+* 認証・Bad Request・Context超過へRetry-Afterが付いても`retryable`が変わらないこと
+* ユーザー向け固定文言と技術情報の分離、生Response・URL・Authorization・Prompt・Tool Resultの漏えい防止
+* Error／Cancelled後のUsage・Completed抑止と、AgentErrorへの一度だけの変換
+
+Providerリトライ方針については、少なくとも次を追加で検証する。
+
+* `retryable`な`rate-limited`、`timeout`、`network`だけが候補となり、認証・入力不正・Context超過・未知エラーが再試行されないこと
+* 指数バックオフ、ジッター、`Retry-After`の下限、1回・累積の待機上限、最大3試行
+* 同一`runId + requestId`のsingle-flightと異なるRequest IDの独立性
+* Tool定義付き要求の未送信／処理開始前拒否だけの再試行、応答開始後・Tool Call受信後の再送禁止
+* 部分イベント公開後の再送禁止、Error／Cancelled後の後続イベント抑止、Abort時のタイマー解放
 
 実APIを使うテストは明示的な環境変数がある場合だけ実行する。
 

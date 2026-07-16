@@ -7,6 +7,7 @@ import { DefaultStorageService, type StorageService } from "../storage/storage-s
 import { DefaultUIService, type UIService, type UIServiceDependencies } from "../ui/ui-service";
 import { type ApplicationService, disposeInReverse } from "./service-lifecycle";
 import type { ModelCatalog } from "../models/model-catalog";
+import type { DiagnosticLogger } from "../observability/diagnostic-logger";
 
 export interface ApplicationServices {
   readonly provider: ProviderService;
@@ -71,6 +72,7 @@ export async function createApplicationServices(
   context: ExtensionContext,
   factories: ApplicationServiceFactories = defaultFactories,
   modelCatalog?: ModelCatalog,
+  logger?: DiagnosticLogger,
 ): Promise<ApplicationServices> {
   const created: ApplicationService[] = [];
 
@@ -93,6 +95,7 @@ export async function createApplicationServices(
       storage,
       provider,
       modelCatalog,
+      logger,
       registerWebviewViewProvider: (viewId, provider, options) =>
         vscode.window.registerWebviewViewProvider(viewId, provider, options),
     });
