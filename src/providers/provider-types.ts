@@ -76,6 +76,9 @@ export type ProviderErrorCode =
 
 export type ProviderErrorSource = "http" | "transport" | "stream" | "timeout" | "cancelled";
 
+export type ProviderAttemptOutcome =
+  "not-sent" | "rejected-before-processing" | "response-started" | "unknown";
+
 export interface ProviderError {
   readonly code: ProviderErrorCode;
   readonly message: string;
@@ -86,6 +89,7 @@ export interface ProviderError {
   readonly providerCode?: string;
   readonly providerType?: string;
   readonly source?: ProviderErrorSource;
+  readonly deliveryStatus?: ProviderAttemptOutcome;
 }
 
 export interface TokenCountInput {

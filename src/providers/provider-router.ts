@@ -6,6 +6,7 @@ import type {
   ProviderRequest,
   TokenCountInput,
 } from "./provider-types";
+import { DefaultProviderRetryPolicy, type ProviderRetryPolicy } from "./provider-retry-policy";
 import type { ChatCompletionsProfile } from "./openai/openai-chat-completions-types";
 
 export interface ProviderCredentialResolver {
@@ -92,15 +93,21 @@ export interface ProviderRouter {
     modelId: string,
     request: ProviderRequest,
     signal: AbortSignal,
+    options?: ProviderStreamOptions,
   ): AsyncIterable<ProviderEvent>;
   countTokens(modelId: string, input: TokenCountInput, signal?: AbortSignal): Promise<number>;
   dispose(): Promise<void>;
+}
+
+export interface ProviderStreamOptions {
+  readonly runId?: string;
 }
 
 export interface ProviderRouterDependencies {
   readonly catalog: ModelCatalog;
   readonly registry: ProviderAdapterRegistry;
   readonly credentials: ProviderCredentialResolver;
+  readonly retryPolicy?: ProviderRetryPolicy;
 }
 
 interface CachedAdapter {
@@ -117,20 +124,26 @@ export class DefaultProviderRouter implements ProviderRouter {
   private readonly activeControllers = new Set<AbortController>();
   private disposed = false;
 
-  public constructor(private readonly dependencies: ProviderRouterDependencies) {}
+  private readonly retryPolicy: ProviderRetryPolicy;
+
+  public constructor(private readonly dependencies: ProviderRouterDependencies) {
+    this.retryPolicy = dependencies.retryPolicy ?? new DefaultProviderRetryPolicy();
+  }
 
   public stream(
     modelId: string,
     request: ProviderRequest,
     signal: AbortSignal,
+    options: ProviderStreamOptions = {},
   ): AsyncIterable<ProviderEvent> {
-    return this.streamInternal(modelId, request, signal);
+    return this.streamInternal(modelId, request, signal, options);
   }
 
   private async *streamInternal(
     modelId: string,
     request: ProviderRequest,
     signal: AbortSignal,
+    options: ProviderStreamOptions,
   ): AsyncIterable<ProviderEvent> {
     const resolved = await this.resolveAdapter(modelId, request.modelId);
     const controller = new AbortController();
@@ -138,7 +151,16 @@ export class DefaultProviderRouter implements ProviderRouter {
     this.activeControllers.add(controller);
     resolved.references += 1;
     try {
-      for await (const event of resolved.adapter.stream(request, controller.signal)) {
+      const execution = this.retryPolicy.execute(
+        {
+          runId: options.runId,
+          request,
+          execute: (attemptRequest, _attempt, attemptSignal) =>
+            resolved.adapter.stream(attemptRequest, attemptSignal),
+        },
+        controller.signal,
+      );
+      for await (const event of execution) {
         if (controller.signal.aborted) break;
         yield event;
       }

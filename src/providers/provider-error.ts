@@ -1,4 +1,9 @@
-import type { ProviderError, ProviderErrorCode, ProviderErrorSource } from "./provider-types";
+import type {
+  ProviderAttemptOutcome,
+  ProviderError,
+  ProviderErrorCode,
+  ProviderErrorSource,
+} from "./provider-types";
 
 const MAX_RETRY_AFTER_MS = 24 * 60 * 60 * 1000;
 const MAX_PROVIDER_ERROR_BODY_LENGTH = 64 * 1024;
@@ -19,6 +24,7 @@ interface ErrorLike {
   readonly retryAfterMs?: unknown;
   readonly retryAfter?: unknown;
   readonly headers?: unknown;
+  readonly deliveryStatus?: unknown;
 }
 
 export interface ProviderErrorInput {
@@ -32,6 +38,7 @@ export interface ProviderErrorInput {
   readonly timedOut?: boolean;
   readonly retryAfterMs?: number;
   readonly retryAfter?: string;
+  readonly deliveryStatus?: ProviderAttemptOutcome;
 }
 
 const SAFE_MESSAGES: Readonly<Record<ProviderErrorCode, string>> = {
@@ -60,6 +67,7 @@ export async function normalizeProviderHttpError(
       providerCode: metadata.code,
       providerType: metadata.type,
       requestId: headers["x-request-id"] ?? options.requestId,
+      ...(response.status === 429 ? { deliveryStatus: "rejected-before-processing" as const } : {}),
       ...(metadata.code === undefined ? {} : { code: metadata.code }),
     },
     options,
@@ -99,6 +107,7 @@ export function normalizeProviderError(
     options.nowMs,
   );
   const requestId = safeRequestId(error.requestId ?? options.requestId);
+  const deliveryStatus = safeDeliveryStatus(error.deliveryStatus);
 
   return {
     code,
@@ -110,13 +119,14 @@ export function normalizeProviderError(
     ...(providerCode === undefined ? {} : { providerCode }),
     ...(providerType === undefined ? {} : { providerType }),
     ...(source === undefined ? {} : { source }),
+    ...(deliveryStatus === undefined ? {} : { deliveryStatus }),
   };
 }
 
 export function createProviderError(
   code: ProviderErrorCode,
   requestId?: string,
-  details: Pick<ProviderError, "status" | "retryAfterMs"> &
+  details: Pick<ProviderError, "status" | "retryAfterMs" | "deliveryStatus"> &
     Partial<Pick<ProviderError, "providerCode" | "providerType" | "source">> = {},
 ): ProviderError {
   return {
@@ -129,6 +139,7 @@ export function createProviderError(
     ...(details.providerCode === undefined ? {} : { providerCode: details.providerCode }),
     ...(details.providerType === undefined ? {} : { providerType: details.providerType }),
     ...(details.source === undefined ? {} : { source: details.source }),
+    ...(details.deliveryStatus === undefined ? {} : { deliveryStatus: details.deliveryStatus }),
   };
 }
 
@@ -246,6 +257,15 @@ function classifyProviderToken(
 
 function isRetryable(code: ProviderErrorCode): boolean {
   return code === "rate-limited" || code === "timeout" || code === "network";
+}
+
+function safeDeliveryStatus(value: unknown): ProviderAttemptOutcome | undefined {
+  return value === "not-sent" ||
+    value === "rejected-before-processing" ||
+    value === "response-started" ||
+    value === "unknown"
+    ? value
+    : undefined;
 }
 
 async function readProviderErrorMetadata(

@@ -1132,6 +1132,105 @@ Provider層とAgent層の境界で次の写像を一箇所に定義する。Agen
 
 `retryAfterMs`は上位のRetry Policyへ渡せるが、このタスクでは再送しない。ストリーム中のError後にはUsageまたはCompletedを発行せず、Abort時はCancelledを一度だけ発行する。これにより、API固有エラーを共通コードとしてAgentの状態遷移、UI表示、診断ログで一貫して処理できる。
 
+### 6.0.5 Providerリトライ方針
+
+Provider Retry Policyは、Provider Adapterが正規化したエラーを入力として、Provider呼び出しの上位境界で待機と再送を管理する。Adapterはエラー分類、`retryable`、`retryAfterMs`の生成だけを担当し、Tool実行、重複排除、Agentの停止判断を担当しない。
+
+#### 再試行の許可条件
+
+自動再試行は、次の条件をすべて満たす場合だけ行う。
+
+1. `ProviderError.retryable === true`である。
+2. エラーコードが`rate-limited`、`timeout`、`network`のいずれかである。`auth-failed`、`bad-request`、`context-exceeded`、`unsupported`、`cancelled`、`unknown`は再試行しない。
+3. Abortされておらず、最大試行回数と累積待機時間の上限を超えていない。
+4. 直前の試行で外部へイベントを公開していない。
+5. Tool Callを伴う要求では、送信前に失敗したか、Providerが処理開始前に拒否したことをAdapterまたはTransportが明示している。
+
+`ProviderError`が一時的なコードへ正規化されていない5xxや未知のProviderコードは再試行しない。再試行対象を増やす場合は、先にProviderエラー正規化のAllowlist、`ProviderErrorCode`、`AgentErrorCode`、Contract Testを同時に更新し、未知エラーを暗黙に一時的と推測してはならない。
+
+#### 試行と重複防止の契約
+
+Retry PolicyはRunの外側から次の実行情報を受け取る。`ProviderRequest`は初回作成時の不変スナップショットとして扱い、再試行のためにメッセージ、Tool定義、Tool Call ID、Tool Resultを変更しない。
+
+```ts
+type ProviderAttemptOutcome =
+  | "not-sent"
+  | "rejected-before-processing"
+  | "response-started"
+  | "unknown";
+
+interface ProviderRetryExecution {
+  readonly runId: string;
+  readonly request: ProviderRequest;
+  readonly toolRisk: boolean;
+  readonly execute: (
+    request: ProviderRequest,
+    attempt: number,
+    signal: AbortSignal,
+  ) => AsyncIterable<ProviderEvent>;
+}
+
+interface ProviderRetryPolicy {
+  execute(input: ProviderRetryExecution, signal: AbortSignal): AsyncIterable<ProviderEvent>;
+}
+```
+
+`toolRisk`は、要求の`tools`が空でない場合、または履歴に未処理のTool Call／Tool Resultの往復が含まれる場合に真とする。Tool定義が存在する要求は、モデルがまだTool Callを返していなくても、サーバーが受領済みか判定できない再送を副作用リスクとして扱う。
+
+同一Runの同一`requestId`については`runId + requestId`をsingle-flightキーとする。キーが処理中の場合、後続呼び出しは新しいHTTP送信を開始せず、既存の処理結果へ合流する。再試行は同じsingle-flightの内部試行として扱い、試行番号だけを内部メタデータで増加させる。完了、失敗、キャンセル後に同じキーを再利用する場合は新しいユーザー操作として新しい`requestId`を要求する。
+
+Tool Riskのある要求では、`not-sent`または`rejected-before-processing`だけを自動再試行可能とする。`response-started`または`unknown`でのTimeout、接続断、ストリーム切断は、Providerが処理済みの可能性を否定できないため自動再試行せず、Agentへ安全なエラーを返す。Tool Callイベントを1件でも受信した試行は、イベントが確定前の断片であっても再送しない。
+
+Tool Riskのない要求でも、ストリームの途中で一度でも外部へ`text-delta`、`reasoning-delta`、`tool-call-*`、`usage`を公開した後は再送しない。再送を行う場合は、失敗した試行のイベントを先に公開していないことを保証し、同じテキストやTool CallがUI・Agentへ二重に届かないようにする。
+
+Retry PolicyはTool Executorを呼び出さない。成功した試行で`tool-call`と`completed(stopReason: "tool-call")`が確定した後に限り、Agent Runtimeが各Tool Call IDを一度だけ実行する。リトライ層がTool Callを見て新しいIDを作る、Toolを再実行する、Tool Resultを組み替えることは禁止する。
+
+#### バックオフと上限
+
+既定値は初回を含む最大3試行、すなわち自動再試行2回とする。再試行`retryIndex`を0始まりとして、待機時間は次で計算する。
+
+```text
+exponential = 250ms × 2^retryIndex
+baseDelay = max(exponential, retryAfterMs ?? 0)
+jitter = 0〜baseDelay × 0.2
+delay = min(8,000ms, baseDelay + jitter)
+```
+
+累積待機時間が15,000msを超える場合、超過する再試行を行わない。`Retry-After`はRFC 9110 §10.2.3に従う正規化済みの非負ミリ秒だけを使い、指数バックオフの下限として扱う。`Retry-After`の存在は`retryable`を上書きせず、認証・入力不正・Context超過に付いていても再試行を許可しない。
+
+ジッターの乱数源と時計は注入可能にし、テストでは固定値を使用する。待機中にAbortされた場合は残りのタイマーを解放し、次の試行、イベント、ログ上の成功を発生させない。ProviderのRequest Timeoutは試行ごとに適用するが、Retry Policyの累積上限も別に適用し、無制限の待機や試行を許可しない。
+
+#### 状態とイベントの流れ
+
+```text
+idle
+  │ runId + requestIdをsingle-flightへ登録
+  ▼
+attempting
+  ├─ 成功 ───────────────→ eventsを公開 → completed
+  ├─ 非再試行Error ──────→ error
+  ├─ 再試行候補・未公開・安全 ─→ backoff → attempting
+  ├─ Tool Risk + accepted不明 ─→ error
+  ├─ Abort ──────────────→ cancelled
+  └─ 試行／時間上限 ─────→ 最後のerror
+```
+
+各試行はErrorまたはCancelledを終端とし、Error／Cancelled後に次の試行のイベントを外部へ発行しない。再試行しない失敗では、最後に得た共通`ProviderError`を一度だけAgentErrorへ写像する。Providerの生Responseや試行ごとのPrompt／Tool Resultをエラーに付加しない。
+
+#### 実装単位と検証
+
+実装時は、待機計算、再試行判定、single-flight、Abort連携、試行イベント境界を独立した純粋ロジックまたは注入可能なサービスとして分離する。Provider RouterはRetry Policyを呼び出すComposition境界になり得るが、Adapter自身へ待機ループを埋め込まない。
+
+最低限、次をFake Transportと保存済みFixtureで検証する。
+
+* `rate-limited`、`timeout`、`network`だけが再試行候補となり、認証・Bad Request・Context超過・未知エラーが再試行されないこと
+* 初回、2回目、3回目の試行、試行上限、待機上限、累積上限、ジッター固定、`Retry-After`優先順位
+* 同一`runId + requestId`の並行呼び出しが1つのTransport実行へ合流し、異なるRequest IDは独立すること
+* Tool定義付き要求の送信前失敗だけが再試行され、受領済み不明・ストリーム開始後・Tool Call断片受信後は再試行されないこと
+* 成功したTool Callが1回だけAgentへ渡り、Retry PolicyがTool Executorを呼ばないこと
+* 待機中・送信中・ストリーム中のAbortで再試行と後続イベントが抑止されること
+* ログや永続化にAPIキー、Authorization、URL、Prompt、Tool Result、生Responseが含まれないこと
+
 ### 6.1 対応プロトコル
 
 初期対応は次の三つとする。
@@ -3785,6 +3884,14 @@ Providerエラー正規化については、少なくとも次を追加で検証
 * 認証・Bad Request・Context超過へRetry-Afterが付いても`retryable`が変わらないこと
 * ユーザー向け固定文言と技術情報の分離、生Response・URL・Authorization・Prompt・Tool Resultの漏えい防止
 * Error／Cancelled後のUsage・Completed抑止と、AgentErrorへの一度だけの変換
+
+Providerリトライ方針については、少なくとも次を追加で検証する。
+
+* `retryable`な`rate-limited`、`timeout`、`network`だけが候補となり、認証・入力不正・Context超過・未知エラーが再試行されないこと
+* 指数バックオフ、ジッター、`Retry-After`の下限、1回・累積の待機上限、最大3試行
+* 同一`runId + requestId`のsingle-flightと異なるRequest IDの独立性
+* Tool定義付き要求の未送信／処理開始前拒否だけの再試行、応答開始後・Tool Call受信後の再送禁止
+* 部分イベント公開後の再送禁止、Error／Cancelled後の後続イベント抑止、Abort時のタイマー解放
 
 実APIを使うテストは明示的な環境変数がある場合だけ実行する。
 
