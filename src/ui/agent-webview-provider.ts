@@ -5,6 +5,7 @@ import * as vscode from "vscode";
 import type { AgentRunRequest } from "../agent/agent-service";
 import { type ModelCatalog } from "../models/model-catalog";
 import type { ProviderService } from "../providers/provider-service";
+import type { StorageService } from "../storage/storage-service";
 import { createPermissionSummary, type PermissionSummary } from "../permissions/permission-profile";
 import {
   ThreadPermissionRevisionConflictError,
@@ -15,6 +16,8 @@ import { ExtensionWebviewProtocolSession } from "./extension-webview-protocol";
 import {
   createExtensionToUiMessage,
   DEFAULT_THREAD_ID,
+  type AgentErrorCode,
+  type ThreadEvent,
   type UiToExtensionMessage,
 } from "./webview-protocol";
 import type { ModelCatalogChangeSubscription } from "../models/model-catalog";
@@ -54,6 +57,7 @@ export interface AgentWebviewProviderOptions {
   readonly modelCatalog?: ModelCatalog;
   readonly providerService?: ProviderService;
   readonly threadModelStore?: ThreadModelStore;
+  readonly storage?: StorageService;
   readonly isThreadRunActive?: (threadId: string) => boolean;
   readonly isWorkspaceTrusted?: () => boolean;
   readonly onDidGrantWorkspaceTrust?: (listener: () => void) => vscode.Disposable;
@@ -67,6 +71,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   private readonly modelCatalog: ModelCatalog | undefined;
   private readonly providerService: ProviderService | undefined;
   private readonly threadModelStore: ThreadModelStore | undefined;
+  private readonly storage: StorageService | undefined;
   private readonly isThreadRunActive: (threadId: string) => boolean;
   private readonly isWorkspaceTrusted: () => boolean;
   private readonly onDidGrantWorkspaceTrust:
@@ -83,6 +88,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     this.modelCatalog = options.modelCatalog;
     this.providerService = options.providerService;
     this.threadModelStore = options.threadModelStore;
+    this.storage = options.storage;
     this.isThreadRunActive = options.isThreadRunActive ?? (() => false);
     this.isWorkspaceTrusted = options.isWorkspaceTrusted ?? (() => true);
     this.onDidGrantWorkspaceTrust = options.onDidGrantWorkspaceTrust;
@@ -104,6 +110,8 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       getModelList: (threadId) => this.getModelList(threadId),
       getPermissionSummary: (threadId) => this.getPermissionSummary(threadId),
       getProviderCredentials: (providerId) => this.getProviderCredentials(providerId),
+      getThreadList: () => this.getThreadList(),
+      getThreadSnapshot: (threadId) => this.getThreadSnapshot(threadId),
       onMessage: async (message) => {
         await this.handleUiMessage(message, protocolSession);
       },
@@ -156,6 +164,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     if (message.type === "delete-provider-credential") {
       await this.handleDeleteProviderCredential(message, protocolSession);
+      return;
+    }
+
+    if (message.type === "rename-thread") {
+      await this.handleRenameThread(message, protocolSession);
       return;
     }
 
@@ -235,6 +248,31 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       }
     }
 
+    if (this.storage) {
+      try {
+        await this.storage.getThreadModelState(message.payload.threadId);
+        await this.storage.appendUserMessage(message.payload.threadId, {
+          eventId: message.messageId,
+          runId: message.messageId,
+          kind: "user-message",
+          payload: { messageId: message.messageId, text },
+        });
+      } catch {
+        await protocolSession.sendToUi(
+          createExtensionToUiMessage(
+            "error",
+            {
+              code: "TOOL_EXECUTION_FAILED",
+              message: "メッセージを保存できませんでした。再試行してください。",
+              retryable: true,
+            },
+            { correlationId: message.messageId },
+          ),
+        );
+        return;
+      }
+    }
+
     this.logger?.debug("ui.thread-event.sending", {
       threadId: message.payload.threadId,
       messageId: message.messageId,
@@ -249,11 +287,96 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       },
       message.messageId,
     );
+    await protocolSession.sendThreadList();
     this.logger?.info("ui.thread-event.sent", {
       threadId: message.payload.threadId,
       messageId: message.messageId,
       eventKind: "user-message",
     });
+  }
+
+  private async handleRenameThread(
+    message: Extract<UiToExtensionMessage, { type: "rename-thread" }>,
+    protocolSession: ExtensionWebviewProtocolSession,
+  ): Promise<void> {
+    if (!this.storage) {
+      await this.sendModelError(
+        protocolSession,
+        "THREAD_NOT_FOUND",
+        "スレッドを変更できません。",
+        message.messageId,
+      );
+      return;
+    }
+
+    try {
+      await this.storage.rename(
+        message.payload.threadId,
+        message.payload.expectedThreadRevision,
+        message.payload.title,
+      );
+      await protocolSession.sendThreadList(message.messageId);
+      if (this.activeThreadId === message.payload.threadId) {
+        await protocolSession.sendThreadSnapshotForSelection(
+          message.payload.threadId,
+          message.messageId,
+        );
+      }
+    } catch (error) {
+      const conflict = error instanceof Error && error.name === "ThreadRevisionConflictError";
+      await this.sendModelError(
+        protocolSession,
+        conflict ? "THREAD_RENAME_CONFLICT" : "THREAD_TITLE_INVALID",
+        conflict
+          ? "スレッドが更新されています。最新のタイトルを確認してください。"
+          : "タイトルを保存できませんでした。",
+        message.messageId,
+      );
+      await protocolSession.sendThreadList(message.messageId);
+    }
+  }
+
+  private async getThreadList() {
+    if (!this.storage) return [];
+    await this.storage.getThreadModelState(DEFAULT_THREAD_ID);
+    const threads = await this.storage.list();
+    return threads.map((thread) => ({
+      id: thread.id,
+      title: thread.title,
+      revision: thread.revision,
+      updatedAt: thread.updatedAt,
+      archived: thread.archived,
+    }));
+  }
+
+  private async getThreadSnapshot(threadId: string) {
+    if (!this.storage) return { revision: 0, events: [] as readonly ThreadEvent[] };
+    const state = await this.storage.getThreadModelState(threadId);
+    const result = await this.storage.read(threadId);
+    const events: ThreadEvent[] = result.events.flatMap((event): ThreadEvent[] => {
+      if (event.kind !== "user-message" && event.kind !== "assistant-text") return [];
+      const payload = event.payload as {
+        readonly messageId?: unknown;
+        readonly text?: unknown;
+      };
+      if (typeof payload.text !== "string") return [];
+      return event.kind === "user-message"
+        ? [
+            {
+              kind: "user-message" as const,
+              ...(typeof payload.messageId === "string" ? { messageId: payload.messageId } : {}),
+              text: payload.text,
+            },
+          ]
+        : [
+            {
+              kind: "assistant-text" as const,
+              ...(typeof payload.messageId === "string" ? { messageId: payload.messageId } : {}),
+              text: payload.text,
+            },
+          ];
+    });
+    return { revision: state.revision, events };
   }
 
   private async handleSelectModel(
@@ -587,12 +710,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
   private async sendModelError(
     protocolSession: ExtensionWebviewProtocolSession,
-    code:
-      | "MODEL_NOT_FOUND"
-      | "MODEL_SELECTION_CONFLICT"
-      | "MODEL_SELECTION_BUSY"
-      | "MODEL_NOT_SELECTED"
-      | "TOOL_EXECUTION_FAILED",
+    code: AgentErrorCode,
     message: string,
     correlationId: string,
   ): Promise<void> {

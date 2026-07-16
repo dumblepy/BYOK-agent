@@ -169,4 +169,35 @@ describe("Webview protocol schemas", () => {
       }),
     ).toBeUndefined();
   });
+
+  it("validates thread list, selection, and rename messages", () => {
+    const list = createExtensionToUiMessage("thread-list", {
+      threads: [
+        {
+          id: "thread-1",
+          title: "最初の依頼",
+          revision: 2,
+          updatedAt: 10,
+          archived: false,
+        },
+      ],
+      selectedThreadId: "thread-1",
+    });
+    const select = createUiToExtensionMessage("select-thread", { threadId: "thread-1" });
+    const rename = createUiToExtensionMessage("rename-thread", {
+      threadId: "thread-1",
+      title: "新しいタイトル",
+      expectedThreadRevision: 2,
+    });
+
+    expect(parseExtensionToUiMessage(list)).toEqual(list);
+    expect(parseUiToExtensionMessage(select)).toEqual(select);
+    expect(parseUiToExtensionMessage(rename)).toEqual(rename);
+    expect(
+      parseUiToExtensionMessage({
+        ...rename,
+        payload: { ...rename.payload, expectedThreadRevision: -1 },
+      }),
+    ).toBeUndefined();
+  });
 });

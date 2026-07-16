@@ -36,6 +36,104 @@ select {
   gap: 12px;
 }
 
+.thread-list {
+  padding: 10px;
+  background: var(--vscode-editorWidget-background);
+  border: 1px solid var(--vscode-widget-border);
+  border-radius: 6px;
+}
+
+.thread-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+
+.thread-list-heading h2 {
+  margin: 0;
+  font-size: 12px;
+}
+
+.thread-list-heading span,
+.thread-list-empty {
+  color: var(--vscode-descriptionForeground);
+  font-size: 11px;
+}
+
+.thread-list ul {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.thread-list li {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  border-radius: 4px;
+}
+
+.thread-list li.is-selected {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+}
+
+.thread-list-item,
+.thread-rename-button,
+.thread-rename-form button {
+  color: inherit;
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.thread-list-item {
+  min-width: 0;
+  flex: 1;
+  padding: 6px;
+  text-align: left;
+}
+
+.thread-list-title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.thread-rename-button,
+.thread-rename-form button {
+  flex: 0 0 auto;
+  padding: 4px;
+}
+
+.thread-rename-button:hover,
+.thread-rename-button:focus,
+.thread-rename-form button:hover,
+.thread-rename-form button:focus {
+  outline: 1px solid var(--vscode-focusBorder);
+}
+
+.thread-rename-form {
+  display: flex;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+}
+
+.thread-rename-form input {
+  min-width: 0;
+  flex: 1;
+  color: var(--vscode-input-foreground);
+  background: var(--vscode-input-background);
+  border: 1px solid var(--vscode-input-border, transparent);
+}
+
 .eyebrow {
   margin: 0 0 4px;
   color: var(--vscode-descriptionForeground);

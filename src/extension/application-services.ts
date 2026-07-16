@@ -36,10 +36,48 @@ const defaultFactories: ApplicationServiceFactories = {
   storage: (context) =>
     new DefaultStorageService({
       globalStorageUri: context.globalStorageUri,
+      artifactOptions: getGlobalArtifactOptions(),
+      threadTitleOptions: getGlobalThreadTitleOptions(),
     }),
   agent: (dependencies) => new DefaultAgentService(dependencies),
   ui: (dependencies) => new DefaultUIService(dependencies),
 };
+
+function getGlobalArtifactOptions(): NonNullable<
+  ConstructorParameters<typeof DefaultStorageService>[0]["artifactOptions"]
+> {
+  const configuration = vscode.workspace.getConfiguration("byokAgent.artifacts");
+  const inspectConfiguration = (
+    configuration as unknown as {
+      inspect?: <T>(key: string) => { readonly globalValue?: T } | undefined;
+    }
+  ).inspect;
+  const inspect = <T>(key: string): T | undefined =>
+    typeof inspectConfiguration === "function"
+      ? inspectConfiguration<T>(key)?.globalValue
+      : undefined;
+  return {
+    maxTotalBytes: inspect<number>("maxTotalBytes"),
+    maxThreadBytes: inspect<number>("maxThreadBytes"),
+    maxArtifactBytes: inspect<number>("maxArtifactBytes"),
+    chunkBytes: inspect<number>("chunkBytes"),
+    retentionDays: inspect<number>("retentionDays"),
+    evictionPolicy: inspect<"oldest-first">("evictionPolicy"),
+  };
+}
+
+function getGlobalThreadTitleOptions(): NonNullable<
+  ConstructorParameters<typeof DefaultStorageService>[0]["threadTitleOptions"]
+> {
+  const configuration = vscode.workspace.getConfiguration("byokAgent.threadTitle");
+  const inspected =
+    typeof configuration.inspect === "function"
+      ? configuration.inspect<boolean>("autoNaming")
+      : undefined;
+  return {
+    autoNaming: inspected?.globalValue ?? false,
+  };
+}
 
 class ApplicationServicesContainer implements ApplicationServices {
   private disposed = false;

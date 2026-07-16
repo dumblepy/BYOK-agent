@@ -3598,7 +3598,57 @@ Codiconのサイズ調整が必要な場合、CSSで `font-size` を指定する
 
 ## 15. 会話・イベント保存
 
-## 15.1 保存形式
+## 15.1 Thread Store
+
+Thread Storeは、会話イベントそのものではなく、スレッドのライフサイクルと実行に必要なメタデータの正本を管理するExtension Host側のStorageコンポーネントである。Webviewは一覧・選択要求を表示するだけで、ファイルシステムや保存形式へ直接アクセスしない。Model Catalog、Permission Policy、SecretStorageはThread Storeへ注入しない。
+
+### 15.1.1 責務と契約
+
+```ts
+interface ThreadRecord {
+  readonly id: string;
+  readonly title: string;
+  readonly titleSource: "default" | "provisional" | "llm" | "user";
+  readonly workspaceId?: string;
+  readonly modelId?: string;
+  readonly permissionProfile: "read-only" | "confirm-writes" | "workspace-write";
+  readonly revision: number;
+  readonly createdAt: number;
+  readonly updatedAt: number;
+  readonly archived: boolean;
+}
+
+interface ThreadStore {
+  create(input?: CreateThreadInput): Promise<ThreadRecord>;
+  get(threadId: string): Promise<ThreadRecord | undefined>;
+  list(options?: { readonly includeArchived?: boolean }): Promise<readonly ThreadRecord[]>;
+  update(
+    threadId: string,
+    expectedRevision: number,
+    patch: ThreadUpdate,
+  ): Promise<ThreadRecord>;
+  rename(
+    threadId: string,
+    expectedRevision: number,
+    title: string,
+  ): Promise<ThreadRecord>;
+  applyGeneratedTitle(
+    threadId: string,
+    expectedRevision: number,
+    title: string,
+    source: "provisional" | "llm",
+  ): Promise<ThreadRecord>;
+  archive(threadId: string, expectedRevision: number): Promise<ThreadRecord>;
+}
+```
+
+`CreateThreadInput`はタイトル、ワークスペース識別子、モデルID、要求権限を任意で受け取る。既定値はタイトル`新しいスレッド`、権限`confirm-writes`、アーカイブ`false`とする。`ThreadUpdate`はタイトル、モデルID、要求権限の部分更新だけを許可し、ID、作成時刻、revision、アーカイブ状態の直接変更は許可しない。アーカイブは削除ではなく`archived: true`への更新であり、アーカイブ解除は別Issueで設計する。
+
+モデルはProvider URL・APIキーではなく論理`modelId`だけを保存する。作成時にHostが解決した既定モデルを入力できるが、未選択状態も許容する。保存されたモデルが後からModel Catalogで解決不能になった場合もThread Storeは一覧を復元するが、Agent Runは開始せず、Hostがモデル再選択を要求する。権限プロファイルは`read-only`、`confirm-writes`、`workspace-write`に限定し、`autonomous`は通常API・既定値・UIへ公開しない。実効権限は保存せず、Workspace TrustとPermission PolicyからRun開始時に計算する。
+
+Thread Storeは作成・取得・一覧・更新・アーカイブを提供する。モデルと権限は同一`meta.json`と同一revisionで管理し、どちらかの更新でもrevisionを1つ進める。これにより、モデル選択と権限選択から届いた古いUI要求が互いの更新を上書きしない。
+
+### 15.1.2 保存形式と原子的更新
 
 初期実装はSQLiteではなく、スナップショット＋JSONLとする。
 
@@ -3608,10 +3658,13 @@ globalStorage/
     <thread-id>/
       meta.json
       events.jsonl
+      snapshot.json
       summary.json
       artifacts/
       changes/
 ```
+
+Thread Storeが直接管理するのは各スレッドの`meta.json`だけである。`events.jsonl`、`summary.json`、`artifacts/`、`changes/`は後続のEvent Store、要約、アーティファクト、ChangeSet保存機構が管理し、Thread Storeは作成・削除・解釈しない。
 
 ### meta.json
 
@@ -3619,34 +3672,415 @@ globalStorage/
 interface ThreadMetadata {
   id: string;
   title: string;
+  titleSource: "default" | "provisional" | "llm" | "user";
   workspaceId?: string;
-  modelId: string;
+  modelId?: string;
   revision: number;
-  permissionProfile: PermissionProfile;
+  permissionProfile: Exclude<PermissionProfile, "autonomous">;
   createdAt: number;
   updatedAt: number;
   archived: boolean;
 }
 ```
 
-### events.jsonl
+`meta.json`の更新は、対象スレッドのロック取得、最新ファイルの再読込、`expectedRevision`との比較、次revisionと`updatedAt`の生成、一時ファイルへの書き込み、同一ディレクトリ内の`rename`の順序で行う。書き込み・renameに失敗した場合は既存ファイルとメモリキャッシュを維持し、一時ファイルを削除する。作成時のID衝突は別UUIDで再試行する。
+
+スレッドIDはStoreが`randomUUID()`で生成し、既存IDを受け取るAPIでは空文字、`.`、`..`、パス区切り、制御文字、絶対パスを拒否する。タイトル、モデルID、workspaceIdにも長さ上限と制御文字検証を適用する。タイトルは表示用テキストとして扱い、HTML、URI、Command URI、ログテンプレートへ展開しない。保存ファイルにはAPIキー、Authorizationヘッダー、生環境変数、認証トークン、Provider応答、プロンプト全文、非公開推論、明示除外ファイル内容を含めない。
+
+### 15.1.3 起動時の一覧復元
+
+`StorageService.initialize()`または最初の`list()`までに`globalStorageUri/threads/`を作成・走査し、直下のスレッドディレクトリから`meta.json`を検証して一覧を構築する。検証対象はJSONオブジェクト、ディレクトリ名とIDの一致、必須文字列、revision、時刻、権限の列挙値、アーカイブ値である。旧形式で不足する任意の`modelId`や権限は安全な既定値へ補完できるが、未知フィールドや機密値を新しい正本へ取り込まない。
+
+通常一覧は未アーカイブだけを対象とし、`includeArchived: true`のときだけアーカイブ済みを含める。順序は`updatedAt`降順、同値なら`createdAt`降順、さらに`id`昇順で固定する。破損したメタデータはそのエントリだけを除外し、有効な他スレッドの復元を失敗させない。除外はパス、分類、件数などの非機密な診断に限定し、破損ファイルを暗黙に上書きしない。
+
+### 15.1.4 競合とエラー
+
+更新はスレッド単位で直列化し、`expectedRevision`が現在値と一致しない場合は保存せず、`ThreadRevisionConflictError`を返す。エラーには`threadId`、期待revision、実revisionだけを含め、ファイル内容や秘密情報を含めない。取得対象が存在しない場合は`undefined`またはStorage共通のNot Found分類へ変換し、呼び出し元が新規作成と誤認して既存データを上書きしないようにする。
+
+同一プロセス内の並行更新はスレッドロックで保護する。原子的renameは部分的なJSONの読み込みを防ぐが、複数Extension Hostプロセスからの同時更新は初期スコープ外とする。将来その運用を許可する場合はOSファイルロック等を追加設計する。
+
+### 15.1.5 実装単位と検証
+
+実装は`src/storage/thread-store.ts`の型・File実装・検証・一覧復元・atomic write・revision競合、`src/storage/storage-service.ts`のライフサイクル接続、既存`thread-model-store.ts`の互換層または統合に分ける。Thread Storeは`StorageService`の公開境界に置き、UIへはThread Summaryとrevisionだけを渡す。
+
+Unit Testでは作成・取得・更新・アーカイブ、既定値、決定的な一覧順、アーカイブ除外、`includeArchived`、モデル・権限の再起動後復元、破損メタデータの部分復元、revision競合、同時更新、パストラバーサル、原子的更新失敗、機密情報非保存を検証する。Extension Integration TestではThread Store／StorageServiceを再生成し、VS Code再起動相当でも一覧と各スレッドのモデル・権限が復元されることを検証する。実APIは使用しない。
+
+完了条件は、Thread StoreのCRUDとアーカイブが動作し、モデルID・要求権限が保存され、VS Code再起動後に未アーカイブのスレッド一覧とメタデータを復元できることである。Event Store、要約、アーティファクト、ChangeSetの完了は本Issueの条件に含めない。
+
+### 15.1.6 スレッドタイトル生成
+
+スレッドタイトルはThread Storeのメタデータとして保存し、会話本文やWebviewの一時状態から推測しない。目的は、最初のユーザーメッセージを短い仮タイトルへ投影し、スレッド一覧から会話を識別できるようにすることである。タイトルの出所は次の4種類で管理する。
 
 ```ts
-type AgentEvent =
-  | UserMessageEvent
-  | AssistantTextEvent
-  | ToolCallEvent
-  | ToolResultEvent
-  | ApprovalEvent
-  | ContextSnapshotEvent
-  | ChangeSetEvent
-  | UsageEvent
-  | ErrorEvent;
+type ThreadTitleSource = "default" | "provisional" | "llm" | "user";
 ```
 
-イベントは追記専用にする。一定件数ごとにスナップショットを作成する。
+新規スレッドのタイトルは`新しいスレッド`、出所は`default`とする。最初の`user-message`をEvent Storeへ追記した後、Extension Hostの純粋なタイトル生成処理で仮タイトルを作り、`applyGeneratedTitle`で`provisional`として保存する。タイトル処理はイベント追記と別の冪等処理とし、タイトル保存が失敗してもユーザーメッセージの永続化を失敗扱いにしない。次回の復元または再同期で最初の`user-message`を参照して再試行できるようにする。
 
-## 15.2 保存しないもの
+仮タイトル生成の入力は最初のユーザーメッセージだけとする。改行・制御文字・Markdownの表示ノイズ・既知の機密パターンを正規化またはマスクし、空白を圧縮したうえでUnicode単位の上限内へ切り詰める。結果が空の場合は既定タイトルへ戻す。タイトル候補の元本文を`meta.json`へ複製せず、タイトルをHTML、URI、Command URI、ログテンプレートとして解釈しない。
+
+`titleSource`が`default`の場合だけ仮タイトルを適用する。`provisional`、`llm`、`user`を最初のメッセージ以外で上書きしない。旧形式の`meta.json`に`titleSource`がない場合、タイトルが既定値なら`default`、それ以外なら`user`として復元し、自動処理による意図しない上書きを防ぐ。
+
+ユーザー編集は`rename(threadId, expectedRevision, title)`で行う。Hostがタイトルの存在、長さ、制御文字、現在revisionを再検証し、成功時にrevisionを1つ進めて`titleSource: "user"`へ固定する。空タイトルは一覧の識別性を損なうため拒否する。revision競合時は保存せず、最新のThread Summaryを返してUIを再同期する。LLM自動命名中にrenameが成功した場合、後続のLLM結果は破棄する。
+
+LLM自動命名はユーザー設定`byokAgent.threadTitle.autoNaming`だけで制御し、既定値は`false`とする。ワークスペース設定や会話内容から暗黙に有効化しない。設定が有効な場合だけ、仮タイトル保存後に単発・非同期でタイトル生成を試みる。生成要求にはタイトル用の正規化済み最初のユーザーメッセージ、選択済みの論理`modelId`、短い出力上限だけを渡し、Tool定義、Tool Result、ファイル内容、秘密情報、会話履歴全体は渡さない。Provider Adapterはタイトル判断や保存を担当しない。
+
+LLM結果は、期待revisionが一致し、現在の`titleSource`が`provisional`であることを再確認してから`llm`として保存する。モデル未選択、Provider未設定、タイムアウト、キャンセル、LLM結果の検証失敗は仮タイトルを維持し、メッセージ送信・Thread Storeの作成・一覧復元を失敗させない。LLM結果の再生成と自動リトライは別Issueとする。
+
+#### スレッド一覧の表示契約
+
+一覧の正本は`ThreadStore.list({ includeArchived: false })`とし、既存の`updatedAt`降順、`createdAt`降順、`id`昇順の順序を維持する。Hostは保存済みメタデータを次の表示用投影へ変換する。
+
+```ts
+interface ThreadSummary {
+  readonly id: string;
+  readonly title: string;
+  readonly revision: number;
+  readonly updatedAt: number;
+  readonly archived: boolean;
+}
+```
+
+Webview通信には、UIから`request-thread-list`、`select-thread`、`rename-thread`、Hostから`thread-list`を追加する。既存EnvelopeとZod判別共用体を使い、renameには`threadId`、`title`、`expectedThreadRevision`を必須にする。HostはUI準備後、スレッド作成後、rename成功後、タイトル生成完了後に最新一覧を通知し、選択後は対象の`thread-snapshot`、モデル、権限状態を同じスレッドIDで返す。Webviewは現在のスレッドと異なる更新を表示中の会話へ適用しない。
+
+#### 実装単位と検証
+
+実装時は、タイトル正規化と仮タイトル生成、Thread Storeの`titleSource`・rename・生成タイトル更新、最初のユーザーメッセージ追記後の接続、一覧通信・表示、LLM Title Generation Portに分ける。単体テストでは、同一入力の冪等性、Unicode切り詰め、機密マスク、空値、旧形式復元、renameのrevision競合、手動タイトルの保護を検証する。統合テストでは、再起動後の一覧、LLM成功・失敗・キャンセル、LLM処理中の手動rename、スレッド切り替え、Webviewへの機密情報非漏えいを検証する。実APIは使用しない。
+
+完了条件は、最初のユーザーメッセージから仮タイトルを作成して再起動後も一覧へ表示できること、ユーザー編集を保存して自動処理から保護できること、任意設定が有効な場合だけLLMタイトルを採用できること、失敗時も識別可能なタイトルを維持できることとする。
+
+## 15.2 Event Store
+
+Event Storeは、Agent Runtimeが生成した意味イベントをスレッド単位で永続化するExtension Host側のStorageコンポーネントである。`events.jsonl`を唯一のイベント正本、`snapshot.json`を再生成可能な派生キャッシュとする。Thread Storeの`meta.json`、履歴コンパクションの`summary.json`、長大なTool Resultの`artifacts/`、ChangeSetの`changes/`は別サービスが管理し、Event Storeは解釈・更新・削除しない。
+
+### 15.2.1 保存Envelope
+
+```ts
+type PersistedAgentEventKind =
+  | "user-message"
+  | "assistant-text"
+  | "tool-call"
+  | "tool-result"
+  | "approval"
+  | "context-snapshot"
+  | "change-set"
+  | "usage"
+  | "error";
+
+interface PersistedAgentEvent<TPayload = unknown> {
+  readonly schemaVersion: 1;
+  readonly eventId: string;
+  readonly threadId: string;
+  readonly runId: string;
+  readonly sequence: number;
+  readonly occurredAt: number;
+  readonly kind: PersistedAgentEventKind;
+  readonly payload: TPayload;
+}
+```
+
+イベントはUTF-8の1行1JSONオブジェクトとして、末尾改行付きで`events.jsonl`へ追記する。JSONはpretty printせず、既存行の書き換え・並べ替え・再採番を行わない。`eventId`はイベント単位のUUID、`runId`は実行単位の識別子、`sequence`はEvent Storeがスレッド単位で割り当てる単調増加の正整数である。順序の正本は`occurredAt`やファイル時刻ではなく`sequence`とし、`occurredAt`は表示・診断用途に限る。
+
+保存対象のイベント種別とpayloadの最小契約は次の通りとする。
+
+| 種別 | 保存する情報 | 保存しない情報 |
+|---|---|---|
+| `user-message` / `assistant-text` | 機密マスク後の表示本文、メッセージID、完了状態 | APIキー等を含む未加工本文、非公開推論 |
+| `tool-call` | tool名、toolCallId、安全な引数要約 | 引数JSON全文、秘密値 |
+| `tool-result` | 成否、要約、実行時間、`artifact://`参照ID | 完全出力、ファイル内容 |
+| `approval` | 操作の安全な要約、承認・拒否・キャンセル結果 | 未加工コマンド、秘密を含む引数 |
+| `context-snapshot` | URIの安全な識別子、範囲、内容ハッシュ、項目数 | コンテキスト本文 |
+| `change-set` | ChangeSet ID、対象パスの要約、状態 | パッチ本文、ファイル内容 |
+| `usage` | Token数、推定値、論理Provider／model ID | Provider応答、認証情報 |
+| `error` | `AgentErrorCode`、固定メッセージ、分類情報 | 生例外、URL、ヘッダー、レスポンス本文 |
+
+Agent RuntimeはProvider Eventの一時ストリームをそのまま保存せず、永続化境界でAgent Eventへ意味付けする。永続化前にpayloadのSchema、サイズ、保存禁止データを検証し、機密を安全に除去できない場合は保存を拒否するか、機密部分を除いた`redacted`表現へ変換する。
+
+### 15.2.2 Event Store契約
+
+```ts
+interface EventStore {
+  append(threadId: string, event: NewPersistedAgentEvent): Promise<PersistedAgentEvent>;
+  appendBatch(
+    threadId: string,
+    events: readonly NewPersistedAgentEvent[],
+  ): Promise<readonly PersistedAgentEvent[]>;
+  read(
+    threadId: string,
+    options?: { readonly afterSequence?: number },
+  ): Promise<EventReadResult>;
+  getSnapshot(threadId: string): Promise<EventSnapshot | undefined>;
+}
+
+interface NewPersistedAgentEvent {
+  readonly eventId?: string;
+  readonly runId: string;
+  readonly occurredAt?: number;
+  readonly kind: PersistedAgentEventKind;
+  readonly payload: unknown;
+}
+
+interface EventReadResult {
+  readonly events: readonly PersistedAgentEvent[];
+  readonly recovery: EventRecoveryReport;
+}
+
+interface EventRecoveryReport {
+  readonly scannedLines: number;
+  readonly acceptedLines: number;
+  readonly ignoredLines: number;
+  readonly diagnostics: readonly EventRecoveryDiagnostic[];
+}
+
+type EventRecoveryDiagnosticCode =
+  | "invalid-json"
+  | "invalid-envelope"
+  | "unknown-event-kind"
+  | "oversized-line"
+  | "duplicate-event-id"
+  | "duplicate-sequence"
+  | "sequence-gap"
+  | "out-of-order"
+  | "unreadable";
+
+interface EventRecoveryDiagnostic {
+  readonly code: EventRecoveryDiagnosticCode;
+  readonly lineNumber?: number;
+}
+
+interface EventSnapshot {
+  readonly schemaVersion: 1;
+  readonly threadId: string;
+  readonly lastSequence: number;
+  readonly eventCount: number;
+  readonly generatedAt: number;
+  readonly state: EventProjection;
+}
+
+interface EventProjection {
+  readonly messages: readonly MessageProjection[];
+  readonly runs: readonly RunProjection[];
+  readonly toolActivities: readonly ToolActivityProjection[];
+  readonly latestError?: ErrorProjection;
+}
+
+interface MessageProjection {
+  readonly messageId: string;
+  readonly role: "user" | "assistant";
+  readonly text: string;
+  readonly complete: boolean;
+}
+
+interface RunProjection {
+  readonly runId: string;
+  readonly status: "running" | "completed" | "cancelled" | "failed";
+  readonly startedAt: number;
+  readonly completedAt?: number;
+}
+
+interface ToolActivityProjection {
+  readonly toolCallId: string;
+  readonly name: string;
+  readonly status: "queued" | "approval-required" | "running" | "succeeded" | "failed" | "cancelled";
+  readonly summary: string;
+}
+
+interface ErrorProjection {
+  readonly code: string;
+  readonly message: string;
+}
+```
+
+`appendBatch`は同一スレッドロック内でsequenceを連続採番し、検証またはサニタイズに失敗した場合はbatch全体を保存しない。追記成功の判定は行の書き込み完了と、可能な環境でのファイルハンドルflush／sync完了後とする。I/O途中で失敗した場合は、既にディスクへ到達した行を取り消すために上書きや再採番をせず、次回復元時に有効行だけを採用する。
+
+### 15.2.3 破損行の復元
+
+読み込みは行単位で行い、各行を独立してUTF-8、JSON構文、Envelope、schemaVersion、threadId、sequence、イベント種別、payloadの型とサイズの順に検証する。不正JSON、型不正、未知イベント、上限超過、末尾の不完全行はその行だけを無視し、後続行の復元を継続する。読み込み不能やディスクI/O障害は、破損行の部分復元とは異なる永続化エラーとして扱う。
+
+有効イベントは`sequence`昇順で返す。重複`eventId`は最初の有効行だけを採用し、重複`sequence`も最初の有効行だけを採用する。sequenceの欠番、ファイル上の逆順、重複は自動補正せず、行番号・分類・件数だけを`EventRecoveryReport`へ記録する。将来の追記sequenceは再採番せず、最大の有効sequenceの次から継続する。破損行を自動削除・自動修復してデータの証跡を失わせない。
+
+`read`の`afterSequence`は返却対象を絞るためだけの引数とし、破損・重複・欠番の検証は原則としてファイル全体を対象にする。復元診断には行本文、payload、ファイル内容、秘密情報を含めない。空ファイルと「有効行がすべて破損しているファイル」は診断上区別できるようにする。
+
+### 15.2.4 スナップショット
+
+一定件数の有効追記ごと（初期値100件、設定可能）に、イベントから安全な`EventProjection`を生成し、スレッドディレクトリの`snapshot.json`へ保存する。スナップショットはイベントの完全コピーではなく、表示メッセージ、Tool Activity要約、runごとの開始・終了・状態、最新の安全なエラー、最新sequenceを保持する派生状態である。本文と投影のサイズには上限を設け、超過分は要約またはArtifact参照へ置き換える。
+
+スナップショット作成は同一スレッドロック内で行い、一時ファイルへの書き込み後に同一ディレクトリ内で`rename`して原子的に公開する。スナップショット作成または置換に失敗しても、正常に追記された`events.jsonl`は成功として扱う。`snapshot.json`のschema、threadId、lastSequence、eventCount、stateを検証し、欠損・破損・未知schema・正本との不整合がある場合は信頼せず、`events.jsonl`の再生へフォールバックする。初期実装では、安全性を優先してスナップショット利用時も正本のsequence整合性を検証する。
+
+### 15.2.5 競合とサービス接続
+
+同一Extension Host内の並行追記はスレッド単位ロックで直列化し、追記直前に正本を再走査して最大sequenceを確認する。複数Extension Hostプロセスによる同一スレッド更新は初期スコープ外とし、将来必要になった時点でOSファイルロック等を設計する。Thread StoreのrevisionはEvent Storeのsequenceと統合せず、メタデータ競合と履歴追記の競合を別契約として扱う。
+
+`StorageService`はEvent StoreをExtension Host内の公開境界として生成・初期化・破棄する。Webviewには保存ファイルへのアクセス権を渡さず、UIへ渡すイベントは検証済みの安全な投影または要約だけにする。Provider Adapterはメッセージ変換とProvider Event正規化までを担当し、イベント保存・snapshot作成・破損復元を担当しない。
+
+### 15.2.6 実装単位と検証
+
+実装は`src/storage/event-store.ts`のEnvelope型、入力検証、追記、sequence採番、ロック、復元診断、snapshot検証、`src/storage/storage-service.ts`のライフサイクル接続、Agent Runtimeからの薄い永続化接続へ分割する。テストはUnit、Agent Simulation、Extension Integrationの層で構成し、実APIは使用しない。
+
+最低限、1回・batch追記後の再起動相当復元、sequence昇順、破損JSON、未知種別、型不正、末尾不完全行、重複eventId／sequence、欠番、逆順、snapshotのatomic更新と破損時フォールバック、I/O失敗時の旧正本保持、機密情報非保存を検証する。完了条件は、Agent実行履歴を`events.jsonl`へ追記し、Store再生成後も有効イベントを順序付きで取得できることである。
+
+## 15.3 会話アーティファクト保存
+
+Artifact Storeは、Tool Resultやコマンド出力のうち、会話履歴・モデル入力へ直接入れるには大きすぎるものを、検査済みのローカルアーティファクトとして保存するExtension Host側のStorageコンポーネントである。会話イベントの正本はEvent Storeに残し、`tool-result`イベントには本文を保存せず、安全な要約と`artifact://`参照IDだけを保存する。Artifact StoreはThread metadata、会話順序、ChangeSet、APIキーを管理しない。
+
+### 15.3.1 責務境界と保存フロー
+
+Artifact Storeへの入力は、Tool／Context層で次の処理を完了したものに限定する。
+
+1. ANSIエスケープシーケンスを除去する。
+2. APIキー、Authorization、環境変数、認証トークン、秘密らしい値をマスクする。
+3. バイナリかテキストかを判定する。
+4. 保存上限と正規化後のサイズを検査する。
+5. 大きい出力の場合だけ、完全な正規化済み出力をArtifact Storeへ保存する。
+6. 会話・モデル入力には要約、先頭／末尾の抜粋、終了状態、サイズ、参照IDだけを渡す。
+
+この順序は`SYW-CONTEXT-007`の正本である。文字数制限用の短縮結果をアーティファクトへ保存するのではなく、機密マスク後かつ表示上の短縮前の正規化済み出力を保存する。これにより会話を小さく保ちながら、保存された内容を後から検証できる。生のTool Result、コマンド文字列、cwd、環境変数、Provider生レスポンスはArtifact Storeへ渡さない。
+
+Artifact StoreはExtension Host内の`StorageService`からのみ利用する。Provider AdapterはProvider固有の変換とイベント正規化までを担当し、Tool Resultの圧縮、機密マスク、Artifact化、削除を担当しない。Webviewには保存先URI、ファイル権限、ファイルシステムAPIを渡さず、Hostが生成した安全なプレビューまたは参照状態だけを渡す。
+
+### 15.3.2 保存先とファイル形式
+
+```text
+globalStorage/
+└── threads/
+    └── <thread-id>/
+        └── artifacts/
+            └── <artifact-id>/
+                ├── meta.json
+                ├── content
+                └── chunks/       # 分割保存時だけ存在
+                    ├── 000000
+                    └── 000001
+```
+
+Artifact Storeが管理するのは`artifacts/`配下だけである。`meta.json`を公開済みアーティファクトの正本とし、`content`または`chunks/`を本文の保存先とする。SQLiteや単一の巨大JSONファイルは使用しない。
+
+```ts
+type ArtifactKind = "tool-result" | "command-output" | "diagnostic";
+type ArtifactEncoding = "utf-8" | "binary";
+
+interface ArtifactMetadata {
+  readonly schemaVersion: 1;
+  readonly artifactId: string;
+  readonly threadId: string;
+  readonly kind: ArtifactKind;
+  readonly mediaType: string;
+  readonly encoding: ArtifactEncoding;
+  readonly byteLength: number;
+  readonly chunkCount: number;
+  readonly contentHash: string;
+  readonly createdAt: number;
+}
+```
+
+メタデータには本文、コマンド、引数、パス、環境変数、秘密情報を含めない。`contentHash`は保存内容の整合性確認と重複診断に使うSHA-256値であり、秘密情報の保護や認証の根拠にはしない。テキストはUTF-8、バイナリは安全な検査済み入力に限るopaque bytesとして保存する。バイナリは自動的にMarkdownやモデル入力へ展開しない。
+
+作成はアーティファクト固有の一時ディレクトリへ内容を書き、flush可能な環境ではflush／syncし、内容を再検証してからメタデータを作成する。最後に一時ディレクトリを同一ファイルシステム上で公開名へrenameする。`meta.json`が最後に公開されるため、メタデータのない内容は参照対象にならない。既存の公開済みIDは上書きせず、作成途中で終了した一時ディレクトリ、メタデータのないディレクトリ、サイズ・ハッシュ不一致のディレクトリは起動時または`sweep`時に回収する。
+
+1アーティファクトが個別上限を超える場合は、チャンクに分けても保存せず、部分的な参照IDを発行しない。容量に収まらない場合の会話側の結果は、保存不能の安全な分類と要約にする。これにより、存在しない全文を参照できるかのような履歴を残さない。
+
+### 15.3.3 参照IDとArtifact Store契約
+
+```ts
+interface CreateArtifactInput {
+  readonly threadId: string;
+  readonly kind: ArtifactKind;
+  readonly mediaType: string;
+  readonly encoding: ArtifactEncoding;
+  readonly content: Uint8Array;
+  readonly leaseId?: string;
+}
+
+interface ArtifactReadOptions {
+  readonly offset?: number;
+  readonly limit?: number;
+  readonly expectedHash?: string;
+  readonly leaseId?: string;
+}
+
+interface ArtifactReadResult {
+  readonly metadata: ArtifactMetadata;
+  readonly offset: number;
+  readonly bytes: Uint8Array;
+  readonly complete: boolean;
+}
+
+interface ArtifactSweepReport {
+  readonly scanned: number;
+  readonly deleted: number;
+  readonly invalidated: number;
+  readonly bytesFreed: number;
+  readonly diagnostics: readonly ArtifactErrorCode[];
+}
+
+interface ArtifactStore {
+  create(input: CreateArtifactInput, signal?: AbortSignal): Promise<ArtifactRef>;
+  read(ref: string, options?: ArtifactReadOptions): Promise<ArtifactReadResult>;
+  stat(ref: string): Promise<ArtifactMetadata | undefined>;
+  delete(ref: string, reason: "eviction" | "thread-cleanup"): Promise<void>;
+  sweep(): Promise<ArtifactSweepReport>;
+}
+
+interface ArtifactRef {
+  readonly uri: `artifact://${string}/${string}`;
+  readonly artifactId: string;
+  readonly threadId: string;
+  readonly byteLength: number;
+  readonly mediaType: string;
+  readonly contentHash: string;
+}
+```
+
+正規形は`artifact://<thread-id>/<artifact-id>`とする。各識別子はStoreが生成または厳格に検証するURL-safeな値だけを許可する。query、fragment、追加path、`.`、`..`、制御文字、percent decode後のパス区切り、絶対パス、任意の`file:` URIは拒否する。URIを内部パスへ解決するときは`threadId`と要求コンテキストのスレッドを比較し、シンボリックリンク解決後も対象が`globalStorage/threads/<thread-id>/artifacts/`配下にあることを確認する。別スレッドの存在を推測できないよう、スレッド不一致と不存在は同じ`ARTIFACT_NOT_FOUND`として扱う。
+
+`read`は範囲付き読み取りを基本とし、既定の返却上限を設ける。全量を一度にメモリ、会話履歴、モデル入力へ展開しない。テキストはHost内でUTF-8として検証し、バイナリはメタデータとopaque bytesで返す。読み取り時の`expectedHash`が一致しない場合は破損として扱い、当該Artifactを無効化する。Artifact参照の解決と読み取りは、UIから直接行わず、Hostの現在スレッド・権限・サイズ制限を再検証する。
+
+### 15.3.4 容量設定と削除方針
+
+設定はユーザー設定または安全な既定値から解決する。ワークスペース内設定から保存先、機密検査、容量上限の安全側制約を上書きさせない。初期値と設定キーは次のとおりとする。
+
+| 設定 | 既定値 | 意味 |
+|---|---:|---|
+| `byokAgent.artifacts.maxTotalBytes` | 256 MiB | Extension全体の公開アーティファクト上限 |
+| `byokAgent.artifacts.maxThreadBytes` | 64 MiB | 1スレッドの公開アーティファクト上限 |
+| `byokAgent.artifacts.maxArtifactBytes` | 16 MiB | 1つの論理アーティファクト上限 |
+| `byokAgent.artifacts.chunkBytes` | 1 MiB | チャンク保存時の最大チャンクサイズ |
+| `byokAgent.artifacts.retentionDays` | 30日 | `createdAt`を基準にした期限 |
+| `byokAgent.artifacts.evictionPolicy` | `oldest-first` | 容量超過時の削除順 |
+
+設定値は正の整数、有限の期間、許可済み列挙値としてHostで検証する。`chunkBytes`は`maxArtifactBytes`以下、スレッド上限は個別上限以上、総容量はスレッド上限以上でなければならない。不正設定は安全な既定値へフォールバックし、設定値そのものをArtifact metadataやログへ保存しない。
+
+作成前に期限切れを削除し、容量不足ならleaseされていない公開済みArtifactを`createdAt`の古い順で削除して容量を確保する。期限切れ判定は作成日時だけで行い、読み取りで保持期限を延長しない。削除はArtifact単位で行い、メタデータを正しく検証できない場合も本文を会話へ戻さず、回収対象として診断する。期限切れ・容量削除はイベント履歴を削除しないため、過去の参照は安全な利用不可状態として表示する。
+
+実行中Runが作成または読み取り中のArtifactには短命なleaseを付ける。leaseはプロセス内状態に限定し、ファイルとして永続化しない。プロセス終了後に残るleaseは存在しないものとして扱う。作成処理は容量確保から公開まで同一のStorageロックで直列化し、並行作成が上限を超えないようにする。複数Extension Hostプロセスからの同一Storage更新は初期スコープ外とする。
+
+`sweep`は起動時、Artifact作成前、明示的なStorage管理処理で実行する。処理内容は期限切れの削除、孤児一時ディレクトリの回収、公開メタデータの検証、サイズ・ハッシュ不一致Artifactの無効化、容量集計の再構築とする。Sweep失敗で有効なEvent Storeや他のArtifactを削除してはならない。
+
+### 15.3.5 エラーと情報分離
+
+Artifact操作の内部分類は次の固定コードに写像する。
+
+```ts
+type ArtifactErrorCode =
+  | "ARTIFACT_INVALID_INPUT"
+  | "ARTIFACT_SENSITIVE_CONTENT"
+  | "ARTIFACT_QUOTA_EXCEEDED"
+  | "ARTIFACT_NOT_FOUND"
+  | "ARTIFACT_CORRUPTED"
+  | "ARTIFACT_IO_FAILED";
+```
+
+ユーザー向けには固定文言、モデル向けには再試行可否と要約、ログ向けにはthreadId、artifactId、種別、サイズ、分類、所要時間だけを渡す。ファイル本文、コマンド、cwd、env、URL全体、任意ヘッダー、Provider生レスポンス、秘密値、非公開推論はどの層にも渡さない。保存失敗時に参照IDを先にイベントへ書かず、公開成功後にだけ`tool-result`イベントを追記する。イベント追記が後から失敗した場合でも公開Artifactを無効な参照として残さないよう、履歴接続側は保存結果を受けてからイベントを作る。
+
+### 15.3.6 実装単位と検証
+
+実装時は、`src/storage/artifact-store.ts`に保存・参照・検証・容量・削除を置き、`src/storage/storage-service.ts`から生成・初期化・破棄する。Tool Result整形を担当するContextまたはTool境界で正規化と要約を行い、Agent Event変換境界で`artifactRef`を安全な`tool-result` payloadへ渡す。Provider AdapterへArtifact Store依存を追加しない。
+
+Unit Testでは、URI検証、同一スレッド境界、パストラバーサル拒否、正規化済みテキスト保存、バイナリ方針、atomic publish、再起動復元、範囲付きread、ハッシュ不一致、孤児回収、TTL、総容量・スレッド容量・個別上限、古い順削除、lease保護、I/O失敗、部分保存なしを検証する。Agent Simulationでは、巨大Tool Resultとコマンド出力が会話本文へ入らず、次のモデル入力に要約と参照IDだけが入り、参照取得が明示的な範囲で行われることを検証する。Extension Integrationでは、StorageService再生成後の復元、スレッド間分離、Webviewへ本文・保存先・ファイル権限が漏れないこと、設定変更とsweepを検証する。実APIテストは行わない。
+
+完了条件は、設定容量内の巨大出力を正規化済み完全出力として別ファイルへ保存し、保存成功後に発行した`artifact://`参照をHostから取得でき、会話履歴・モデル入力・UIへ巨大本文を直接渡さず、容量と削除方針を再起動後も一貫して適用できることである。APIキー、Authorization、生環境変数、認証トークン、Provider生レスポンス、非公開推論、未加工出力を保存しないことも必須とする。
+
+## 15.4 保存しないもの
 
 * APIキー
 * Authorizationヘッダー
@@ -3793,6 +4227,18 @@ interface ChangeSetManager {
 }
 ```
 
+```ts
+interface ArtifactStore {
+  create(input: CreateArtifactInput, signal?: AbortSignal): Promise<ArtifactRef>;
+  read(ref: string, options?: ArtifactReadOptions): Promise<ArtifactReadResult>;
+  stat(ref: string): Promise<ArtifactMetadata | undefined>;
+  delete(ref: string, reason: "eviction" | "thread-cleanup"): Promise<void>;
+  sweep(): Promise<ArtifactSweepReport>;
+}
+```
+
+`ArtifactStore`は長大なTool Resultやコマンド出力を会話イベントから分離するHost内の保存境界である。`CreateArtifactInput`は正規化・機密マスク済みのbytesだけを受け取り、URIの形式検証、スレッド所有権、サイズ・ハッシュ検証、atomic publish、容量・TTL・leaseによる削除を内部で行う。`read`は範囲付き取得を基本とし、Webview、Provider Adapter、SecretStorageへ保存先や本文を直接公開しない。
+
 ---
 
 ## 18. エラー分類
@@ -3860,6 +4306,11 @@ interface AgentError {
 * 権限判定
 * Patch Parser
 * 履歴要約
+* Artifact URIの形式・スレッド境界・パストラバーサル拒否
+* Artifactの正規化済み保存、ハッシュ検証、atomic publish、範囲付きread
+* 総容量・スレッド容量・個別上限・TTL・oldest-first削除・lease保護
+* 破損Artifact、孤児一時ディレクトリ、I/O失敗、容量超過時の部分保存なし
+* 機密情報・未加工Tool Result・保存先パスがArtifact metadata、Event、ログ、UIへ漏れないこと
 
 ### 19.2 Provider Contract Test
 
@@ -3917,6 +4368,8 @@ const scenario = [
 * キャンセルが全レイヤーへ伝播する
 * ChangeSet適用前にディスクが変化しない
 * 要約後も目的と未完了事項が保持される
+* 巨大Tool Result／コマンド出力が会話本文に保存されず、保存成功後の`artifact://`参照だけが履歴へ入る
+* Artifact参照の範囲付き読み取り、削除済み参照、別スレッド参照拒否が安全な結果になる
 
 ### 19.4 Extension Integration Test
 
@@ -3932,6 +4385,7 @@ const scenario = [
 * Remote Development環境
 * 複数ルートワークスペース
 * VS Code再起動後のスレッド復元
+* Artifact Storeの再生成後のアーティファクト復元、容量設定、TTL／削除方針、Webview向け安全なプレビュー
 
 ---
 

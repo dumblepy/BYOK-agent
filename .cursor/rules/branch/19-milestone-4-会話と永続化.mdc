@@ -1,0 +1,158 @@
+---
+description: 19-milestone-4-会話と永続化ブランチでのスレッドタイトル設計・実装時に読み込む
+alwaysApply: false
+---
+# Milestone 4: スレッドタイトル生成
+
+このブランチでは、会話の最初のユーザーメッセージから識別可能な仮タイトルを作り、Thread Storeへ安全に保存する。タイトルはユーザーが編集でき、LLMによる自動命名は明示的な任意設定が有効な場合だけ行う。
+
+## 実装方針
+
+- Thread Storeはタイトルの正本とrevisionを管理する。WebviewはThread Summaryを表示し、ファイルシステムや保存先へ直接アクセスしない。
+- 最初の`user-message`イベントが永続化された後、Extension Hostのタイトルサービスがローカルで仮タイトルを生成する。タイトル生成は冪等にし、最初のユーザーメッセージ以外で仮タイトルを上書きしない。
+- タイトル候補は制御文字、改行、Markdown記法、過剰な空白、既知の機密パターンを正規化・マスクしてから保存する。本文全文を`meta.json`へ複製しない。
+- ユーザーの明示的なrenameは`expectedRevision`付きで保存し、成功時にタイトルの出所を`user`へ固定する。以後、仮タイトルやLLMタイトルがユーザー名を上書きしてはならない。
+- LLM自動命名はユーザー設定`byokAgent.threadTitle.autoNaming`（既定`false`）だけで有効化する。設定が無効、モデル未選択、Provider不通、キャンセル、機密検査失敗の場合は仮タイトルを維持し、メッセージ送信やスレッド保存を失敗扱いにしない。
+- LLMへ渡すのはタイトル生成用に正規化した最初のユーザーメッセージだけとし、Tool定義、Tool Result、ファイル内容、秘密情報、会話履歴全体を渡さない。Provider Adapterはタイトルの判断や保存を担当しない。
+- スレッド一覧はHostから検証済みの`ThreadSummary`として取得し、`title`、`updatedAt`、`revision`を表示する。空タイトルは許可せず、一覧上は安全な既定文言で補完する。
+
+## 進捗
+
+- [x] `ThreadRecord`のタイトル出所、仮タイトル生成、LLM任意設定の契約を確定する
+- [x] 最初のユーザーメッセージから仮タイトルを生成して保存する処理を実装する
+- [x] Thread Storeのrename APIとrevision競合処理を実装する
+- [x] スレッド一覧のHost／Webview通信と表示を実装する
+- [x] 任意設定が有効な場合のLLM自動命名Portを実装する
+- [x] タイトル生成、手動編集、一覧復元、競合、機密マスクのテストを追加する
+- [x] `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`を実行する
+
+## 参考資料
+
+- `documents/issues.md` — Milestone 4「スレッドタイトル生成を実装する」の要求と完了条件
+- `documents/design.md` §14.1〜§14.3 — ヘッダー、スレッド表示、Webview通信
+- `documents/design.md` §15.1 — Thread Store、`meta.json`、revision競合、一覧復元
+- `documents/design.md` §15.2 — 最初のユーザーメッセージを確定するEvent Store
+- `documents/design.md` §16〜§19 — セキュリティ、エラー分離、テスト設計
+- `.cursor/rules/project.mdc` — `SYW-STORAGE-001`〜`003`、`SYW-UI-003`、`SYW-SEC-004`
+- `src/storage/thread-store.ts` — 現行のThread Store契約とタイトル検証
+- `src/storage/event-store.ts` — `user-message`イベントの永続化と復元
+- `src/ui/webview-protocol.ts` — 現行のZodベース通信契約
+
+## 調査結果・設計まとめ
+
+### 現状と変更範囲
+
+実装前のThread Storeは`meta.json`に`title`を保存し、既定値`新しいスレッド`とrevision付き更新を提供していた。一方、Webview通信にはThread一覧、選択、renameの専用メッセージがなかったため、既存のファイル形式とStorage境界を維持しながら、タイトルの出所、生成フロー、一覧プロトコルを追加した。Provider層は認証管理まででタイトル生成APIを持たないため、LLM命名は`TitleGenerationPort`を注入する境界まで実装し、既存のProviderネットワーク処理を無理に再実装していない。
+
+### データモデル
+
+```ts
+type ThreadTitleSource = "default" | "provisional" | "llm" | "user";
+
+interface ThreadRecord {
+  readonly id: string;
+  readonly title: string;
+  readonly titleSource: ThreadTitleSource;
+  readonly revision: number;
+  readonly updatedAt: number;
+  // workspaceId、modelId、permissionProfile、createdAt、archivedは既存契約を維持する
+}
+```
+
+`titleSource`は同じ`meta.json`へ保存する。新規スレッドは`default`、最初のユーザーメッセージから作った仮タイトルは`provisional`、任意設定による採用済みLLMタイトルは`llm`、手動編集済みタイトルは`user`とする。既存メタデータにこのフィールドがない場合、タイトルが既定文言なら`default`、それ以外は安全側に`user`として復元し、自動命名による上書きを防ぐ。
+
+タイトルは保存時に前後空白を除去し、改行・制御文字を空白へ正規化する。保存上限は既存の200文字を維持し、仮タイトルとLLMタイトルの表示上限は60 Unicode code pointsを目安とする。タイトル候補が空、マスク後に空、または不正な場合は`新しいスレッド`へ戻す。タイトルはUI表示専用のテキストとして扱い、HTML、URI、Command URI、ログテンプレートへ展開しない。
+
+### 仮タイトル生成
+
+タイトル生成は純粋関数として分離し、LLMやファイルI/Oへ依存させない。
+
+```ts
+interface ProvisionalTitleGenerator {
+  fromFirstUserMessage(text: string): string;
+}
+```
+
+処理順は、改行・制御文字の正規化、Markdownコードフェンス等の表示ノイズ除去、機密パターンのマスク、空白の圧縮、先頭からのUnicode単位での切り詰め、空値時の既定文言とする。省略記号は上限内に収め、同じ入力から常に同じタイトルを得られるようにする。原文は`meta.json`へ保存しない。
+
+最初の`user-message`をEvent Storeへ追記した後、タイトルサービスがThread Storeの現在の`titleSource`を確認する。`default`の場合だけ仮タイトルを保存する。すでに`provisional`、`llm`、`user`であれば何もしない。保存に失敗してもユーザーメッセージイベントは失わず、次回の一覧復元または明示的な再同期で再計算できるようにする。
+
+### ユーザー編集
+
+ユーザー編集はタイトル入力欄またはスレッド一覧の編集操作からHostへ送る。UIの表示変更だけで確定させず、HostがスレッドID、タイトル長、制御文字、現在revision、対象スレッドの存在を再検証する。空文字は一覧の識別性を損なうため拒否し、保存済みタイトルを暗黙に既定値へ戻さない。
+
+```ts
+interface RenameThreadRequest {
+  readonly threadId: string;
+  readonly title: string;
+  readonly expectedThreadRevision: number;
+}
+```
+
+保存はatomic renameで行い、成功時にrevisionを1増やし、`titleSource: "user"`へ遷移する。revision競合時は上書きせず、最新のThread Summaryを返してUIへ再編集を要求する。ユーザーが現在のタイトルと同じ文字列を保存した場合も`user`へ固定し、保護の意図を維持する。
+
+### LLM自動命名
+
+設定はユーザー設定の`byokAgent.threadTitle.autoNaming`のみを入力とし、既定値は`false`とする。ワークスペース設定や会話イベントから暗黙に有効化しない。設定が有効なとき、仮タイトル保存後に非同期の単発処理として自動命名を試みる。
+
+```ts
+interface ThreadTitleSettings {
+  readonly autoNaming: boolean;
+}
+
+interface TitleGenerationPort {
+  generate(input: {
+    readonly text: string;
+    readonly modelId: string;
+    readonly signal: AbortSignal;
+  }): Promise<string>;
+}
+```
+
+生成要求はタイトル専用の短いプロンプト、Toolなし、出力長上限付きとし、正規化済み本文以外のコンテキストを含めない。Providerの生レスポンス、プロンプト、失敗理由は`meta.json`、イベント、ログへ保存しない。LLM結果は仮タイトルがまだ有効であること、revisionが期待値と一致すること、`titleSource`が`provisional`であることを再確認してから`llm`として保存する。自動命名中にユーザーが編集した場合は、ユーザータイトルを優先し、LLM結果を破棄する。
+
+自動命名の失敗・タイムアウト・キャンセル・モデル未選択・Provider未設定は、スレッド作成やメッセージ送信を失敗させない。仮タイトルはそのまま一覧に表示する。LLMタイトルを再生成する操作や自動再試行は本Issueの対象外とし、必要になった時点で別途設計する。
+
+### 一覧表示と通信
+
+一覧の正本はHostの`ThreadStore.list({ includeArchived: false })`とし、既存の`updatedAt`降順、`createdAt`降順、ID昇順の決定的な順序を維持する。Webviewへ渡す一覧要素は次の表示用投影とする。
+
+```ts
+interface ThreadSummary {
+  readonly id: string;
+  readonly title: string;
+  readonly revision: number;
+  readonly updatedAt: number;
+  readonly archived: boolean;
+}
+```
+
+追加する通信は、UIからの`request-thread-list`、`select-thread`、`rename-thread`、Hostからの`thread-list`を基本とする。すべて既存EnvelopeとZod判別共用体を使用し、renameには`expectedThreadRevision`を必須にする。Hostは一覧要求、rename成功、タイトル生成完了、スレッド作成後に最新の`thread-list`を送る。スレッド選択後は対象の`thread-snapshot`、モデル、権限状態を同じスレッドIDで返す。Webviewは現在表示中でないスレッドの更新を現在画面へ適用しない。
+
+一覧にはタイトルだけでなく、タイトルが欠落・空の場合の既定表示、更新時刻、選択状態を安全に表示する。タイトル文字列をHTMLやリンクとして解釈せず、一覧上で識別できることを完了条件とする。
+
+### 実装単位と検証方針
+
+実装時は次の単位へ分ける。
+
+- `src/storage/thread-title.ts`: タイトル出所、候補の正規化、仮タイトル生成、LLM結果の採用条件
+- `src/storage/thread-store.ts`: `titleSource`、rename、生成タイトル更新、revision競合、旧`meta.json`移行
+- `src/storage/storage-service.ts`または会話書き込み境界: 最初の`user-message`追記後のタイトル処理の接続
+- `src/ui/webview-protocol.ts`、`src/ui/extension-webview-protocol.ts`: 一覧、選択、renameの検証済み通信
+- `src/ui/webview/`、`src/ui/main.tsx`: Thread Summary一覧、タイトル編集、競合時の再同期
+- `tests/unit/thread-title.test.ts`: 正規化、機密マスク、Unicode切り詰め、空値、冪等性
+- `tests/unit/thread-store.test.ts`: `titleSource`、rename、生成タイトルの保護、旧形式復元、revision競合、atomic write
+- `tests/unit/webview-protocol.test.ts`: 一覧、選択、renameのpayload上限、未知フィールド、revision検証
+- `tests/agent-simulation/`またはStorage統合テスト: 最初のユーザーメッセージ、LLM成功・失敗、手動renameとの競合
+- `tests/extension-integration/`: 再起動後の一覧表示、Webview再表示、スレッド切り替え、タイトル漏えい防止
+
+実API、実ワークスペースの秘密情報、環境変数はテストに使用しない。タイトル生成Port、時計、UUID、ファイルシステム、ProviderをFakeに差し替え、LLMが無効な場合も同じ仮タイトルで検証可能にする。
+
+### 完了条件
+
+1. 最初のユーザーメッセージを保存したスレッドに、再起動後も同一の識別可能な仮タイトルが表示される。
+2. ユーザーがタイトルを編集・保存でき、保存後に仮タイトルやLLM結果で上書きされない。
+3. `byokAgent.threadTitle.autoNaming`が既定で無効で、明示的に有効化した場合だけLLM命名を試行できる。
+4. LLMの失敗、キャンセル、設定無効、revision競合がメッセージ送信や既存タイトルを壊さず、仮タイトルまたはユーザータイトルを維持する。
+5. Thread Storeから復元した一覧をHost経由でWebviewへ渡し、各スレッドをタイトルで識別・選択できる。
+6. タイトル、LLM要求、ログ、通信にAPIキー、Authorization、生環境変数、認証トークン、未加工の機密本文を追加保存・出力しない。

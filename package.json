@@ -20,6 +20,55 @@
   ],
   "main": "./out/extension/extension.js",
   "contributes": {
+    "configuration": {
+      "title": "BYOK Agent",
+      "properties": {
+        "byokAgent.artifacts.maxTotalBytes": {
+          "type": "number",
+          "default": 268435456,
+          "minimum": 1,
+          "description": "会話アーティファクトのExtension全体容量（bytes）。"
+        },
+        "byokAgent.artifacts.maxThreadBytes": {
+          "type": "number",
+          "default": 67108864,
+          "minimum": 1,
+          "description": "1スレッドあたりの会話アーティファクト容量（bytes）。"
+        },
+        "byokAgent.artifacts.maxArtifactBytes": {
+          "type": "number",
+          "default": 16777216,
+          "minimum": 1,
+          "description": "1つの会話アーティファクトの最大容量（bytes）。"
+        },
+        "byokAgent.artifacts.chunkBytes": {
+          "type": "number",
+          "default": 1048576,
+          "minimum": 1,
+          "description": "分割保存時の1チャンクの最大容量（bytes）。"
+        },
+        "byokAgent.artifacts.retentionDays": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "会話アーティファクトの保持日数。"
+        },
+        "byokAgent.artifacts.evictionPolicy": {
+          "type": "string",
+          "enum": [
+            "oldest-first"
+          ],
+          "default": "oldest-first",
+          "description": "容量超過時の会話アーティファクト削除方針。"
+        },
+        "byokAgent.threadTitle.autoNaming": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "最初のユーザーメッセージをLLMへ渡してスレッドタイトルを自動生成する。"
+        }
+      }
+    },
     "commands": [
       {
         "command": "byokAgent.setApiKey",
