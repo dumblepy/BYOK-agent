@@ -170,7 +170,7 @@ describe("Webview protocol schemas", () => {
     ).toBeUndefined();
   });
 
-  it("validates thread list, selection, and rename messages", () => {
+  it("validates thread list, creation, selection, and rename messages", () => {
     const list = createExtensionToUiMessage("thread-list", {
       threads: [
         {
@@ -184,6 +184,7 @@ describe("Webview protocol schemas", () => {
       selectedThreadId: "thread-1",
     });
     const select = createUiToExtensionMessage("select-thread", { threadId: "thread-1" });
+    const create = createUiToExtensionMessage("create-thread", {});
     const rename = createUiToExtensionMessage("rename-thread", {
       threadId: "thread-1",
       title: "新しいタイトル",
@@ -192,6 +193,7 @@ describe("Webview protocol schemas", () => {
 
     expect(parseExtensionToUiMessage(list)).toEqual(list);
     expect(parseUiToExtensionMessage(select)).toEqual(select);
+    expect(parseUiToExtensionMessage(create)).toEqual(create);
     expect(parseUiToExtensionMessage(rename)).toEqual(rename);
     expect(
       parseUiToExtensionMessage({

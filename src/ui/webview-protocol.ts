@@ -331,6 +331,7 @@ export const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
       .strict(),
   ),
   messageSchema("request-thread-list", z.object({}).strict()),
+  messageSchema("create-thread", z.object({}).strict()),
   messageSchema(
     "select-thread",
     z
@@ -367,6 +368,7 @@ export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
       .object({
         threadId: identifierSchema,
         revision: z.number().int().nonnegative(),
+        eventSequence: z.number().int().nonnegative().optional(),
         events: z.array(threadEventSchema).max(1_000),
       })
       .strict(),

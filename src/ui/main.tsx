@@ -65,6 +65,7 @@ function App() {
     INITIAL_PROVIDER_CREDENTIAL_STATE,
   );
   const [threadList, setThreadList] = useState<readonly ThreadSummary[]>([]);
+  const [isThreadListOpen, setIsThreadListOpen] = useState(false);
   const modelSelectionRequestIdRef = useRef<string | undefined>(undefined);
   const permissionSelectionRequestIdRef = useRef<string | undefined>(undefined);
   const snapshotThreadIdRef = useRef(DEFAULT_THREAD_ID);
@@ -87,6 +88,7 @@ function App() {
             dispatchThread({
               type: "replace-snapshot",
               revision: message.payload.revision,
+              eventSequence: message.payload.eventSequence,
               events: message.payload.events,
             });
           } else if (message.type === "thread-list") {
@@ -208,6 +210,7 @@ function App() {
 
   const handleThreadSelect = (threadId: string): void => {
     if (threadId === snapshotThreadIdRef.current) return;
+    setIsThreadListOpen(false);
     try {
       protocolClient.send("select-thread", { threadId });
     } catch {
@@ -229,6 +232,18 @@ function App() {
       dispatchComposer({
         type: "error",
         message: "タイトル変更要求を送信できませんでした。",
+      });
+    }
+  };
+
+  const handleNewThread = (): void => {
+    setIsThreadListOpen(false);
+    try {
+      protocolClient.send("create-thread", {});
+    } catch {
+      dispatchComposer({
+        type: "error",
+        message: "新しいスレッドを作成できませんでした。",
       });
     }
   };
@@ -380,18 +395,35 @@ function App() {
   return (
     <main class="agent-shell">
       <header class="agent-header">
-        <div>
-          <p class="eyebrow">BYOK CODING AGENT</p>
-          <h1>Agent</h1>
-        </div>
-        <span class="status" aria-label="準備完了">
-          Ready
-        </span>
+        <span class="agent-header-spacer" aria-hidden="true" />
+        <nav class="agent-header-actions" aria-label="スレッド操作">
+          <button
+            type="button"
+            class={`agent-header-button ${isThreadListOpen ? "is-active" : ""}`}
+            aria-label="スレッド履歴を表示"
+            aria-expanded={isThreadListOpen}
+            onClick={() => setIsThreadListOpen((open) => !open)}
+          >
+            <i class="codicon codicon-history" aria-hidden="true" />
+          </button>
+          <button type="button" class="agent-header-button" aria-label="設定">
+            <i class="codicon codicon-settings-gear" aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            class="agent-header-button"
+            aria-label="新しいスレッド"
+            onClick={handleNewThread}
+          >
+            <i class="codicon codicon-edit" aria-hidden="true" />
+          </button>
+        </nav>
       </header>
 
       <ThreadList
         threads={threadList}
         selectedThreadId={snapshotThreadIdRef.current}
+        open={isThreadListOpen}
         onSelect={handleThreadSelect}
         onRename={handleThreadRename}
       />

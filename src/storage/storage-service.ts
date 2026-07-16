@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 import type { Uri } from "vscode";
 
 import { DisposableStore, ManagedService } from "../extension/service-lifecycle";
@@ -46,10 +49,15 @@ export interface StorageService extends ManagedService, ThreadModelStore, Thread
 }
 
 export interface StorageServiceDependencies {
+  /** Kept for activation compatibility; conversation data uses the user-global root below. */
   readonly globalStorageUri: Uri;
+  /** Test/integration override. Production callers should omit this. */
+  readonly rootPath?: string;
   readonly artifactOptions?: Omit<ArtifactStoreOptions, "rootPath">;
   readonly threadTitleOptions?: ThreadTitleServiceOptions;
 }
+
+export const DEFAULT_STORAGE_DIRECTORY = ".byok-agent";
 
 /** Lifecycle boundary for JSONL conversation and file-based artifact storage. */
 export class DefaultStorageService extends ManagedService implements StorageService {
@@ -62,20 +70,20 @@ export class DefaultStorageService extends ManagedService implements StorageServ
   private readonly threadTitleService: ThreadTitleService;
   public readonly artifacts: FileArtifactStore;
 
-  public constructor(private readonly dependencies: StorageServiceDependencies) {
+  public constructor(dependencies: StorageServiceDependencies) {
     super();
-    const modelStore = new FileThreadModelStore(
-      getThreadModelStoreFileSystem(dependencies.globalStorageUri),
-    );
+    const rootPath = dependencies.rootPath ?? getDefaultStorageRootPath();
+    const fileSystem: ThreadModelStoreFileSystem = { rootPath };
+    const modelStore = new FileThreadModelStore(fileSystem);
     this.threadModelStore = modelStore;
     this.threadStore = modelStore.threadStore;
-    this.eventStore = new FileEventStore(getEventStoreFileSystem(dependencies.globalStorageUri));
+    this.eventStore = new FileEventStore({ rootPath });
     this.threadTitleService = new ThreadTitleService(this.threadStore, {
       ...dependencies.threadTitleOptions,
     });
     this.artifacts = new FileArtifactStore({
       ...dependencies.artifactOptions,
-      rootPath: getRootPath(dependencies.globalStorageUri),
+      rootPath,
     });
   }
 
@@ -227,17 +235,6 @@ function isTextPayload(value: unknown): value is { readonly text: string } {
   );
 }
 
-function getThreadModelStoreFileSystem(globalStorageUri: Uri): ThreadModelStoreFileSystem {
-  const rootPath = getRootPath(globalStorageUri);
-  return rootPath ? { rootPath } : {};
-}
-
-function getEventStoreFileSystem(globalStorageUri: Uri): { readonly rootPath?: string } {
-  const rootPath = getRootPath(globalStorageUri);
-  return rootPath ? { rootPath } : {};
-}
-
-function getRootPath(globalStorageUri: Uri): string | undefined {
-  const rootPath = (globalStorageUri as Uri & { readonly fsPath?: unknown }).fsPath;
-  return typeof rootPath === "string" ? rootPath : undefined;
+export function getDefaultStorageRootPath(): string {
+  return join(homedir(), DEFAULT_STORAGE_DIRECTORY);
 }

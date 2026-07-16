@@ -172,6 +172,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       return;
     }
 
+    if (message.type === "create-thread") {
+      await this.handleCreateThread(message, protocolSession);
+      return;
+    }
+
     if (message.type !== "send-message") {
       // Agent execution and cancellation are connected by the Agent Runtime task.
       return;
@@ -336,6 +341,35 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async handleCreateThread(
+    message: Extract<UiToExtensionMessage, { type: "create-thread" }>,
+    protocolSession: ExtensionWebviewProtocolSession,
+  ): Promise<void> {
+    if (!this.storage) {
+      await this.sendModelError(
+        protocolSession,
+        "TOOL_EXECUTION_FAILED",
+        "新しいスレッドを作成できません。",
+        message.messageId,
+      );
+      return;
+    }
+
+    try {
+      const thread = await this.storage.create();
+      this.activeThreadId = thread.id;
+      await protocolSession.sendThreadList(message.messageId);
+      await protocolSession.sendThreadSnapshotForSelection(thread.id, message.messageId);
+    } catch {
+      await this.sendModelError(
+        protocolSession,
+        "TOOL_EXECUTION_FAILED",
+        "新しいスレッドを作成できません。再試行してください。",
+        message.messageId,
+      );
+    }
+  }
+
   private async getThreadList() {
     if (!this.storage) return [];
     await this.storage.getThreadModelState(DEFAULT_THREAD_ID);
@@ -350,7 +384,9 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
   }
 
   private async getThreadSnapshot(threadId: string) {
-    if (!this.storage) return { revision: 0, events: [] as readonly ThreadEvent[] };
+    if (!this.storage) {
+      return { revision: 0, eventSequence: 0, events: [] as readonly ThreadEvent[] };
+    }
     const state = await this.storage.getThreadModelState(threadId);
     const result = await this.storage.read(threadId);
     const events: ThreadEvent[] = result.events.flatMap((event): ThreadEvent[] => {
@@ -376,7 +412,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
             },
           ];
     });
-    return { revision: state.revision, events };
+    return {
+      revision: state.revision,
+      eventSequence: result.events.at(-1)?.sequence ?? 0,
+      events,
+    };
   }
 
   private async handleSelectModel(

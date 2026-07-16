@@ -6,6 +6,7 @@ import type { ThreadSummary } from "../../webview-protocol";
 export interface ThreadListProps {
   readonly threads: readonly ThreadSummary[];
   readonly selectedThreadId: string;
+  readonly open: boolean;
   readonly onSelect: (threadId: string) => void;
   readonly onRename: (threadId: string, title: string, revision: number) => void;
 }
@@ -13,6 +14,7 @@ export interface ThreadListProps {
 export function ThreadList({
   threads,
   selectedThreadId,
+  open,
   onSelect,
   onRename,
 }: ThreadListProps): JSX.Element {
@@ -35,6 +37,8 @@ export function ThreadList({
     onRename(thread.id, title, thread.revision);
     setEditingId(undefined);
   };
+
+  if (!open) return <></>;
 
   return (
     <section class="thread-list" aria-label="スレッド一覧">

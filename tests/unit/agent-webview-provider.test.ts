@@ -1,4 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const vscodeMock = vi.hoisted(() => ({
   Uri: {
@@ -13,6 +16,7 @@ vi.mock("vscode", () => vscodeMock);
 
 import { AgentWebviewProvider } from "../../src/ui/agent-webview-provider";
 import { ConfiguredModelCatalog, StaticModelCatalog } from "../../src/models/model-catalog";
+import { DefaultStorageService } from "../../src/storage/storage-service";
 import { FileThreadModelStore } from "../../src/storage/thread-model-store";
 import { createUiToExtensionMessage } from "../../src/ui/webview-protocol";
 
@@ -145,6 +149,44 @@ describe("AgentWebviewProvider", () => {
         },
       }),
     );
+  });
+
+  it("creates and selects a new thread from the create-thread action", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "byok-agent-webview-"));
+    const storage = new DefaultStorageService({
+      globalStorageUri: {} as never,
+      rootPath,
+    });
+    await storage.initialize();
+    const provider = new AgentWebviewProvider(
+      {
+        extensionUri: { path: "/extension" },
+      } as never,
+      { storage },
+    );
+    const view = createWebviewView();
+    provider.resolveWebviewView(view as never);
+
+    const message = createUiToExtensionMessage("create-thread", {});
+    view.emit(message);
+    await vi.waitFor(async () => {
+      expect(await storage.list()).toHaveLength(2);
+    });
+
+    const threads = await storage.list();
+    expect(threads).toHaveLength(2);
+    const createdThread = threads.find((thread) => thread.id !== "default");
+    expect(createdThread).toBeDefined();
+    expect(view.sent).toContainEqual(
+      expect.objectContaining({
+        type: "thread-snapshot",
+        correlationId: message.messageId,
+        payload: expect.objectContaining({ threadId: createdThread?.id, events: [] }),
+      }),
+    );
+
+    await storage.dispose();
+    await rm(rootPath, { recursive: true, force: true });
   });
 
   it("lists models, persists a thread selection, and rejects stale selections", async () => {
