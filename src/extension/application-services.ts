@@ -37,6 +37,7 @@ const defaultFactories: ApplicationServiceFactories = {
     new DefaultStorageService({
       globalStorageUri: context.globalStorageUri,
       artifactOptions: getGlobalArtifactOptions(),
+      threadTitleOptions: getGlobalThreadTitleOptions(),
     }),
   agent: (dependencies) => new DefaultAgentService(dependencies),
   ui: (dependencies) => new DefaultUIService(dependencies),
@@ -62,6 +63,19 @@ function getGlobalArtifactOptions(): NonNullable<
     chunkBytes: inspect<number>("chunkBytes"),
     retentionDays: inspect<number>("retentionDays"),
     evictionPolicy: inspect<"oldest-first">("evictionPolicy"),
+  };
+}
+
+function getGlobalThreadTitleOptions(): NonNullable<
+  ConstructorParameters<typeof DefaultStorageService>[0]["threadTitleOptions"]
+> {
+  const configuration = vscode.workspace.getConfiguration("byokAgent.threadTitle");
+  const inspected =
+    typeof configuration.inspect === "function"
+      ? configuration.inspect<boolean>("autoNaming")
+      : undefined;
+  return {
+    autoNaming: inspected?.globalValue ?? false,
   };
 }
 

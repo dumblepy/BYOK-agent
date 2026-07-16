@@ -1,180 +1,158 @@
 ---
-description: 19-milestone-4-会話と永続化ブランチでの開発時に読み込む
+description: 19-milestone-4-会話と永続化ブランチでのスレッドタイトル設計・実装時に読み込む
 alwaysApply: false
 ---
-# Milestone 4: 会話アーティファクト保存
+# Milestone 4: スレッドタイトル生成
 
-このブランチでは、長大なTool Resultやコマンド出力を会話履歴の本文から分離し、Extension Host内のファイルへ安全に保存して参照できるアーティファクト保存機構を設計・実装する。
+このブランチでは、会話の最初のユーザーメッセージから識別可能な仮タイトルを作り、Thread Storeへ安全に保存する。タイトルはユーザーが編集でき、LLMによる自動命名は明示的な任意設定が有効な場合だけ行う。
 
 ## 実装方針
 
-- Artifact StoreはExtension Host側の`StorageService`からだけ利用する。Webview、Provider Adapter、Tool実装、SecretStorageは保存ファイルへ直接アクセスしない。
-- SQLiteは使用しない。正本はスレッド配下の`artifacts/<artifact-id>/meta.json`と`content`または`chunks/`で構成し、イベント履歴には安全な要約と`artifact://`参照IDだけを保存する。
-- アーティファクトは、ANSI除去、機密マスク、バイナリ判定、安全なサイズ検査を経た正規化済み出力だけを保存する。生のTool Result、コマンド出力、Providerレスポンス、環境変数は永続化しない。
-- 参照IDは`artifact://<thread-id>/<artifact-id>`に固定する。参照IDをパスとして直接連結せず、形式・所有スレッド・存在・メタデータを検証してから内部パスへ解決する。
-- 生成は一時ファイルへの書き込み、内容の検証、メタデータの作成、同一ディレクトリ内のrenameの順に行う。メタデータを最後に公開し、途中終了した不完全アーティファクトは起動時に検出して回収する。
-- 容量制限は総容量、スレッド単位容量、1アーティファクト上限、チャンクサイズで定義する。保存前に期限切れ・未固定の古いアーティファクトを削除し、容量を確保できない場合は部分保存せず、会話には安全な要約と保存失敗分類だけを残す。
-- 既定の削除方針は期限切れを優先し、次に作成日時の古いものから削除する。実行中Runが参照中のアーティファクトはleaseで固定し、削除対象から除外する。履歴イベントは削除せず、参照先が消えた場合は`artifact-unavailable`として扱う。
-- テキストは完全な正規化済み出力を保存し、会話・モデル入力へは要約、先頭末尾の抜粋、サイズ、終了状態、参照IDだけを渡す。モデルやUIが全文を必要とする場合は、Hostの範囲付きread APIを介して取得する。
-- バイナリや機密を安全に検査できない出力は既定で保存しない。保存を許可するToolは安全な媒体種別と機密検査済みであることを明示し、UI・モデルには内容を展開せずメタデータだけを返す。
-- Artifact StoreはAgent RuntimeとContext Managerの間の保存境界として接続する。Provider AdapterはArtifact Storeを知らず、Event Storeはアーティファクト本文を解釈しない。
+- Thread Storeはタイトルの正本とrevisionを管理する。WebviewはThread Summaryを表示し、ファイルシステムや保存先へ直接アクセスしない。
+- 最初の`user-message`イベントが永続化された後、Extension Hostのタイトルサービスがローカルで仮タイトルを生成する。タイトル生成は冪等にし、最初のユーザーメッセージ以外で仮タイトルを上書きしない。
+- タイトル候補は制御文字、改行、Markdown記法、過剰な空白、既知の機密パターンを正規化・マスクしてから保存する。本文全文を`meta.json`へ複製しない。
+- ユーザーの明示的なrenameは`expectedRevision`付きで保存し、成功時にタイトルの出所を`user`へ固定する。以後、仮タイトルやLLMタイトルがユーザー名を上書きしてはならない。
+- LLM自動命名はユーザー設定`byokAgent.threadTitle.autoNaming`（既定`false`）だけで有効化する。設定が無効、モデル未選択、Provider不通、キャンセル、機密検査失敗の場合は仮タイトルを維持し、メッセージ送信やスレッド保存を失敗扱いにしない。
+- LLMへ渡すのはタイトル生成用に正規化した最初のユーザーメッセージだけとし、Tool定義、Tool Result、ファイル内容、秘密情報、会話履歴全体を渡さない。Provider Adapterはタイトルの判断や保存を担当しない。
+- スレッド一覧はHostから検証済みの`ThreadSummary`として取得し、`title`、`updatedAt`、`revision`を表示する。空タイトルは許可せず、一覧上は安全な既定文言で補完する。
 
 ## 進捗
 
-- [x] `ArtifactStore`、`ArtifactRef`、メタデータ、保存・取得・削除エラーの契約を確定する
-- [x] `globalStorage/threads/<thread-id>/artifacts/`のファイル形式、atomic publish、起動時回収を実装する
-- [x] Tool Result／コマンド出力の正規化、機密マスク、要約、参照ID生成の接続点を実装する
-- [x] 総容量・スレッド容量・個別上限・TTL・削除方針・leaseの設定を実装する
-- [x] Artifact URIの範囲付き参照、認可、UI／モデル向けの安全な公開境界を実装する
-- [x] Unit、Agent Simulation、Extension Integration Testを追加する
+- [x] `ThreadRecord`のタイトル出所、仮タイトル生成、LLM任意設定の契約を確定する
+- [x] 最初のユーザーメッセージから仮タイトルを生成して保存する処理を実装する
+- [x] Thread Storeのrename APIとrevision競合処理を実装する
+- [x] スレッド一覧のHost／Webview通信と表示を実装する
+- [x] 任意設定が有効な場合のLLM自動命名Portを実装する
+- [x] タイトル生成、手動編集、一覧復元、競合、機密マスクのテストを追加する
 - [x] `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`を実行する
 
 ## 参考資料
 
-- `documents/issues.md` — Milestone 4「会話アーティファクト保存機構を実装する」の要求と完了条件
-- `documents/design.md` §8.6 — Tool Resultの圧縮順序と`artifact://`参照の既存方針
-- `documents/design.md` §15.1〜§15.2 — Thread Store、Event Store、保存先レイアウトと責務境界
-- `documents/design.md` §15.3 — 本設計で定義するArtifact Store
-- `documents/design.md` §16 — Webview、パス、ネットワーク、ログのセキュリティ設計
-- `documents/design.md` §17〜§19 — 主要インターフェース、エラー分類、テスト設計
-- `.cursor/rules/project.mdc` — `SYW-CONTEXT-007`、`SYW-STORAGE-001`〜`003`、`SYW-SEC-002`、`SYW-SEC-004`、`SYW-TEST-001`〜`002`
-- `src/storage/storage-service.ts` — StorageServiceの公開境界
-- `src/storage/event-store.ts` — Event Storeのイベント保存と復元契約
+- `documents/issues.md` — Milestone 4「スレッドタイトル生成を実装する」の要求と完了条件
+- `documents/design.md` §14.1〜§14.3 — ヘッダー、スレッド表示、Webview通信
+- `documents/design.md` §15.1 — Thread Store、`meta.json`、revision競合、一覧復元
+- `documents/design.md` §15.2 — 最初のユーザーメッセージを確定するEvent Store
+- `documents/design.md` §16〜§19 — セキュリティ、エラー分離、テスト設計
+- `.cursor/rules/project.mdc` — `SYW-STORAGE-001`〜`003`、`SYW-UI-003`、`SYW-SEC-004`
+- `src/storage/thread-store.ts` — 現行のThread Store契約とタイトル検証
+- `src/storage/event-store.ts` — `user-message`イベントの永続化と復元
+- `src/ui/webview-protocol.ts` — 現行のZodベース通信契約
 
 ## 調査結果・設計まとめ
 
-### 責務と保存対象
+### 現状と変更範囲
 
-Artifact Storeは、表示・モデル入力に適さない大きさのTool Result、コマンド出力、将来の診断出力を、検査済みのローカルデータとして保存する。会話履歴の正本はEvent Storeに残し、`tool-result`イベントのpayloadには本文を入れず、`artifactRef`と安全な要約だけを記録する。Artifact Storeは会話順序、Thread metadata、ChangeSet、APIキーを管理しない。
+実装前のThread Storeは`meta.json`に`title`を保存し、既定値`新しいスレッド`とrevision付き更新を提供していた。一方、Webview通信にはThread一覧、選択、renameの専用メッセージがなかったため、既存のファイル形式とStorage境界を維持しながら、タイトルの出所、生成フロー、一覧プロトコルを追加した。Provider層は認証管理まででタイトル生成APIを持たないため、LLM命名は`TitleGenerationPort`を注入する境界まで実装し、既存のProviderネットワーク処理を無理に再実装していない。
 
-保存するのは「機密マスクと正規化を完了した出力」であり、呼び出し元が渡した生データではない。したがって、Artifact Store単体を直接呼び出すAPIではなく、Tool／Context層で出力の出所、媒体種別、機密検査状態を明示した入力を受ける。
-
-### ファイル形式
-
-```text
-<globalStorageUri>/
-└── threads/<thread-id>/
-    └── artifacts/
-        └── <artifact-id>/
-            ├── meta.json       # 公開済みであることを示す正本メタデータ
-            ├── content         # 小さい単一ファイル
-            └── chunks/          # 個別上限を超えない分割保存時だけ作成
-                ├── 000000
-                └── 000001
-```
-
-`meta.json`は次の情報を持つ。`artifactId`、`threadId`、`kind`、`mediaType`、`encoding`、`byteLength`、`chunkCount`、SHA-256の`contentHash`、`createdAt`、schemaVersionだけを保存し、出力本文、コマンド文字列、環境変数、URIの元パス、秘密値は含めない。`contentHash`は内容の同一性検査に使うが、認証や秘密情報の代替にはしない。
-
-書き込みは、アーティファクト固有の一時ディレクトリへ内容とメタデータを書き、内容を再読してバイト数・ハッシュを検証した後、`meta.json`を最後に公開する。親の`artifacts/`直下へアーティファクトディレクトリをrenameして公開する方式を基本とする。既存IDは再利用せず、途中終了した一時ディレクトリ、メタデータのないディレクトリ、ハッシュ不一致の成果物は利用不可として回収する。既存の公開済みアーティファクトは上書きしない。
-
-テキストはUTF-8として保存し、`encoding: "utf-8"`と`mediaType: "text/plain"`を付ける。改行の正規化など表示に影響する変換を行った場合は、メタデータではなく固定の正規化契約で扱う。バイナリは安全な検査済み入力に限りopaque bytesとして保存し、モデル入力やMarkdown表示へ自動展開しない。
-
-### 参照IDと読み取り
+### データモデル
 
 ```ts
-type ArtifactKind = "tool-result" | "command-output" | "diagnostic";
+type ThreadTitleSource = "default" | "provisional" | "llm" | "user";
 
-interface ArtifactRef {
-  readonly uri: `artifact://${string}/${string}`;
-  readonly artifactId: string;
+interface ThreadRecord {
+  readonly id: string;
+  readonly title: string;
+  readonly titleSource: ThreadTitleSource;
+  readonly revision: number;
+  readonly updatedAt: number;
+  // workspaceId、modelId、permissionProfile、createdAt、archivedは既存契約を維持する
+}
+```
+
+`titleSource`は同じ`meta.json`へ保存する。新規スレッドは`default`、最初のユーザーメッセージから作った仮タイトルは`provisional`、任意設定による採用済みLLMタイトルは`llm`、手動編集済みタイトルは`user`とする。既存メタデータにこのフィールドがない場合、タイトルが既定文言なら`default`、それ以外は安全側に`user`として復元し、自動命名による上書きを防ぐ。
+
+タイトルは保存時に前後空白を除去し、改行・制御文字を空白へ正規化する。保存上限は既存の200文字を維持し、仮タイトルとLLMタイトルの表示上限は60 Unicode code pointsを目安とする。タイトル候補が空、マスク後に空、または不正な場合は`新しいスレッド`へ戻す。タイトルはUI表示専用のテキストとして扱い、HTML、URI、Command URI、ログテンプレートへ展開しない。
+
+### 仮タイトル生成
+
+タイトル生成は純粋関数として分離し、LLMやファイルI/Oへ依存させない。
+
+```ts
+interface ProvisionalTitleGenerator {
+  fromFirstUserMessage(text: string): string;
+}
+```
+
+処理順は、改行・制御文字の正規化、Markdownコードフェンス等の表示ノイズ除去、機密パターンのマスク、空白の圧縮、先頭からのUnicode単位での切り詰め、空値時の既定文言とする。省略記号は上限内に収め、同じ入力から常に同じタイトルを得られるようにする。原文は`meta.json`へ保存しない。
+
+最初の`user-message`をEvent Storeへ追記した後、タイトルサービスがThread Storeの現在の`titleSource`を確認する。`default`の場合だけ仮タイトルを保存する。すでに`provisional`、`llm`、`user`であれば何もしない。保存に失敗してもユーザーメッセージイベントは失わず、次回の一覧復元または明示的な再同期で再計算できるようにする。
+
+### ユーザー編集
+
+ユーザー編集はタイトル入力欄またはスレッド一覧の編集操作からHostへ送る。UIの表示変更だけで確定させず、HostがスレッドID、タイトル長、制御文字、現在revision、対象スレッドの存在を再検証する。空文字は一覧の識別性を損なうため拒否し、保存済みタイトルを暗黙に既定値へ戻さない。
+
+```ts
+interface RenameThreadRequest {
   readonly threadId: string;
-  readonly byteLength: number;
-  readonly mediaType: string;
-  readonly contentHash: string;
-}
-
-interface ArtifactSweepReport {
-  readonly scanned: number;
-  readonly deleted: number;
-  readonly invalidated: number;
-  readonly bytesFreed: number;
-  readonly diagnostics: readonly ArtifactErrorCode[];
-}
-
-interface ArtifactStore {
-  create(input: CreateArtifactInput, signal?: AbortSignal): Promise<ArtifactRef>;
-  read(ref: string, options?: ArtifactReadOptions): Promise<ArtifactReadResult>;
-  stat(ref: string): Promise<ArtifactMetadata | undefined>;
-  delete(ref: string, reason: "eviction" | "thread-cleanup"): Promise<void>;
-  sweep(): Promise<ArtifactSweepReport>;
+  readonly title: string;
+  readonly expectedThreadRevision: number;
 }
 ```
 
-正規形は`artifact://<thread-id>/<artifact-id>`とする。`thread-id`と`artifact-id`はStoreが生成・検証するURL-safeな識別子だけを許可し、query、fragment、追加path、percent decode後の区切り文字、`.`、`..`、制御文字を拒否する。URIから解決したスレッドIDと要求コンテキストのスレッドIDが一致しない場合は、存在の有無を明かさずNot Foundへ分類する。絶対パス、任意のファイルURI、シンボリックリンクを参照IDとして受け付けない。
+保存はatomic renameで行い、成功時にrevisionを1増やし、`titleSource: "user"`へ遷移する。revision競合時は上書きせず、最新のThread Summaryを返してUIへ再編集を要求する。ユーザーが現在のタイトルと同じ文字列を保存した場合も`user`へ固定し、保護の意図を維持する。
 
-`read`はHost内部だけのAPIとし、`offset`、`limit`、`expectedHash`、`leaseId`を受け取れる範囲付き読み取りにする。既定の最大返却量を設け、全量要求でも一度にメモリやモデル入力へ展開しない。読み取り結果は、テキストならUTF-8の安全なチャンク、バイナリならメタデータとopaque bytesとして返す。WebviewへはHostが再度サニタイズしたプレビューだけを渡し、WebviewにglobalStorageのURIやファイル権限を渡さない。
+### LLM自動命名
 
-### Tool Result／コマンド出力の流れ
+設定はユーザー設定の`byokAgent.threadTitle.autoNaming`のみを入力とし、既定値は`false`とする。ワークスペース設定や会話イベントから暗黙に有効化しない。設定が有効なとき、仮タイトル保存後に非同期の単発処理として自動命名を試みる。
 
-```text
-Tool実行
-  ↓ 生出力（メモリ上のみ）
-ANSI除去 → 機密マスク → バイナリ判定 → 正規化済みサイズ判定
-  ├─ 小さい: 制限済み本文を通常のTool Resultへ
-  └─ 大きい: Artifact Storeへ完全な正規化済み出力を保存
-                  ↓
-        要約 + 先頭／末尾抜粋 + byteLength + artifact://参照
-                  ↓
-              Event Store／次のモデル入力
+```ts
+interface ThreadTitleSettings {
+  readonly autoNaming: boolean;
+}
+
+interface TitleGenerationPort {
+  generate(input: {
+    readonly text: string;
+    readonly modelId: string;
+    readonly signal: AbortSignal;
+  }): Promise<string>;
+}
 ```
 
-Tool Resultの共通処理は、既存の`SYW-CONTEXT-007`どおり、ANSI除去、機密マスク、バイナリ判定、文字数制限、先頭末尾保持、重要行抽出、完全出力のArtifact化、要約と参照ID渡しの順序を崩さない。Artifact化する完全出力は、文字数制限前の「マスク済み・正規化済み」データとする。これにより、会話本文は小さく保ちながら、利用者が検証可能な出力を保持できる。
+生成要求はタイトル専用の短いプロンプト、Toolなし、出力長上限付きとし、正規化済み本文以外のコンテキストを含めない。Providerの生レスポンス、プロンプト、失敗理由は`meta.json`、イベント、ログへ保存しない。LLM結果は仮タイトルがまだ有効であること、revisionが期待値と一致すること、`titleSource`が`provisional`であることを再確認してから`llm`として保存する。自動命名中にユーザーが編集した場合は、ユーザータイトルを優先し、LLM結果を破棄する。
 
-`CreateArtifactInput`には、`threadId`、`kind`、正規化済みのtextまたは検査済みbytes、媒体種別、作成時刻、実行中Runのlease情報を渡す。生のコマンド、cwd、env、Tool引数は渡さず、Event Storeへ保存する安全な要約は別途生成する。保存に失敗した場合は、履歴に参照IDを発行したことにせず、`ARTIFACT_PERSISTENCE_FAILED`または`ARTIFACT_QUOTA_EXCEEDED`の安全な分類と要約だけを保存する。
+自動命名の失敗・タイムアウト・キャンセル・モデル未選択・Provider未設定は、スレッド作成やメッセージ送信を失敗させない。仮タイトルはそのまま一覧に表示する。LLMタイトルを再生成する操作や自動再試行は本Issueの対象外とし、必要になった時点で別途設計する。
 
-### 容量・保持・削除
+### 一覧表示と通信
 
-設定はユーザー設定またはExtensionの安全な既定値から解決し、ワークスペース内設定で保持上限や削除を弱めたり、外部保存先へ変更したりしない。初期値は次のとおりとする。
+一覧の正本はHostの`ThreadStore.list({ includeArchived: false })`とし、既存の`updatedAt`降順、`createdAt`降順、ID昇順の決定的な順序を維持する。Webviewへ渡す一覧要素は次の表示用投影とする。
 
-| 設定 | 既定値 | 意味 |
-|---|---:|---|
-| `byokAgent.artifacts.maxTotalBytes` | 256 MiB | Extension全体の公開アーティファクト上限 |
-| `byokAgent.artifacts.maxThreadBytes` | 64 MiB | 1スレッドの公開アーティファクト上限 |
-| `byokAgent.artifacts.maxArtifactBytes` | 16 MiB | 1つの論理アーティファクト上限 |
-| `byokAgent.artifacts.chunkBytes` | 1 MiB | チャンク保存時の最大チャンクサイズ |
-| `byokAgent.artifacts.retentionDays` | 30日 | 作成日時を基準にした期限 |
-| `byokAgent.artifacts.evictionPolicy` | `oldest-first` | 容量超過時の削除順 |
+```ts
+interface ThreadSummary {
+  readonly id: string;
+  readonly title: string;
+  readonly revision: number;
+  readonly updatedAt: number;
+  readonly archived: boolean;
+}
+```
 
-`maxArtifactBytes`を超える出力は複数チャンクに分けても保存せず、部分的な参照を発行しない。保存容量の範囲で完全な出力を維持することを優先し、呼び出し元には安全な要約と保存不能理由を返す。総容量またはスレッド容量を超える場合は、まず期限切れ、次にleaseされていない最古の公開済みアーティファクトを削除してから再試行する。削除後も足りない場合は保存を拒否する。
+追加する通信は、UIからの`request-thread-list`、`select-thread`、`rename-thread`、Hostからの`thread-list`を基本とする。すべて既存EnvelopeとZod判別共用体を使用し、renameには`expectedThreadRevision`を必須にする。Hostは一覧要求、rename成功、タイトル生成完了、スレッド作成後に最新の`thread-list`を送る。スレッド選択後は対象の`thread-snapshot`、モデル、権限状態を同じスレッドIDで返す。Webviewは現在表示中でないスレッドの更新を現在画面へ適用しない。
 
-期限切れ判定は`createdAt + retentionDays`で行い、アクセスしただけでは期限を延長しない。`oldest-first`以外を追加する場合も、初期実装では`lru`のようにアクセス時刻更新を伴う方式を既定にせず、メタデータ書き込みの競合と秘密情報漏えい面を別途検証する。`sweep()`は起動時、作成前、明示的なStorage管理処理で実行し、削除はメタデータを確認した上でアーティファクト単位に行う。
-
-実行中Runが作成・読み取り中のArtifactはleaseで固定する。leaseはメモリ上の短命な参照状態とし、プロセス終了後に残らない。孤児化したleaseファイルは保存しない。Evictionで削除された参照はEvent Storeから消さず、stat/readをNot Foundへ分類し、履歴表示では「保存期限または容量方針により利用できません」と固定文言で示す。
-
-### エラー、整合性、セキュリティ
-
-次の分類をユーザー向け固定文言、モデル向け安全なTool Result、ログ向けメタデータに分離する。
-
-| 分類 | 意味 | リトライ |
-|---|---|---|
-| `ARTIFACT_INVALID_INPUT` | 形式、媒体、識別子、サイズの入力不正 | 不可 |
-| `ARTIFACT_SENSITIVE_CONTENT` | 安全に機密除去できない | 不可 |
-| `ARTIFACT_QUOTA_EXCEEDED` | 削除後も設定容量に収まらない | 設定変更後のみ可 |
-| `ARTIFACT_NOT_FOUND` | URI不正、別スレッド、削除済み、未公開 | 不可 |
-| `ARTIFACT_CORRUPTED` | メタデータ、サイズ、ハッシュが不一致 | 不可。再生成可 |
-| `ARTIFACT_IO_FAILED` | 読み書き、rename、容量不足などのI/O障害 | 条件付き |
-
-ログと診断にはthreadId、artifactId、種別、サイズ、分類、経過時間だけを記録し、URI以外のパス、本文、コマンド、cwd、env、ヘッダー、Providerレスポンス、秘密値を含めない。ハッシュ不一致や破損時は当該Artifactだけを無効化し、他のArtifactとEvent Storeの履歴復元を失敗させない。読み取り結果を新たなEventへ保存する場合も、本文ではなく参照・範囲・結果分類だけを残す。
+一覧にはタイトルだけでなく、タイトルが欠落・空の場合の既定表示、更新時刻、選択状態を安全に表示する。タイトル文字列をHTMLやリンクとして解釈せず、一覧上で識別できることを完了条件とする。
 
 ### 実装単位と検証方針
 
 実装時は次の単位へ分ける。
 
-- `src/storage/artifact-store.ts`: Artifact URI、メタデータ、入力検証、atomic publish、chunk read、hash検証、lease、quota、sweep
-- `src/storage/storage-service.ts`: Artifact Storeの生成・初期化・破棄とExtension Host公開
-- `src/context/`またはTool Result整形箇所: ANSI除去、機密マスク、バイナリ判定、要約、閾値判定、Artifact Store呼び出し
-- `src/storage/event-store.ts`またはAgent Event変換境界: `tool-result` payloadへの参照と安全な要約の保存
-- `tests/unit/artifact-store.test.ts`: URI、保存、読み取り範囲、hash、再起動、quota、TTL、eviction、lease、破損、孤児回収
-- `tests/agent-simulation/artifact-persistence.test.ts`: 巨大Tool Result／コマンド出力が会話本文に入らず、次のモデル入力と履歴に参照だけが渡ること
-- `tests/extension-integration/artifact-store-persistence.test.ts`: StorageService再生成、スレッド分離、UIプレビュー境界、設定、削除方針
+- `src/storage/thread-title.ts`: タイトル出所、候補の正規化、仮タイトル生成、LLM結果の採用条件
+- `src/storage/thread-store.ts`: `titleSource`、rename、生成タイトル更新、revision競合、旧`meta.json`移行
+- `src/storage/storage-service.ts`または会話書き込み境界: 最初の`user-message`追記後のタイトル処理の接続
+- `src/ui/webview-protocol.ts`、`src/ui/extension-webview-protocol.ts`: 一覧、選択、renameの検証済み通信
+- `src/ui/webview/`、`src/ui/main.tsx`: Thread Summary一覧、タイトル編集、競合時の再同期
+- `tests/unit/thread-title.test.ts`: 正規化、機密マスク、Unicode切り詰め、空値、冪等性
+- `tests/unit/thread-store.test.ts`: `titleSource`、rename、生成タイトルの保護、旧形式復元、revision競合、atomic write
+- `tests/unit/webview-protocol.test.ts`: 一覧、選択、renameのpayload上限、未知フィールド、revision検証
+- `tests/agent-simulation/`またはStorage統合テスト: 最初のユーザーメッセージ、LLM成功・失敗、手動renameとの競合
+- `tests/extension-integration/`: 再起動後の一覧表示、Webview再表示、スレッド切り替え、タイトル漏えい防止
 
-実API、実ワークスペースの秘密情報、実環境変数はテストに使用しない。Fake filesystemと固定時刻・固定UUIDを注入し、再現可能なテストにする。
+実API、実ワークスペースの秘密情報、環境変数はテストに使用しない。タイトル生成Port、時計、UUID、ファイルシステム、ProviderをFakeに差し替え、LLMが無効な場合も同じ仮タイトルで検証可能にする。
 
 ### 完了条件
 
-1. 閾値を超えるTool Resultとコマンド出力について、正規化済み完全出力を会話履歴と別ファイルへ保存できる。
-2. 保存成功時だけ`artifact://<thread-id>/<artifact-id>`を発行し、同一スレッドのHost APIから範囲付きで参照できる。
-3. Event Storeの会話イベント、モデル入力、Webviewメッセージに巨大な本文を直接含めず、安全な要約と参照IDだけを渡せる。
-4. 総容量、スレッド容量、個別上限、TTL、削除方針、実行中leaseを適用し、容量不足時に部分Artifactを残さない。
-5. 再起動後も公開済みArtifactを検証して復元でき、途中終了・破損・削除済み参照を安全に扱える。
-6. APIキー、Authorization、環境変数、認証トークン、Provider生レスポンス、非公開推論、未加工出力が保存・ログ・UI境界へ漏れない。
+1. 最初のユーザーメッセージを保存したスレッドに、再起動後も同一の識別可能な仮タイトルが表示される。
+2. ユーザーがタイトルを編集・保存でき、保存後に仮タイトルやLLM結果で上書きされない。
+3. `byokAgent.threadTitle.autoNaming`が既定で無効で、明示的に有効化した場合だけLLM命名を試行できる。
+4. LLMの失敗、キャンセル、設定無効、revision競合がメッセージ送信や既存タイトルを壊さず、仮タイトルまたはユーザータイトルを維持する。
+5. Thread Storeから復元した一覧をHost経由でWebviewへ渡し、各スレッドをタイトルで識別・選択できる。
+6. タイトル、LLM要求、ログ、通信にAPIキー、Authorization、生環境変数、認証トークン、未加工の機密本文を追加保存・出力しない。

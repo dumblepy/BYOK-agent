@@ -47,6 +47,7 @@ describe("ExtensionWebviewProtocolSession", () => {
 
     expect(webview.sent.map((message) => (message as { type: string }).type)).toEqual([
       "host-ready",
+      "thread-list",
       "thread-snapshot",
       "model-list",
       "permission-updated",
@@ -73,7 +74,7 @@ describe("ExtensionWebviewProtocolSession", () => {
     webview.emit(ready);
     webview.emit(ready);
     await flush();
-    expect(webview.sent).toHaveLength(5);
+    expect(webview.sent).toHaveLength(6);
     session.dispose();
   });
 

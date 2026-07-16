@@ -51,6 +51,7 @@ export class DefaultUIService extends ManagedService implements UIService {
       modelCatalog: this.dependencies.modelCatalog ?? new StaticModelCatalog(),
       providerService: this.dependencies.provider,
       threadModelStore: this.dependencies.storage,
+      storage: this.dependencies.storage,
       isThreadRunActive: (threadId) => this.dependencies.agent.hasActiveRun(threadId),
       isWorkspaceTrusted: () => vscode.workspace.isTrusted,
       logger: this.dependencies.logger,

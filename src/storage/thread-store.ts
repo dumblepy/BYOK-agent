@@ -6,10 +6,12 @@ import {
   isUserSelectablePermissionProfile,
   type UserSelectablePermissionProfile,
 } from "../permissions/permission-profile";
+import { DEFAULT_THREAD_TITLE, type ThreadTitleSource } from "./thread-title";
 
 export interface ThreadRecord {
   readonly id: string;
   readonly title: string;
+  readonly titleSource: ThreadTitleSource;
   readonly workspaceId?: string;
   readonly modelId?: string;
   readonly permissionProfile: UserSelectablePermissionProfile;
@@ -37,6 +39,13 @@ export interface ThreadStore {
   get(threadId: string): Promise<ThreadRecord | undefined>;
   list(options?: { readonly includeArchived?: boolean }): Promise<readonly ThreadRecord[]>;
   update(threadId: string, expectedRevision: number, patch: ThreadUpdate): Promise<ThreadRecord>;
+  rename(threadId: string, expectedRevision: number, title: string): Promise<ThreadRecord>;
+  applyGeneratedTitle(
+    threadId: string,
+    expectedRevision: number,
+    title: string,
+    source: "provisional" | "llm",
+  ): Promise<ThreadRecord>;
   archive(threadId: string, expectedRevision: number): Promise<ThreadRecord>;
 }
 
@@ -66,7 +75,7 @@ export class ThreadNotFoundError extends Error {
 const MAX_ID_LENGTH = 128;
 const MAX_TITLE_LENGTH = 200;
 const MAX_IDENTIFIER_LENGTH = 512;
-const DEFAULT_TITLE = "新しいスレッド";
+const DEFAULT_TITLE = DEFAULT_THREAD_TITLE;
 
 export class FileThreadStore implements ThreadStore {
   private readonly memory = new Map<string, ThreadRecord>();
@@ -88,6 +97,7 @@ export class FileThreadStore implements ThreadStore {
       const record: ThreadRecord = {
         id,
         title,
+        titleSource: input.title === undefined ? "default" : "user",
         ...(workspaceId === undefined ? {} : { workspaceId }),
         ...(modelId === undefined ? {} : { modelId }),
         permissionProfile,
@@ -150,8 +160,46 @@ export class FileThreadStore implements ThreadStore {
       const next: ThreadRecord = {
         ...current,
         ...(title === undefined ? {} : { title }),
+        ...(title === undefined ? {} : { titleSource: "user" as const }),
         ...(modelId === undefined ? {} : { modelId }),
         ...(permissionProfile === undefined ? {} : { permissionProfile }),
+        revision: current.revision + 1,
+        updatedAt: Date.now(),
+      };
+      await this.writeRecord(next, false);
+      this.memory.set(threadId, next);
+      return next;
+    });
+  }
+
+  public rename(threadId: string, expectedRevision: number, title: string): Promise<ThreadRecord> {
+    return this.update(threadId, expectedRevision, { title });
+  }
+
+  public applyGeneratedTitle(
+    threadId: string,
+    expectedRevision: number,
+    title: string,
+    source: "provisional" | "llm",
+  ): Promise<ThreadRecord> {
+    validateThreadId(threadId);
+    validateRevision(expectedRevision);
+    const validatedTitle = validateTitle(title);
+    return this.withThreadLock(threadId, async () => {
+      const current = await this.requireCurrent(threadId, true);
+      if (current.revision !== expectedRevision) {
+        throw new ThreadRevisionConflictError(threadId, expectedRevision, current.revision);
+      }
+      if (
+        (source === "provisional" && current.titleSource !== "default") ||
+        (source === "llm" && current.titleSource !== "provisional")
+      ) {
+        return current;
+      }
+      const next: ThreadRecord = {
+        ...current,
+        title: validatedTitle,
+        titleSource: source,
         revision: current.revision + 1,
         updatedAt: Date.now(),
       };
@@ -190,6 +238,7 @@ export class FileThreadStore implements ThreadStore {
       const record = {
         id: threadId,
         title: DEFAULT_TITLE,
+        titleSource: "default" as const,
         permissionProfile: "confirm-writes" as const,
         revision: 0,
         createdAt: now,
@@ -316,6 +365,7 @@ function parseRecord(value: unknown, directoryId: string): ThreadRecord {
   return {
     id: validateThreadId(String(value.id)),
     title: validateTitle(value.title),
+    titleSource: validateTitleSource(value.titleSource, value.title),
     ...(validateOptionalIdentifier(value.workspaceId, "workspaceId") === undefined
       ? {}
       : { workspaceId: value.workspaceId as string }),
@@ -351,11 +401,19 @@ function validateTitle(value: unknown): string {
   if (
     typeof value !== "string" ||
     value.length === 0 ||
+    value.trim().length === 0 ||
     value.length > MAX_TITLE_LENGTH ||
     hasControlCharacters(value)
   )
     throw new TypeError("Invalid thread title");
   return value;
+}
+function validateTitleSource(value: unknown, title: unknown): ThreadTitleSource {
+  if (value === undefined) return title === DEFAULT_TITLE ? "default" : "user";
+  if (value === "default" || value === "provisional" || value === "llm" || value === "user") {
+    return value;
+  }
+  throw new SyntaxError("Invalid thread title source");
 }
 function validateOptionalIdentifier(value: unknown, name: string): string | undefined {
   if (value === undefined) return undefined;

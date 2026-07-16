@@ -1,8 +1,9 @@
 import { render } from "preact";
-import { useEffect, useMemo, useReducer, useRef } from "preact/hooks";
+import { useEffect, useMemo, useReducer, useRef, useState } from "preact/hooks";
 
 import "./styles.css";
 import { Composer } from "./webview/components/Composer";
+import { ThreadList } from "./webview/components/ThreadList";
 import {
   composerReducer,
   createInitialComposerState,
@@ -32,7 +33,7 @@ import {
   eventToThreadViewAction,
   threadViewReducer,
 } from "./webview/thread-view-model";
-import { DEFAULT_THREAD_ID } from "./webview-protocol";
+import { DEFAULT_THREAD_ID, type ThreadSummary } from "./webview-protocol";
 import { WebviewProtocolClient, type WebviewProtocolApi } from "./webview-protocol-client";
 import {
   createAgentWebviewStateStore,
@@ -63,6 +64,7 @@ function App() {
     providerCredentialReducer,
     INITIAL_PROVIDER_CREDENTIAL_STATE,
   );
+  const [threadList, setThreadList] = useState<readonly ThreadSummary[]>([]);
   const modelSelectionRequestIdRef = useRef<string | undefined>(undefined);
   const permissionSelectionRequestIdRef = useRef<string | undefined>(undefined);
   const snapshotThreadIdRef = useRef(DEFAULT_THREAD_ID);
@@ -87,6 +89,8 @@ function App() {
               revision: message.payload.revision,
               events: message.payload.events,
             });
+          } else if (message.type === "thread-list") {
+            setThreadList(message.payload.threads);
           } else if (message.type === "thread-event") {
             snapshotThreadIdRef.current = message.payload.threadId;
             dispatchThread(
@@ -200,6 +204,33 @@ function App() {
     }
 
     dispatchComposer({ type: "draft-changed", draft: normalizedDraft });
+  };
+
+  const handleThreadSelect = (threadId: string): void => {
+    if (threadId === snapshotThreadIdRef.current) return;
+    try {
+      protocolClient.send("select-thread", { threadId });
+    } catch {
+      dispatchComposer({
+        type: "error",
+        message: "スレッドを切り替えられませんでした。",
+      });
+    }
+  };
+
+  const handleThreadRename = (threadId: string, title: string, revision: number): void => {
+    try {
+      protocolClient.send("rename-thread", {
+        threadId,
+        title,
+        expectedThreadRevision: revision,
+      });
+    } catch {
+      dispatchComposer({
+        type: "error",
+        message: "タイトル変更要求を送信できませんでした。",
+      });
+    }
   };
 
   const handleComposerSubmit = (): void => {
@@ -357,6 +388,13 @@ function App() {
           Ready
         </span>
       </header>
+
+      <ThreadList
+        threads={threadList}
+        selectedThreadId={snapshotThreadIdRef.current}
+        onSelect={handleThreadSelect}
+        onRename={handleThreadRename}
+      />
 
       <ThreadView messages={threadState.messages} isRestoring={!threadState.isHydrated} />
 

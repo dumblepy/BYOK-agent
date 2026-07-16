@@ -60,6 +60,12 @@
           ],
           "default": "oldest-first",
           "description": "容量超過時の会話アーティファクト削除方針。"
+        },
+        "byokAgent.threadTitle.autoNaming": {
+          "type": "boolean",
+          "default": false,
+          "scope": "window",
+          "description": "最初のユーザーメッセージをLLMへ渡してスレッドタイトルを自動生成する。"
         }
       }
     },

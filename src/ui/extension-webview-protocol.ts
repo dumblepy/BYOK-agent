@@ -8,6 +8,7 @@ import {
   type ModelListPayload,
   type PermissionSummaryValue,
   type ProviderCredentialSummary,
+  type ThreadSummary,
   type ThreadEvent,
   type UiToExtensionMessage,
 } from "./webview-protocol";
@@ -28,6 +29,12 @@ export interface ExtensionWebviewProtocolHandlers {
   readonly getProviderCredentials?: (
     providerId?: string,
   ) => readonly ProviderCredentialSummary[] | Promise<readonly ProviderCredentialSummary[]>;
+  readonly getThreadList?: () => readonly ThreadSummary[] | Promise<readonly ThreadSummary[]>;
+  readonly getThreadSnapshot?: (
+    threadId: string,
+  ) =>
+    | { readonly revision: number; readonly events: readonly ThreadEvent[] }
+    | Promise<{ readonly revision: number; readonly events: readonly ThreadEvent[] }>;
 }
 
 const MAX_SEEN_MESSAGE_IDS = 2_048;
@@ -130,6 +137,16 @@ export class ExtensionWebviewProtocolSession {
       return;
     }
 
+    if (message.type === "request-thread-list") {
+      await this.sendThreadList(message.messageId);
+      return;
+    }
+
+    if (message.type === "select-thread") {
+      await this.sendThreadSnapshot(message.payload.threadId, message.messageId);
+      return;
+    }
+
     try {
       this.handlers.logger?.debug("protocol.handler.started", {
         type: message.type,
@@ -183,19 +200,39 @@ export class ExtensionWebviewProtocolSession {
         { correlationId: message.messageId },
       ),
     );
+    await this.sendThreadList(message.messageId);
     await this.sendThreadSnapshot("default", message.messageId);
+  }
+
+  public async sendThreadList(correlationId?: string): Promise<void> {
+    const threads = (await this.handlers.getThreadList?.()) ?? [];
+    await this.sendToUi(
+      createExtensionToUiMessage(
+        "thread-list",
+        { threads: [...threads] },
+        correlationId ? { correlationId } : {},
+      ),
+    );
+  }
+
+  public sendThreadSnapshotForSelection(threadId: string, correlationId: string): Promise<void> {
+    return this.sendThreadSnapshot(threadId, correlationId);
   }
 
   private async sendThreadSnapshot(threadId: string, correlationId: string): Promise<void> {
     const currentSequence = this.threadSequences.get(threadId) ?? 0;
     this.threadSequences.set(threadId, Math.max(currentSequence, 0));
+    const snapshot = (await this.handlers.getThreadSnapshot?.(threadId)) ?? {
+      revision: 0,
+      events: [],
+    };
     await this.sendToUi(
       createExtensionToUiMessage(
         "thread-snapshot",
         {
           threadId,
-          revision: 0,
-          events: [],
+          revision: snapshot.revision,
+          events: [...snapshot.events],
         },
         { correlationId },
       ),

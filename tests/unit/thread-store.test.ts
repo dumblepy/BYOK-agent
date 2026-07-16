@@ -15,6 +15,7 @@ describe("FileThreadStore", () => {
       modelId: "coding-primary",
       permissionProfile: "read-only",
     });
+    expect(created.titleSource).toBe("user");
 
     const updated = await first.update(created.id, 0, { permissionProfile: "workspace-write" });
     expect(updated).toMatchObject({
@@ -71,5 +72,33 @@ describe("FileThreadStore", () => {
     const saved = await readFile(join(rootPath, "threads", thread.id, "meta.json"), "utf8");
     expect(saved).not.toContain("Authorization");
     expect(saved).not.toContain("api_key");
+  });
+
+  it("migrates legacy titles conservatively and protects generated titles", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "byok-agent-threads-"));
+    const store = new FileThreadStore({ rootPath });
+    const thread = await store.create();
+    const metadataPath = join(rootPath, "threads", thread.id, "meta.json");
+    const legacy = JSON.parse(await readFile(metadataPath, "utf8")) as Record<string, unknown>;
+    delete legacy.titleSource;
+    await writeFile(metadataPath, `${JSON.stringify(legacy)}\n`);
+
+    const restored = new FileThreadStore({ rootPath });
+    const migrated = await restored.get(thread.id);
+    expect(migrated?.titleSource).toBe("default");
+    const provisional = await restored.applyGeneratedTitle(
+      thread.id,
+      0,
+      "仮タイトル",
+      "provisional",
+    );
+    expect(provisional.titleSource).toBe("provisional");
+    const renamed = await restored.rename(thread.id, 1, "確定タイトル");
+    await expect(
+      restored.applyGeneratedTitle(renamed.id, 2, "上書き", "llm"),
+    ).resolves.toMatchObject({
+      title: "確定タイトル",
+      titleSource: "user",
+    });
   });
 });

@@ -9,6 +9,7 @@ import {
   type ThreadModelStoreFileSystem,
 } from "./thread-model-store";
 import type { CreateThreadInput, ThreadRecord, ThreadStore, ThreadUpdate } from "./thread-store";
+import { ThreadTitleService, type ThreadTitleServiceOptions } from "./thread-title";
 import type { UserSelectablePermissionProfile } from "../permissions/permission-profile";
 import {
   FileEventStore,
@@ -41,11 +42,13 @@ export interface StorageService extends ManagedService, ThreadModelStore, Thread
   deleteArtifact(ref: string, reason: "eviction" | "thread-cleanup"): Promise<void>;
   sweepArtifacts(): Promise<ArtifactSweepReport>;
   acquireArtifactLease(ref: string): Promise<ArtifactLease>;
+  appendUserMessage(threadId: string, event: NewPersistedAgentEvent): Promise<PersistedAgentEvent>;
 }
 
 export interface StorageServiceDependencies {
   readonly globalStorageUri: Uri;
   readonly artifactOptions?: Omit<ArtifactStoreOptions, "rootPath">;
+  readonly threadTitleOptions?: ThreadTitleServiceOptions;
 }
 
 /** Lifecycle boundary for JSONL conversation and file-based artifact storage. */
@@ -56,6 +59,7 @@ export class DefaultStorageService extends ManagedService implements StorageServ
   private readonly threadModelStore: ThreadModelStore;
   private readonly threadStore: ThreadStore;
   private readonly eventStore: EventStore;
+  private readonly threadTitleService: ThreadTitleService;
   public readonly artifacts: FileArtifactStore;
 
   public constructor(private readonly dependencies: StorageServiceDependencies) {
@@ -66,6 +70,9 @@ export class DefaultStorageService extends ManagedService implements StorageServ
     this.threadModelStore = modelStore;
     this.threadStore = modelStore.threadStore;
     this.eventStore = new FileEventStore(getEventStoreFileSystem(dependencies.globalStorageUri));
+    this.threadTitleService = new ThreadTitleService(this.threadStore, {
+      ...dependencies.threadTitleOptions,
+    });
     this.artifacts = new FileArtifactStore({
       ...dependencies.artifactOptions,
       rootPath: getRootPath(dependencies.globalStorageUri),
@@ -92,8 +99,40 @@ export class DefaultStorageService extends ManagedService implements StorageServ
     return this.threadStore.archive(threadId, expectedRevision);
   }
 
+  public rename(threadId: string, expectedRevision: number, title: string): Promise<ThreadRecord> {
+    return this.threadStore.rename(threadId, expectedRevision, title);
+  }
+
+  public applyGeneratedTitle(
+    threadId: string,
+    expectedRevision: number,
+    title: string,
+    source: "provisional" | "llm",
+  ): Promise<ThreadRecord> {
+    return this.threadStore.applyGeneratedTitle(threadId, expectedRevision, title, source);
+  }
+
   public append(threadId: string, event: NewPersistedAgentEvent): Promise<PersistedAgentEvent> {
     return this.eventStore.append(threadId, event);
+  }
+
+  public async appendUserMessage(
+    threadId: string,
+    event: NewPersistedAgentEvent,
+  ): Promise<PersistedAgentEvent> {
+    const persisted = await this.eventStore.append(threadId, event);
+    if (event.kind !== "user-message" || !isTextPayload(event.payload)) return persisted;
+
+    const events = await this.eventStore.read(threadId);
+    const firstUserMessage = events.events.find((candidate) => candidate.kind === "user-message");
+    if (firstUserMessage?.eventId === persisted.eventId) {
+      try {
+        await this.threadTitleService.handleFirstUserMessage(threadId, event.payload.text);
+      } catch {
+        // The event is the source of truth. A title failure must not reject a saved message.
+      }
+    }
+    return persisted;
   }
 
   public appendBatch(
@@ -177,6 +216,15 @@ export class DefaultStorageService extends ManagedService implements StorageServ
   protected override onDispose(): Promise<void> {
     return this.disposables.dispose();
   }
+}
+
+function isTextPayload(value: unknown): value is { readonly text: string } {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    typeof (value as { readonly text?: unknown }).text === "string"
+  );
 }
 
 function getThreadModelStoreFileSystem(globalStorageUri: Uri): ThreadModelStoreFileSystem {

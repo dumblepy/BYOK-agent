@@ -95,6 +95,9 @@ const agentErrorCodeSchema = z.enum([
   "PERMISSION_SELECTION_CONFLICT",
   "PERMISSION_SELECTION_BUSY",
   "PERMISSION_PROFILE_NOT_ALLOWED",
+  "THREAD_NOT_FOUND",
+  "THREAD_RENAME_CONFLICT",
+  "THREAD_TITLE_INVALID",
 ]);
 
 const threadEventSchema = z.discriminatedUnion("kind", [
@@ -203,6 +206,15 @@ const providerCredentialSummarySchema = z
     vendor: z.string().min(1).max(256),
     status: providerCredentialStatusSchema,
     canEdit: z.boolean(),
+  })
+  .strict();
+const threadSummarySchema = z
+  .object({
+    id: identifierSchema,
+    title: z.string().min(1).max(200),
+    revision: z.number().int().nonnegative(),
+    updatedAt: timestampSchema,
+    archived: z.boolean(),
   })
   .strict();
 
@@ -318,6 +330,25 @@ export const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
       })
       .strict(),
   ),
+  messageSchema("request-thread-list", z.object({}).strict()),
+  messageSchema(
+    "select-thread",
+    z
+      .object({
+        threadId: identifierSchema,
+      })
+      .strict(),
+  ),
+  messageSchema(
+    "rename-thread",
+    z
+      .object({
+        threadId: identifierSchema,
+        title: z.string().min(1).max(200),
+        expectedThreadRevision: z.number().int().nonnegative(),
+      })
+      .strict(),
+  ),
 ]);
 
 export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
@@ -420,6 +451,15 @@ export const extensionToUiMessageSchema = z.discriminatedUnion("type", [
       .strict(),
   ),
   messageSchema(
+    "thread-list",
+    z
+      .object({
+        threads: z.array(threadSummarySchema).max(256),
+        selectedThreadId: identifierSchema.optional(),
+      })
+      .strict(),
+  ),
+  messageSchema(
     "protocol-error",
     z
       .object({
@@ -454,6 +494,7 @@ export type ChangeSetStatus = z.infer<typeof changeSetStatusSchema>;
 export type ChangeFileSummary = z.infer<typeof changeFileSummarySchema>;
 export type ModelSummary = z.infer<typeof modelSummarySchema>;
 export type ProviderCredentialSummary = z.infer<typeof providerCredentialSummarySchema>;
+export type ThreadSummary = z.infer<typeof threadSummarySchema>;
 export type UiToExtensionMessage = z.infer<typeof uiToExtensionMessageSchema>;
 export type ExtensionToUiMessage = z.infer<typeof extensionToUiMessageSchema>;
 export type ModelListPayload = Extract<ExtensionToUiMessage, { type: "model-list" }>["payload"];
