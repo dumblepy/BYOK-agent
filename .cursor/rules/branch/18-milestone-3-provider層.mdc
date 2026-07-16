@@ -1,0 +1,70 @@
+---
+description: 18-milestone-3-provider層ブランチでProvider共通層を設計・実装するときに読み込む
+alwaysApply: false
+---
+# Provider共通インターフェースの実装方針
+
+このブランチでは、Agent RuntimeがProvider固有のHTTP API、認証、入力形式、ストリーム形式を意識せずにモデルを呼び出せる共通契約を定義する。対象は共通型、Adapter境界、イベント正規化、キャンセル、エラー分類、契約テストの設計と実装であり、Agent LoopやProvider固有Adapterの実装は後続タスクで行う。
+
+## 実装方針
+
+- `ProviderAdapter`はExtension Host内の境界とし、Agentの判断、Tool実行、権限判定、履歴圧縮、リトライ実行を持たせない。
+- `ProviderRequest`はProvider非依存の会話入力、ツール定義、モデル識別子、生成設定、メタデータで構成し、APIキー・Authorizationヘッダー・生環境変数を含めない。
+- `ProviderEvent`はテキスト、推論要約、Tool Callの開始・引数断片・完了、Usage、完了、Error、Cancelを表現できる判別共用体とする。Provider固有イベント名や生レスポンスをAgentへ漏らさない。
+- Tool Callはストリーム途中の断片をAdapter内で結合し、Agentへは安定したCall ID、名前、検証前のJSON引数を一度だけ完了イベントとして渡す。不完全な呼び出しは成功扱いにしない。
+- Usageは入力・出力・キャッシュ等の既知の値と未知値を区別し、未提供の値を推測して補完しない。Stop reasonも共通列挙へ正規化する。
+- APIエラーは認証、Rate Limit、Timeout、Bad Request、Context Exceeded、Unsupported、Network、Cancelled、Unknownへ分類し、ユーザー向け・モデル向け・ログ向け情報を分離する。
+- `stream(request, signal)`はAbortSignalを必須で受け取り、Abort済み・Abort発生後に新たなイベントを発行しない。HTTPクライアントのキャンセルとAsyncIterableの終了を同じ契約で扱う。
+- リトライ可否はAdapterが分類情報として返すが、実際の再試行回数、バックオフ、重複Tool Call防止はProviderサービスまたはAgent実行管理側の責務とする。
+- 初期対応プロトコルはOpenAI Responses、OpenAI互換Chat Completions、Anthropic Messagesに限定し、GeminiはSchema v1と共通契約を変更しない第2段階で扱う。
+- Provider設定とSecretStorageの解決は既存のModel Catalog／Credential Serviceを経由する。共通型・イベント・ログ・永続化へ秘密情報を渡さない。
+
+## 進捗
+
+- [x] `AGENTS.md`、プロジェクトルール、共通ブランチルールを確認する
+- [x] `documents/design.md`のProvider、Model Catalog、Agent Error、テスト方針を確認する
+- [x] Provider共通契約、イベントライフサイクル、責務境界を設計する
+- [x] `documents/design.md`へProvider共通層の詳細設計を追記する
+- [x] このブランチ用ルールファイルを作成する
+- [x] `ProviderRequest`、`ProviderEvent`、`ProviderError`の型を実装する
+- [x] Provider Adapter契約とAbortSignalの挙動を実装する
+- [x] Provider Contract Test基盤を実装する
+- [x] 型検査、Lint、Provider Contract Testを実行する
+
+## 参考資料
+
+- `documents/design.md` §5.5 Model Catalog
+- `documents/design.md` §6 Provider Adapter
+- `documents/design.md` §7 エージェント実行方式
+- `documents/design.md` §18 エラー分類
+- `documents/design.md` §19.2 Provider Contract Test
+- `.cursor/rules/project.mdc` の `SYW-PROVIDER-001`〜`SYW-PROVIDER-004`
+- `.cursor/rules/project.mdc` の `SYW-ERR-001`、`SYW-TEST-001`、`SYW-TEST-002`
+
+## 完了条件
+
+1. AgentがProvider固有のメッセージ形式、Tool定義形式、ストリームイベント形式を参照せずに`ProviderRequest`を生成できる。
+2. OpenAI Responses、OpenAI互換Chat Completions、Anthropic MessagesのAdapterが同じ`ProviderEvent`契約へ適合できる設計になっている。
+3. Text、Tool Call、Usage、Completed、Error、Cancelをストリーム契約として区別できる。
+4. Tool Call IDと引数断片を欠落・重複なく扱え、不完全なストリームを安全にエラー化できる。
+5. AbortSignalによるキャンセルがHTTP通信、ストリーム購読、Agentへの通知に伝播する。
+6. Provider固有エラーを共通エラーコード、retryable、Retry-After等の安全なメタデータへ正規化できる。
+7. APIキー、認証ヘッダー、プロンプト全文、Tool Result全文、生レスポンスが共通イベント・ログ・保存データへ流出しない。
+
+## 対象外
+
+- OpenAI、Anthropic等のProvider固有Adapter本体
+- Provider Routerの登録・再利用実装
+- Agent Runtime、Tool Executor、Permission Service、履歴圧縮の実装
+- 自動リトライの実行、指数バックオフの実装
+- 実APIを用いたテスト（明示的な環境変数がある場合を除く）
+- `git add`、`git commit`
+
+## 調査結果・設計まとめ
+
+- 既存設計は`ProviderAdapter.stream(request, signal)`と`ProviderEvent`の最小形を定義済みだが、Tool Callの断片、キャンセル、エラー詳細、リトライ情報のライフサイクルが不足しているため、本ブランチで契約を補完する。
+- 共通契約はProviderの翻訳層に限定し、Agentは`text-delta`を表示用に、確定済み`tool-call`をTool Schema検証・権限判定用に、`usage`と`completed`をRun結果用に利用する。
+- `ProviderEvent`は生のHTTPレスポンスやProvider固有JSONを保持しない。必要な診断は安全な分類コード、status、request ID相当の非秘密メタデータだけに縮約する。
+- キャンセルは正常完了や回復可能エラーと混同しない。Abort由来の場合は`PROVIDER_CANCELLED`相当として扱い、Agent側ではユーザー停止の停止条件へ接続する。
+- `countTokens`は任意機能とし、未対応Adapterには共通推定方式を適用する。Provider固有のToken計数がなくてもAgentの予算計算を妨げない。
+- この設計の達成点は、Provider固有実装を差し替えてもAgentの入力・イベント処理・停止条件・エラー表示の契約が変わらないことである。

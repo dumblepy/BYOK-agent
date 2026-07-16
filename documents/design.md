@@ -925,25 +925,115 @@ interface ProviderAdapter {
 }
 ```
 
+### 6.0 共通契約の詳細設計
+
+Provider層は「内部の正規化済み入力をProvider APIへ変換し、Provider APIの応答を正規化済みイベントへ変換する」境界とする。Agent RuntimeはProviderのHTTP方式、認証ヘッダー、メッセージ配置、ストリームイベント名を知らず、`ProviderRequest`を渡して`ProviderEvent`だけを消費する。共通型にはAPIキー、Authorizationヘッダー、生環境変数、プロンプト全文のログ用複製、生レスポンスを含めない。
+
+```ts
+type ProviderRole = "system" | "user" | "assistant" | "tool";
+
+interface ProviderMessage {
+  readonly role: ProviderRole;
+  readonly content: readonly ProviderContentPart[];
+  readonly toolCallId?: string;
+}
+
+type ProviderContentPart =
+  | { readonly type: "text"; readonly text: string }
+  | { readonly type: "image"; readonly mediaType: string; readonly data: string };
+
+interface ProviderToolDefinition {
+  readonly name: string;
+  readonly description?: string;
+  readonly inputSchema: unknown;
+}
+
+interface ProviderRequest {
+  readonly requestId: string;
+  readonly modelId: string;
+  readonly messages: readonly ProviderMessage[];
+  readonly tools: readonly ProviderToolDefinition[];
+  readonly options: {
+    readonly temperature?: number;
+    readonly maxOutputTokens?: number;
+    readonly reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh";
+  };
+  readonly metadata?: Readonly<Record<string, string>>;
+}
+```
+
+`ProviderRequest`の`modelId`はCatalogで検証済みの値とし、URLや認証情報は含めない。`metadata`は相関ID等の非秘密情報に限定し、Provider Adapterは許可されていない任意ヘッダーを生成してはならない。Tool定義の`inputSchema`は送信前にAgent側で選定済みだが、Provider側でもAPI形式への変換時に構造を壊さない。
+
+イベントはストリーム順序を保った判別共用体とし、断片と確定値を明確に分ける。
+
 ```ts
 type ProviderEvent =
-  | { type: "text-delta"; text: string }
-  | { type: "reasoning-delta"; text: string }
+  | { readonly type: "text-delta"; readonly text: string }
+  | { readonly type: "reasoning-delta"; readonly text: string }
+  | { readonly type: "tool-call-start"; readonly id: string; readonly name: string }
+  | { readonly type: "tool-call-delta"; readonly id: string; readonly argumentsDelta: string }
   | {
-      type: "tool-call";
-      id: string;
-      name: string;
-      arguments: unknown;
+      readonly type: "tool-call";
+      readonly id: string;
+      readonly name: string;
+      readonly arguments: unknown;
     }
   | {
-      type: "usage";
-      inputTokens: number;
-      outputTokens: number;
-      cachedTokens?: number;
+      readonly type: "usage";
+      readonly inputTokens: number;
+      readonly outputTokens: number;
+      readonly cachedTokens?: number;
+      readonly reasoningTokens?: number;
     }
-  | { type: "completed"; stopReason: string }
-  | { type: "error"; error: ProviderError };
+  | {
+      readonly type: "completed";
+      readonly stopReason: "end-turn" | "tool-call" | "max-tokens" | "content-filter" | "unknown";
+    }
+  | { readonly type: "error"; readonly error: ProviderError }
+  | { readonly type: "cancelled" };
+
+type ProviderErrorCode =
+  | "auth-failed"
+  | "rate-limited"
+  | "timeout"
+  | "bad-request"
+  | "context-exceeded"
+  | "unsupported"
+  | "network"
+  | "cancelled"
+  | "unknown";
+
+interface ProviderError {
+  readonly code: ProviderErrorCode;
+  readonly message: string;
+  readonly retryable: boolean;
+  readonly retryAfterMs?: number;
+  readonly status?: number;
+  readonly requestId?: string;
+}
 ```
+
+AdapterはProvider固有のTool Call断片を内部バッファで`id`単位に結合し、JSONとして完全に解析できた場合だけ`tool-call`を発行する。`tool-call-start`や`tool-call-delta`をAgentが再結合する設計にはしない。ストリーム終了時に未完了の引数、ID欠落、名前欠落、同一IDの矛盾が残った場合は`completed`を発行せず、`bad-request`または`unknown`の非再試行エラーとして終了する。並列Tool Callは複数のIDを独立して保持し、受信順を壊さない。
+
+`usage`はProviderが明示的に返した値だけを設定し、未提供の値を0や推定値で埋めない。`completed`は最終イベントとして扱う。ErrorまたはCancelledの後に別の完了イベントを発行してはならず、Agent側はErrorを`AgentErrorCode`へ変換する。Provider固有の生エラー本文はユーザー向けメッセージへ直接渡さず、安全な分類と短い説明に置き換える。
+
+### 6.0.1 AbortSignalとAsyncIterableの契約
+
+`stream(request, signal)`は呼び出し時点で`signal.aborted`を検査し、Abort済みなら通信を開始せず`cancelled`として終了する。実行中にAbortされた場合はHTTPリクエスト、Reader、Provider SDKの購読を中断し、Adapterが所有する一時バッファを破棄する。Abort後に到着したネットワークデータはイベントへ変換しない。Abortがユーザー操作に由来する場合、`cancelled`は失敗ではなくAgentの`cancelled`状態へ変換する。
+
+`AsyncIterable`のconsumerが早期終了した場合も、Adapterは可能な範囲で内部リソースを解放する。各AdapterはレスポンスReader、タイマー、購読解除を`finally`で解放し、再利用されるAdapterインスタンスにRun固有のTool CallバッファやUsageを残さない。
+
+### 6.0.2 責務境界とエラー変換
+
+Provider Adapterが担当するのはメッセージ・Tool定義・Tool Resultの変換、イベント正規化、Call ID保持、Usage正規化、Providerエラー分類、キャンセル、リトライ可否の判定だけである。Tool実行、引数Schema検証、権限確認、履歴保存、コンテキスト圧縮、リトライの実行、停止条件の判断はAgentまたは各専門サービスが担当する。
+
+`ProviderError`は`AgentError`へ変換する際に、`auth-failed`、`rate-limited`、`timeout`、`bad-request`、`context-exceeded`、`cancelled`を既存の`AgentErrorCode`へ対応付ける。`retryAfterMs`はProviderが返した安全な数値だけを保持し、バックオフの実行判断は上位層で行う。Errorイベント、ログ、永続化にはAPIキー、Authorization、URL全体、プロンプト、Tool Result、生レスポンスを含めない。
+
+### 6.0.3 実装単位と契約テスト
+
+実装時は、共通型（`ProviderRequest`、`ProviderEvent`、`ProviderError`）、Adapter境界、Providerエラー変換、Contract Test Fixtureを分離する。Adapterごとのテストは同じ入力と期待される共通イベント列を使用し、Provider固有のJSON形式をAgentテストへ持ち込まない。
+
+最低限、Text delta、Reasoning delta、単一・並列Tool Call、断片結合、Usage、Stop Reason、認証・Rate Limit・Timeout・Bad Request、Retry-After、Abort前後、Abort後イベント抑止、不完全Tool Call、Error後の完了イベント抑止を検証する。実APIテストは明示的な環境変数がある場合だけ実行し、通常のContract Testは保存済みストリームFixtureとFake HTTP層で完結させる。
 
 ### 6.1 対応プロトコル
 
