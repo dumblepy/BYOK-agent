@@ -1,144 +1,133 @@
 ---
-description: 20-milestone-5-コンテキスト管理ブランチでContextItem共通型を設計・実装するときに読み込む
+description: 20-milestone-5-コンテキスト管理ブランチでContext Provider基盤を設計・実装するときに読み込む
 alwaysApply: false
 ---
-# Milestone 5: ContextItem共通型
+# Milestone 5: Context Provider基盤
 
-このブランチでは、静的・ターン単位・実行中のすべてのコンテキストを同じデータ契約で表現するため、`ContextItem`共通型を定義する。本ブランチの対象は共通型とその契約テストまでとし、Context Provider、収集処理、重複排除、予算計算、コンパクション、UI添付機能は後続Issueの対象とする。
+このブランチでは、複数のコンテキストソースを共通の`ContextProvider`契約で扱い、`ContextCollector`が並列収集・Provider単位のタイムアウト・キャンセル・失敗分離を提供する。本タスクの完了対象はContext Provider基盤と契約テストまでとし、個別Provider、重複排除、Token予算、コンパクション、UI添付、Prompt構築は後続Issueの対象とする。
 
 ## 実装方針
 
-- `ContextItem`はExtension Host内で使うシリアライズ可能なデータDTOとする。VS Codeの`Uri`、`Range`、Editorなどの実行時オブジェクトや、Provider・Storage・UIのサービスへ直接依存させない。
-- 詳細設計`documents/design.md` §8.2の契約を正本とし、`kind`、`source`、`content`、`uri`、`range`、`priority`、`estimatedTokens`、`contentHash`、`volatile`、`sensitive`を共通項目として扱う。Issueに明記された項目だけでなく、出所と本文も共通形式に含める。
-- 型定義は`src/context/context-item.ts`に置く。既存のExtension側TypeScriptの命名・`readonly`・`interface`中心の方針に合わせ、公開プロパティは読み取り専用にする。
-- `ContextItem`は生成・収集・マスク・永続化を担当しない。型定義と、必要な範囲の純粋な契約検証だけを置き、Provider固有の判断を共通型へ持ち込まない。
-- `content`はコンテキスト本文そのものを表す。機密判定や送信前マスクを通過したことを`contentHash`やフラグだけで表現しない。`sensitive: true`の項目は、後続層で送信・ログ・永続化・Webview表示を禁止または明示的な安全処理の対象とする。
-- `volatile`と`sensitive`は独立した属性とする。両方`true`の項目を許可し、`volatile`はターン／実行ごとの再収集対象、`sensitive`は機密扱いを意味する。どちらも本文の内容を推測するためのフラグではない。
-- ハッシュは重複排除と整合性確認のための値であり、機密情報保護・認証・安全性の根拠にはしない。ハッシュから本文を復元できないことを前提にした設計や、ハッシュだけをログへ出して安全とみなす設計は禁止する。
+- `ContextProvider`はソース固有の収集だけを担当し、モデル向けPrompt構築、Token予算、重複排除、履歴保存、UI通信、Tool実行を担当しない。
+- `ContextCollector`はExtension Host側のオーケストレーターとして、対象Providerを登録順に選択し、各Providerの収集を同時に開始する。Providerの完了順ではなく登録順で結果を平坦化し、出力順を決定的にする。
+- Providerは`ContextItem`の配列を返す。返却直後に既存のContextItem実行時検証を通し、1件でも不正な項目、未知の項目、重複IDがあれば、そのProviderの結果だけを破棄して`invalid-result`として記録する。
+- 1つのProviderの例外、タイムアウト、結果不正は他Providerの結果を失敗にしない。全Providerが失敗しても収集処理自体は完了し、空のContextBundleとProvider別結果を返す。空のコンテキストをAgent実行不能とみなすかはContextManager／AgentRuntimeの責務とする。
+- タイムアウトはProviderごとの独立した`AbortController`で管理する。タイマー発火時にProviderへAbortSignalを伝播し、そのProviderだけを`timed-out`として確定する。ProviderがSignalを無視して遅れて返した値や例外は結果へ追加せず、安全に破棄する。
+- 呼び出し元のAbortSignalが中断された場合は全Providerへ中断を伝播し、収集全体を`cancelled`として終了する。キャンセル後に部分的なContextBundleを利用側へ成功結果として公開しない。キャンセルはProvider失敗ではなく、Agentの`USER_CANCELLED`へ変換する。
+- Provider識別子、失敗コード、件数、経過時間だけを診断・ログへ出し、ContextItem本文、ファイル内容、URI全体、例外本文、認証情報をログや失敗情報へ含めない。
+- ProviderのI/O依存はコンストラクター注入する。共通インターフェースにVS CodeのEditor、Uri、Range、Storage、Provider Adapterを持ち込まず、返却値はシリアライズ可能な`ContextItem`に限定する。
+- 実装開始時点では`src/context/context-provider.ts`と`src/context/context-collector.ts`、`tests/unit/context-collector.test.ts`を候補とする。既存の命名、`readonly`、lower-kebab-caseのファイル名に合わせ、実際の配置は設計書と現行構成を再確認して決める。
 
-## データ契約
+## 共通契約
 
 ```ts
-export type ContextItemKind =
-  | "instruction"
-  | "workspace"
-  | "file"
-  | "selection"
-  | "symbol"
-  | "diagnostic"
-  | "git"
-  | "tool-result"
-  | "conversation-summary";
+type ContextScope = "static" | "turn" | "execution";
 
-export interface SerializedPosition {
-  readonly line: number;
-  readonly character: number;
+interface ContextRequest {
+  readonly threadId: string;
+  readonly runId?: string;
+  readonly scope: ContextScope;
 }
 
-export interface SerializedRange {
-  readonly start: SerializedPosition;
-  readonly end: SerializedPosition;
-}
-
-export interface ContextItem {
+interface ContextProvider {
   readonly id: string;
-  readonly kind: ContextItemKind;
-  readonly source: string;
-  readonly content: string;
-  readonly uri?: string;
-  readonly range?: SerializedRange;
-  readonly priority: number;
-  readonly estimatedTokens: number;
-  readonly contentHash: string;
-  readonly volatile: boolean;
-  readonly sensitive: boolean;
+  readonly scopes: readonly ContextScope[];
+
+  collect(
+    request: ContextRequest,
+    signal: AbortSignal
+  ): Promise<readonly ContextItem[]>;
 }
 ```
 
-### 各フィールドの意味
+`ContextRequest`はProvider間で共通化すべき識別子と収集スコープだけを持つ。アクティブエディタ、診断、Git、Workspaceなどの実行時依存は各Providerへ注入し、共通Requestへ任意の`unknown`ペイロードを追加しない。将来共通化が必要な入力は設計書を更新してから契約へ追加する。
 
-| フィールド | 契約 |
-|---|---|
-| `id` | 1つの収集結果内で項目を識別する不透明なID。本文、URI、秘密情報から推測可能な値を直接組み立てない。 |
-| `kind` | 設計書§8.2に定める9種の固定列挙。ProviderやUIの都合で自由文字列を追加しない。 |
-| `source` | 生成元を示す安定した識別子。表示文言、本文、APIキー、Authorization、生レスポンスを含めない。 |
-| `content` | モデルへ渡す候補となるテキスト本文。空文字は型上許可するが、採用可否はContext Manager側で判断する。 |
-| `uri` | ファイル等の出典を表すシリアライズ済みURI。未関連の項目では省略する。ローカルパスを代用せず、認証情報を含むURIを許可しない。 |
-| `range` | `uri`内の位置を表す範囲。VS Code互換の0始まりの行・文字位置、終端を含まない半開区間とする。全体ファイルを表す場合は省略可能とする。 |
-| `priority` | 採用競合時の数値優先度。有限な数値とし、値が大きいほど優先する。優先順位の意味付けと再配分はContext Manager側で行う。 |
-| `estimatedTokens` | `content`をモデルへ渡した場合の推定Token数。有限の0以上の数値とし、未計算を負数や`NaN`で表さない。推定値を実測Usageとして扱わない。 |
-| `contentHash` | `content`のUTF-8バイト列に対する小文字のSHA-256 hex（64文字）。本文を意味変更する正規化をハッシュ計算前に暗黙適用しない。 |
-| `volatile` | 現在の状態に依存し、ターンまたは実行単位で更新され得る項目であることを示す。キャッシュ・再利用・永続化の判断は利用側で行う。 |
-| `sensitive` | 本文または出典に機密性があり、通常のPrompt・ログ・Storage・Webviewへそのまま出してはならないことを示す。機密性のないことを示す値ではない。 |
+```ts
+type ContextProviderStatus =
+  | "fulfilled"
+  | "failed"
+  | "timed-out"
+  | "cancelled"
+  | "invalid-result";
 
-### `SerializedRange`の不変条件
+interface ContextProviderOutcome {
+  readonly providerId: string;
+  readonly status: ContextProviderStatus;
+  readonly itemCount: number;
+  readonly elapsedMs: number;
+  readonly failureCode?:
+    | "provider-failed"
+    | "provider-timeout"
+    | "provider-cancelled"
+    | "invalid-result";
+}
 
-- `line`と`character`は0以上の安全な整数とする。負数、小数、`NaN`、`Infinity`、過大な値を許可しない。
-- `start`は`end`より後になってはならない。行が同じ場合は`start.character <= end.character`、行が異なる場合は`start.line < end.line`であることを要求する。
-- `start`と`end`の位置は同じでもよく、空の選択範囲を表現できるようにする。
-- VS Codeの実行時`Range`を型に持ち込まず、JSONへ安全に変換した値だけを`ContextItem`に格納する。
+interface ContextCollectionResult {
+  readonly status: "completed" | "cancelled";
+  readonly items: readonly ContextItem[];
+  readonly providers: readonly ContextProviderOutcome[];
+}
 
-### 正規化・検証境界
+interface ContextCollector {
+  collect(
+    request: ContextRequest,
+    signal: AbortSignal
+  ): Promise<ContextCollectionResult>;
+}
+```
 
-- TypeScriptの型だけでは実行時入力を検証できないため、外部境界から復元する場合はContext層のランタイム検証を通す。未知の`kind`、未知フィールド、必須値欠落、範囲不整合、非有限数、ハッシュ形式不正は拒否する。
-- URIは文字列として保持するが、後続のPath Security規則に従って正規化・ワークスペース境界確認を行う。`file` URIとローカルパスを同一視せず、`..`脱出、認証情報、危険なスキームを許可しない。
-- `contentHash`は本文のUTF-8バイト列から明示的に計算する。改行、Unicode、末尾空白を勝手に変換してハッシュだけ一致させることは禁止する。重複排除で正規化本文を使う必要がある場合は、正規化後本文を別のContextItemとして扱うか、その規約を先に明記する。
-- `priority`と`estimatedTokens`は`number`で公開するが、生成時・入力時は有限値を検証する。`estimatedTokens`は整数を基本とし、小数を扱う場合はToken推定器の契約として別途固定する。
-- `id`と`source`は表示・Promptテンプレート・ファイルパスの断片として無検証で解釈しない。ログへ記録する場合も、本文・Secret・認証情報を含まない安全な識別子へ制限する。
-
-## 実装単位とテスト方針
-
-実装を開始する際は次の小さい単位で進める。
-
-1. `src/context/context-item.ts`に`ContextItemKind`、`SerializedPosition`、`SerializedRange`、`ContextItem`を追加する。
-2. `ContextItem`が既存の`src/context/tool-result-artifact.ts`やProvider型を再利用せず、単独でExtension側TypeScriptをコンパイルできることを確認する。
-3. 必要なランタイム検証を同じContext層の純粋関数として追加する場合は、返却値を型付きの新しいオブジェクトにし、入力オブジェクトを変更しない。検証が不要な範囲でサービスやI/Oを追加しない。
-4. `tests/unit/context-item.test.ts`で、全`kind`、必須・任意フィールド、`readonly`前提の型利用、Rangeの0始まり・半開区間、同位置の空Range、優先度、Token推定値、SHA-256形式、`sensitive`／`volatile`の全組合せを検証する。
-5. 不正入力を検証する場合は、未知種別、負数・非有限Token／優先度、Range逆転、負の位置、URI内認証情報、SHA-256以外のハッシュ、機密本文のログ漏えいが拒否または防止されることを検証する。
-6. 実装後に`pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`を実行する。実API、実ワークスペース、秘密情報、環境変数はテストに使用しない。
-
-本ブランチでは、型の追加に伴ってContext ProviderやContext Managerへ接続しない。Provider別の収集、明示添付、優先順位による選別、URI・Range・Hashによる重複排除、Token予算、コンパクションは、それぞれの後続Issueでこの契約を利用して実装する。
+上記は設計上の契約であり、実装の正本は`src/context/context-provider.ts`と`src/context/context-collector.ts`を参照する。`ContextItem`の詳細は`documents/design.md` §8.2と既存の`src/context/context-item.ts`を正本とする。
 
 ## 進捗
 
-- [x] `documents/issues.md`、`documents/design.md` §8.1〜§8.4、既存のContext／Storage型を調査する
-- [x] ContextItemの共通フィールド、Range、Hash、機密性・揮発性の契約を設計する
-- [x] `src/context/context-item.ts`に共通型を実装する
-- [x] ContextItemの実行時検証方針を実装し、境界値・不正値をテストする
-- [x] すべての`ContextItemKind`と属性組合せのunit testを追加する
+- [x] 既存のContextItem契約、ContextManager境界、エラー・ログ・テスト規則を調査する
+- [x] ContextProvider共通インターフェース、ContextRequest、収集結果の契約を設計する
+- [x] 並列実行、Provider単位タイムアウト、親AbortSignal伝播、遅延結果破棄の方針を設計する
+- [x] Provider単位の失敗分離、結果検証、決定的な結果順序、機密情報非漏えいの方針を設計する
+- [x] `ContextProvider`共通型と`ContextCollector`を実装する
+- [x] 並列収集、タイムアウト、キャンセル、失敗分離のunit testを追加する
+- [x] Provider contract testのFake Provider基盤を追加する
 - [x] `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`を実行する
-- [x] 完了条件「すべてのコンテキストを共通形式で扱える」を、後続Context Providerが利用できる型契約として確認する
+- [x] 完了条件「複数ソースからコンテキストを収集できる」をFake Providerで確認する
 
 ## 参考資料
 
-- `documents/issues.md` — Milestone 5「ContextItem共通型を定義する」の要求と完了条件
-- `documents/design.md` §3 — `src/context/`の配置
-- `documents/design.md` §8.1〜§8.4 — コンテキスト分類、ContextItem、採用優先順位、Token予算
-- `documents/design.md` §16〜§19 — セキュリティ、エラー分離、テスト方針
-- `.cursor/rules/project.mdc` — `SYW-CONTEXT-001`〜`SYW-CONTEXT-006`、`SYW-SEC-002`、`SYW-SEC-004`
-- `src/context/tool-result-artifact.ts` — 既存のContext関連処理と機密マスク境界の確認資料
-- `src/storage/artifact-store.ts` — SHA-256の表現とハッシュを整合性確認に使う既存実装
+- `documents/issues.md` — Milestone 5「Context Provider基盤を実装する」の要求と完了条件
+- `documents/design.md` §8.1〜§8.6 — コンテキスト分類、共通項目、優先順位、予算、圧縮
+- `documents/design.md` §8.7 — Context Provider基盤の共通契約と収集ライフサイクル
+- `documents/design.md` §17〜§19 — ContextManager境界、エラー分類、テストとログの方針
+- `.cursor/rules/project.mdc` — `SYW-CONTEXT-001`〜`SYW-CONTEXT-007`、`SYW-ERR-001`、`SYW-SEC-004`、`SYW-TEST-001`〜`SYW-TEST-002`
+- `src/context/context-item.ts` — ContextItemのランタイム検証と既存の共通型
+- `src/providers/provider-adapter.ts` — AbortSignalとAsyncIterableの境界設計を確認する参照資料
 
 ## 調査結果・設計まとめ
 
 ### 現状
 
-`src/context/`にはTool Resultの圧縮・アーティファクト化処理だけがあり、ファイル、選択範囲、診断、Git、指示、会話要約を横断する共通型はまだ存在しない。`documents/design.md` §3では`ContextItem.ts`が配置予定として示され、§8.2では9種類の`kind`と、出所・本文・位置・優先度・Token推定・Hash・機密性・揮発性を持つ契約が定義されている。
+`ContextItem`共通型と実行時検証は実装済みだが、複数ソースを束ねるProvider契約と収集オーケストレーターは未実装である。`ContextManager`は将来、収集結果を優先順位付け・重複排除・Token予算へ渡す上位境界として残し、Provider基盤では項目の収集と安全な結果集約だけを行う。
 
 ### 採用する設計判断
 
-1. 設計書の`contentHash`という名前を維持する。Issueの「Hash」はこのフィールドを指し、別名の`hash`は追加しない。
-2. `uri`はシリアライズ済み文字列、`range`は独自の`SerializedRange`とする。VS Code型を共有しないことで、ContextItemをテスト、Prompt構築、将来のStorage境界で安全に受け渡せるようにする。
-3. Rangeは0始まり・半開区間とし、空範囲を許可する。位置の意味を1つに固定し、Providerごとの行番号解釈の差を共通型へ持ち込まない。
-4. `contentHash`はSHA-256 hexに固定する。ハッシュの目的は同じ本文の重複排除・整合性確認であり、`sensitive`判定や送信許可を置き換えない。
-5. 優先度は設計書との互換性のため`number`とする。優先順位の具体的な採用順は`ContextManager`が§8.3に従って決め、ContextItem自体は選別ロジックを持たない。
-6. `sensitive`と`volatile`は単純なbooleanのメタデータとし、意味上の組合せを制限しない。機密性・再収集性は異なる軸であり、片方からもう片方を推測しない。
-7. ContextItemは本文を含むため、StorageやWebviewへ無条件に渡せる公開DTOとはみなさない。将来のログ・永続化・IPCでは、本文を含まない安全な投影型を別途定義する。
+1. Providerの公開メソッドは`collect(request, signal)`に固定し、キャンセル可能性を全Provider共通の必須契約にする。
+2. 収集は全対象Providerを並列に開始する。Providerの登録順を結果の並び順に使い、ネットワーク・I/O完了順によるプロンプト差異を作らない。
+3. タイムアウトはProvider単位とし、タイムアウトしたProviderだけを失敗扱いにする。タイムアウト後の遅延Promiseは観測対象から切り離すが、未処理の拒否を残さない。
+4. 親キャンセルは全体キャンセルとする。Provider単位の失敗と異なり、キャンセル後の部分結果を成功Bundleとして公開しない。
+5. Providerの返却結果は公開前に全件検証する。検証失敗時に一部だけ採用せず、そのProviderの結果を原子的に破棄する。
+6. 収集結果にはProviderごとの安全なOutcomeを含める。診断表示と観測性はOutcomeの有限なコード・件数・時間だけを使い、生例外を伝播させない。
+7. Context Provider基盤では重複排除や優先順位変更をしない。ContextItemの`priority`を保持したまま、後続のContextManager／Deduplicator／Budgeterへ委ねる。
+
+### 実装前に固定するテスト観点
+
+- 2つ以上のFake Providerが異なる完了時間でも、すべての項目が登録順で集約されること
+- 1つのProviderが例外、タイムアウト、壊れたContextItemを返しても、他Providerの正常項目が採用されること
+- ProviderごとにAbortSignalが渡され、タイムアウト時は対象ProviderだけがAbortされること
+- 親Signalの事前中断・実行中中断でProvider呼び出しと結果公開が止まり、遅延結果・遅延例外が混入しないこと
+- Provider ID重複、空または不正なID、対応外Scope、ContextItem ID重複を安全に拒否できること
+- Outcome、エラー、ログへContextItem本文、認証情報、ファイル内容、生例外本文が漏れないこと
 
 ### 完了条件
 
-- 静的、ターン単位、実行中の各コンテキストを、`ContextItem`の同じ必須・任意フィールドで表現できる。
-- 9種のContextItem種別が共通の判別可能な`kind`として型付けされている。
-- URI、Range、Priority、Token推定値、Content Hash、`sensitive`、`volatile`の契約が明文化され、曖昧なProvider固有形式を共通型へ持ち込まない。
-- 機密項目を通常の送信・ログ・保存対象として誤って扱わないための境界が明確になっている。
-- ContextItemの型とunit testが既存のProvider、Storage、Webviewの責務を変更せずにコンパイル・実行できる。
+- 共通インターフェースを通じて複数のFake ProviderからContextItemを収集できる。
+- Providerごとのタイムアウト、キャンセル、例外、結果不正が、他Providerの結果を失わずに個別Outcomeへ変換される。
+- 収集結果の順序とOutcomeが決定的で、親キャンセル後の部分結果を成功扱いしない。
+- Provider基盤がContextItemの優先順位、重複排除、Token予算、Prompt、Storage、UIの責務を侵食しない。

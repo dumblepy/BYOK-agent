@@ -1934,6 +1934,156 @@ artifact://thread-123/tool-result-48
 
 ---
 
+## 8.7 Context Provider基盤
+
+Context Provider基盤は、エディタ、Workspace、Diagnostics、Git、指示ファイルなどの複数ソースから`ContextItem`を収集し、後続の`ContextManager`へ一つの収集結果として渡すExtension Host側の境界である。本節はProviderの個別実装ではなく、Provider共通契約と収集ライフサイクルを定義する。
+
+### 8.7.1 責務分割
+
+```text
+ContextRequest
+      │
+      ▼
+ContextCollector ──┬─ ContextProvider A ──▶ ContextItem[]
+                   ├─ ContextProvider B ──▶ ContextItem[]
+                   └─ ContextProvider C ──▶ ContextItem[]
+                           │
+                           ▼
+             Provider別Outcome + ContextCollectionResult
+                           │
+                           ▼
+        ContextManager / Deduplicator / ContextBudgeter
+```
+
+責務は次のように分離する。
+
+| コンポーネント | 担当 | 担当しないこと |
+|---|---|---|
+| `ContextProvider` | 1つのソースから現在の`ContextItem`を収集し、キャンセルを受け付ける | 他Providerの調整、Prompt構築、重複排除、Token予算、保存、UI通信 |
+| `ContextCollector` | Providerの選択、並列開始、タイムアウト、Abort伝播、結果検証、失敗分離、決定的な集約 | Provider固有のI/O、優先順位の再計算、Prompt構築 |
+| `ContextManager` | 収集結果の分類、優先順位、重複排除、Token予算、コンパクション、Prompt入力への変換 | Provider固有の取得処理、Webviewへの本文公開 |
+
+Providerのファイル、VS Code API、Git、Diagnosticsなどへの依存はProvider自身へ注入する。共通契約は実行時オブジェクトを保持せず、検証済みでシリアライズ可能な`ContextItem`だけを返す。
+
+### 8.7.2 共通インターフェース
+
+```ts
+type ContextScope = "static" | "turn" | "execution";
+
+interface ContextRequest {
+  readonly threadId: string;
+  readonly runId?: string;
+  readonly scope: ContextScope;
+}
+
+interface ContextProvider {
+  readonly id: string;
+  readonly scopes: readonly ContextScope[];
+
+  collect(
+    request: ContextRequest,
+    signal: AbortSignal
+  ): Promise<readonly ContextItem[]>;
+}
+```
+
+`id`は登録・診断・ログ用の安定した不透明識別子とし、本文、URI、APIキー、Authorization、生レスポンスを含めない。空白、制御文字、Provider間で衝突する識別子は登録時に拒否する。`scopes`に`request.scope`が含まれないProviderはその収集処理から除外する。
+
+`ContextRequest`にはProvider間で共有する最小限の識別子とスコープだけを置く。アクティブエディタ、選択範囲、Workspaceサービス、Gitサービスなどは各Providerへ注入し、任意の`unknown`ペイロードやVS Codeの`Uri`・`Range`を共通Requestへ追加しない。共通入力を増やす必要が生じた場合は、本契約とテストを同時に更新する。
+
+### 8.7.3 収集結果と失敗分類
+
+```ts
+type ContextProviderStatus =
+  | "fulfilled"
+  | "failed"
+  | "timed-out"
+  | "cancelled"
+  | "invalid-result";
+
+interface ContextProviderOutcome {
+  readonly providerId: string;
+  readonly status: ContextProviderStatus;
+  readonly itemCount: number;
+  readonly elapsedMs: number;
+  readonly failureCode?:
+    | "provider-failed"
+    | "provider-timeout"
+    | "provider-cancelled"
+    | "invalid-result";
+}
+
+interface ContextCollectionResult {
+  readonly status: "completed" | "cancelled";
+  readonly items: readonly ContextItem[];
+  readonly providers: readonly ContextProviderOutcome[];
+}
+
+interface ContextCollector {
+  collect(
+    request: ContextRequest,
+    signal: AbortSignal
+  ): Promise<ContextCollectionResult>;
+}
+```
+
+Providerの例外は`provider-failed`、Provider固有タイマーの満了は`provider-timeout`、Providerが自身のSignalを確認して中断した場合は`provider-cancelled`、返却値の検証失敗は`invalid-result`へ分類する。これらはProvider単位のOutcomeであり、他Providerの成功項目を失敗にしない。生例外、例外メッセージ、レスポンス本文、ファイル内容はOutcomeに保持しない。
+
+全Providerの収集が終わった場合、Providerが全件失敗していても`status: "completed"`、空の`items`、失敗を含む`providers`を返す。コンテキストが空であることをRun失敗とみなす判断は`ContextManager`または`AgentRuntime`が行う。呼び出し元のAbortSignalが中断された場合は`status: "cancelled"`とし、`items`を空にして部分的なBundleを成功結果として利用できないようにする。
+
+### 8.7.4 並列収集のライフサイクル
+
+1. Collectorは登録済みProviderの重複IDと契約を検証し、`request.scope`をサポートするProviderだけを登録順に選択する。
+2. 親Signalが開始前に中断済みならProviderを呼び出さず、空の項目と`cancelled`結果を返す。
+3. 選択した全Providerの処理を同時に開始する。各Providerには専用の`AbortController`を渡し、親Signalの中断を専用Controllerへ伝播する。
+4. Providerごとに正の有限値である`providerTimeoutMs`を適用する。タイムアウト時は専用Controllerを中断し、そのProviderを`timed-out`として確定する。他Providerは継続する。
+5. Providerが返した配列は、公開前に全件を`parseContextItem`相当の実行時検証へ通す。検証失敗時はそのProviderの全項目を破棄し、`invalid-result`とする。
+6. Provider単位の処理は成功、失敗、タイムアウト、キャンセルのいずれかへ必ず確定し、拒否Promiseを未処理のまま残さない。タイムアウト後・キャンセル後に到着した値や例外は無視する。
+7. 集約順はProviderの登録順、その内部ではProviderが返した配列順とする。完了時刻やPromiseの解決順で並べ替えない。
+8. 親Signalが収集中に中断された場合は全専用Controllerを中断し、完了済みProviderの項目も公開せず、全体を`cancelled`として確定する。
+
+タイムアウトは`Promise.race`で待機を打ち切るだけでは不十分である。必ずAbortを伝播し、Providerが保持するReader、Timer、購読、I/Oを解放できる契約にする。ProviderがAbortSignalを無視する場合でもCollectorは遅延結果を採用せず、遅延Promiseの拒否だけは安全に処理する。
+
+### 8.7.5 ContextItem検証と後続処理への受け渡し
+
+Collectorは次の検証だけを行う。
+
+- Providerが`readonly ContextItem[]`以外を返していないこと
+- 各項目が既存の`ContextItem`契約、`kind`、Range、URI、有限数、Hash、機密性・揮発性の規則を満たすこと
+- 1回の全体収集内で項目IDが重複していないこと
+- Providerが返す項目数と実装上の上限を超えていないこと
+
+Collectorは`priority`を書き換えず、同じ内容の統合、URI・Range・Hashによる重複排除、Token再推定を行わない。検証済みの項目は`ContextManager`へ渡され、§8.3の優先順位、§8.4の予算、後続のDeduplicatorへ進む。`sensitive`項目はこの段階でログ、Webview、永続化へ投影しない。
+
+### 8.7.6 タイムアウト・キャンセル・失敗の境界
+
+| 事象 | 対象Provider | 他Provider | 収集結果 |
+|---|---|---|---|
+| Providerが正常終了 | `fulfilled` | 継続 | 項目を採用 |
+| Providerが例外を返す | `failed` | 継続 | 当該項目を不採用 |
+| Provider単位Timeout | `timed-out` | 継続 | 当該項目を不採用 |
+| ProviderがAbortを検知 | `cancelled` | 継続（親が未中断の場合） | 当該項目を不採用 |
+| ContextItem検証失敗 | `invalid-result` | 継続 | 当該Providerの項目を全件不採用 |
+| 親AbortSignalが中断 | 全Providerを中断 | 全Providerを中断 | `cancelled`、項目は空 |
+
+Provider単位の失敗はAgentの`failed`状態へ直結しない。必要なソースが欠けた場合の扱いは、各Providerの重要度を使う将来のContextManager設計で決定する。現段階では、Providerの重要度や再試行を共通Collectorへ埋め込まない。
+
+### 8.7.7 テスト設計と完了条件
+
+単体テストではFake Providerを使い、外部ファイル、実Workspace、Git、ネットワーク、実APIへ接続しない。最低限、次を検証する。
+
+- 2つ以上のProviderを並列開始し、完了順にかかわらず登録順で項目とOutcomeが安定すること
+- Providerの例外、Provider単位Timeout、壊れたContextItem、ID重複が対象Providerだけを失敗にすること
+- Timeout時に対象ProviderのSignalだけが中断され、他Providerが収集を継続すること
+- 親Signalの事前中断・実行中中断でProvider呼び出しと結果公開が止まり、部分Bundleが返らないこと
+- Providerが遅れて解決・拒否しても、Timeout／Abort後の項目・イベント・未処理拒否が残らないこと
+- Scope非対応Providerが呼び出されないこと、重複Provider IDが登録時に拒否されること
+- Outcomeとログに本文、URI全体、秘密情報、生例外が含まれないこと
+
+完了条件は、共通インターフェースを実装した複数ProviderからContextItemを収集でき、1つのProviderの失敗・Timeout・結果不正が他Providerの正常結果を妨げず、親キャンセルが全レイヤーへ伝播することである。実装後は`pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`を実行する。
+
+---
+
 ## 9. システムプロンプト
 
 ## 9.1 モジュール構造
