@@ -75,6 +75,7 @@ export function createContextItem(
     sensitive: overrides.sensitive ?? false,
     ...(overrides.uri === undefined ? {} : { uri: overrides.uri }),
     ...(overrides.range === undefined ? {} : { range: overrides.range }),
+    ...(overrides.metadata === undefined ? {} : { metadata: overrides.metadata }),
   };
 }
 

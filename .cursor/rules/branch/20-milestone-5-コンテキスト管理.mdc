@@ -1,133 +1,224 @@
 ---
-description: 20-milestone-5-コンテキスト管理ブランチでContext Provider基盤を設計・実装するときに読み込む
+description: 20-milestone-5-コンテキスト管理ブランチでアクティブエディタと選択範囲のContext Providerを設計・実装するときに読み込む
 alwaysApply: false
 ---
-# Milestone 5: Context Provider基盤
+# Milestone 5: アクティブエディタ・選択範囲Context
 
-このブランチでは、複数のコンテキストソースを共通の`ContextProvider`契約で扱い、`ContextCollector`が並列収集・Provider単位のタイムアウト・キャンセル・失敗分離を提供する。本タスクの完了対象はContext Provider基盤と契約テストまでとし、個別Provider、重複排除、Token予算、コンパクション、UI添付、Prompt構築は後続Issueの対象とする。
+このブランチでは、現在フォーカスされているテキストエディタをターン単位のコンテキストとして収集する。アクティブファイルの本文、URI、言語ID、カーソル位置、未保存状態を一つのスナップショットから作成し、非空の選択範囲をファイル本文より高い優先度でモデル入力へ渡せる形にする。保存済みファイルだけでなく、`untitled`ドキュメントもVS Codeが保持するインメモリ本文を使って扱う。
+
+本ファイルは実装方針、設計書、進捗の記録を兼ねる。このブランチでは設計を固定しつつ、実装コードとテストコードを追加し、ContextItem のメタデータ拡張とアクティブエディタ収集を段階的に進める。
 
 ## 実装方針
 
-- `ContextProvider`はソース固有の収集だけを担当し、モデル向けPrompt構築、Token予算、重複排除、履歴保存、UI通信、Tool実行を担当しない。
-- `ContextCollector`はExtension Host側のオーケストレーターとして、対象Providerを登録順に選択し、各Providerの収集を同時に開始する。Providerの完了順ではなく登録順で結果を平坦化し、出力順を決定的にする。
-- Providerは`ContextItem`の配列を返す。返却直後に既存のContextItem実行時検証を通し、1件でも不正な項目、未知の項目、重複IDがあれば、そのProviderの結果だけを破棄して`invalid-result`として記録する。
-- 1つのProviderの例外、タイムアウト、結果不正は他Providerの結果を失敗にしない。全Providerが失敗しても収集処理自体は完了し、空のContextBundleとProvider別結果を返す。空のコンテキストをAgent実行不能とみなすかはContextManager／AgentRuntimeの責務とする。
-- タイムアウトはProviderごとの独立した`AbortController`で管理する。タイマー発火時にProviderへAbortSignalを伝播し、そのProviderだけを`timed-out`として確定する。ProviderがSignalを無視して遅れて返した値や例外は結果へ追加せず、安全に破棄する。
-- 呼び出し元のAbortSignalが中断された場合は全Providerへ中断を伝播し、収集全体を`cancelled`として終了する。キャンセル後に部分的なContextBundleを利用側へ成功結果として公開しない。キャンセルはProvider失敗ではなく、Agentの`USER_CANCELLED`へ変換する。
-- Provider識別子、失敗コード、件数、経過時間だけを診断・ログへ出し、ContextItem本文、ファイル内容、URI全体、例外本文、認証情報をログや失敗情報へ含めない。
-- ProviderのI/O依存はコンストラクター注入する。共通インターフェースにVS CodeのEditor、Uri、Range、Storage、Provider Adapterを持ち込まず、返却値はシリアライズ可能な`ContextItem`に限定する。
-- 実装開始時点では`src/context/context-provider.ts`と`src/context/context-collector.ts`、`tests/unit/context-collector.test.ts`を候補とする。既存の命名、`readonly`、lower-kebab-caseのファイル名に合わせ、実際の配置は設計書と現行構成を再確認して決める。
+- `ActiveEditorContextProvider`は`ContextProvider`の`turn`スコープを実装し、収集時点のアクティブな`TextEditor`を一度だけ読み取る。Providerの共通RequestへVS Codeの`TextEditor`、`TextDocument`、`Uri`、`Range`を追加せず、VS Code依存はAdapterまたは依存性注入で境界内に閉じ込める。
+- Providerは保存済み・未保存を区別してディスクから読み直さない。常に`TextDocument.getText()`を正本とし、編集中の未保存内容をモデルへ渡す。これにより保存前の編集内容、Undo後の内容、`untitled`本文を同じ経路で扱う。
+- 取得処理は同期的なスナップショット作成として設計し、処理の前後でAbortSignalを確認する。収集中にキャンセルされた場合、部分的なファイル項目や選択項目を公開せず、ContextCollectorのキャンセル契約に従う。
+- 一つのアクティブエディタから、通常はファイル項目を1件、非空選択ごとに選択項目を1件返す。複数選択は`TextEditor.selections`の順序を維持し、主選択はインデックス0として扱う。空のカーソルは選択項目を作らない。
+- 選択項目には対象範囲と本文を保持させ、ファイル項目には文書全体と編集対象のメタデータを保持させる。選択項目の優先度はファイル項目より高くするが、明示添付を最優先とする既存の全体優先順位は変更しない。
+- `languageId`、主カーソル、`isUntitled`は本文へ文字列連結して埋め込まず、検証可能な型付きメタデータとしてContextItemからモデル向け変換層へ渡す。ContextItemの既存の未知プロパティ拒否を維持し、メタデータのスキーマを同時に拡張する。
+- URIはコンテキスト本文とモデル向けメタデータには必要な識別子として保持するが、診断ログ、Outcome、永続化イベント、Webviewメッセージへは出さない。APIキー、Authorization、ローカル本文のログ出力も行わない。
+- Providerは選択、重複排除、Token予算、履歴圧縮、Prompt文字列構築を担当しない。ContextItemの`priority`と`contentHash`を正しく設定してContextManagerへ渡し、既存の§8.3、§8.4、§8.5の後続処理に委ねる。
+- 実装時の候補は`src/context/context-item.ts`、`src/context/active-editor-context-provider.ts`、VS Code境界Adapter、`tests/unit/context-item.test.ts`、`tests/unit/active-editor-context-provider.test.ts`とする。今回はこの候補に沿って実装を追加する。
 
-## 共通契約
+## 設計書
+
+### 1. 責務と境界
+
+```text
+VS Code window.activeTextEditor
+          │
+          ▼
+ActiveEditorReader ──(EditorSnapshot)──▶ ActiveEditorContextProvider
+                                             │
+                                             ▼
+                                   ContextItem[]（検証済み）
+                                             │
+                                             ▼
+                          ContextCollector / ContextManager
+                                             │
+                                             ▼
+                                      モデル入力
+```
+
+責務を次のように分ける。
+
+| コンポーネント | 担当 | 担当しないこと |
+|---|---|---|
+| `ActiveEditorReader` | `window.activeTextEditor`から本文、位置、URI、言語などを一回でスナップショット化する | ContextItemの優先順位、Prompt構築、ログ、保存 |
+| `ActiveEditorContextProvider` | Snapshotを`file`項目と`selection`項目へ変換し、ContextItem契約へ合わせる | ディスク再読込、他Provider調整、重複排除、Token予算 |
+| `ContextCollector` | Providerの実行、タイムアウト、Abort、結果検証、決定的な集約 | エディタ固有の取得、優先度再計算、Prompt構築 |
+| `ContextManager` / モデル向け変換層 | 優先順位、予算配分、メタデータを含むモデル入力への整形 | VS Code APIへの直接アクセス |
+
+### 2. Snapshot契約
+
+VS Code APIの実体をProviderの共通契約へ漏らさないため、Adapterの戻り値を次のシリアライズ可能な型として定義する。`undefined`はテキストエディタがアクティブでない状態を表し、失敗ではない。
 
 ```ts
-type ContextScope = "static" | "turn" | "execution";
-
-interface ContextRequest {
-  readonly threadId: string;
-  readonly runId?: string;
-  readonly scope: ContextScope;
+interface ActiveEditorSnapshot {
+  readonly uri: string;
+  readonly languageId: string;
+  readonly text: string;
+  readonly documentRange: SerializedRange;
+  readonly cursor: SerializedPosition;
+  readonly selections: readonly SerializedRange[];
+  readonly isUntitled: boolean;
+  readonly isDirty: boolean;
+  readonly documentVersion: number;
 }
 
-interface ContextProvider {
-  readonly id: string;
-  readonly scopes: readonly ContextScope[];
-
-  collect(
-    request: ContextRequest,
-    signal: AbortSignal
-  ): Promise<readonly ContextItem[]>;
+interface ActiveEditorReader {
+  read(): ActiveEditorSnapshot | undefined;
 }
 ```
 
-`ContextRequest`はProvider間で共通化すべき識別子と収集スコープだけを持つ。アクティブエディタ、診断、Git、Workspaceなどの実行時依存は各Providerへ注入し、共通Requestへ任意の`unknown`ペイロードを追加しない。将来共通化が必要な入力は設計書を更新してから契約へ追加する。
+Snapshotは`TextDocument.getText()`、`TextEditor.selections[0].active`、`TextDocument.languageId`、`TextDocument.uri.toString()`、`TextDocument.isUntitled`、`TextDocument.isDirty`、`TextDocument.version`から同一同期呼び出し内で作成する。`documentRange`は文書全体を表すゼロベースの半開区間とし、空文書は`{ start: { line: 0, character: 0 }, end: { line: 0, character: 0 } }`とする。
+
+`documentVersion`はProviderが取得時点を検証するための内部情報であり、モデルへ必須で渡す表示情報ではない。Snapshot作成後に文書が変わった場合、本文・範囲・カーソルの組み合わせが不整合になる可能性があるため、実装時は再取得して混在させず、取得開始時の一貫したSnapshotを一回のRunへ固定する。次ターンでは新しいSnapshotを作る。
+
+### 3. ContextItemへの変換
+
+既存の`ContextItem`に型付きの任意メタデータを追加する。未知プロパティ拒否、SHA-256本文ハッシュ、URI・Range検証は維持する。
 
 ```ts
-type ContextProviderStatus =
-  | "fulfilled"
-  | "failed"
-  | "timed-out"
-  | "cancelled"
-  | "invalid-result";
-
-interface ContextProviderOutcome {
-  readonly providerId: string;
-  readonly status: ContextProviderStatus;
-  readonly itemCount: number;
-  readonly elapsedMs: number;
-  readonly failureCode?:
-    | "provider-failed"
-    | "provider-timeout"
-    | "provider-cancelled"
-    | "invalid-result";
+interface EditorContextMetadata {
+  readonly languageId: string;
+  readonly cursor?: SerializedPosition;
+  readonly isUntitled: boolean;
+  readonly isDirty: boolean;
 }
 
-interface ContextCollectionResult {
-  readonly status: "completed" | "cancelled";
-  readonly items: readonly ContextItem[];
-  readonly providers: readonly ContextProviderOutcome[];
-}
-
-interface ContextCollector {
-  collect(
-    request: ContextRequest,
-    signal: AbortSignal
-  ): Promise<ContextCollectionResult>;
+interface ContextItem {
+  // 既存フィールドは省略
+  readonly metadata?: {
+    readonly editor?: EditorContextMetadata;
+  };
 }
 ```
 
-上記は設計上の契約であり、実装の正本は`src/context/context-provider.ts`と`src/context/context-collector.ts`を参照する。`ContextItem`の詳細は`documents/design.md` §8.2と既存の`src/context/context-item.ts`を正本とする。
+メタデータはAdapterの生オブジェクトをそのまま渡さず、文字列長・制御文字・列挙値・位置の妥当性を実行時検証する。`languageId`が空または制御文字を含む場合はProvider結果を原子的に不採用とする。`isUntitled`と`isDirty`はbooleanとして保持する。`documentVersion`、`viewColumn`、可視範囲、UIラベルは今回のモデル入力契約には含めない。
+
+作成する項目の規則は次のとおりとする。
+
+| 項目 | `kind` | `source` | `content` | `uri` / `range` | 優先度 |
+|---|---|---|---|---|---:|
+| アクティブファイル | `file` | `active-editor` | Snapshotの全文 | URI、文書全体Range | `ACTIVE_FILE_PRIORITY` |
+| 非空選択 | `selection` | `active-editor-selection` | `document.getText(selection)`相当の選択本文 | URI、選択Range | `ACTIVE_SELECTION_PRIORITY` |
+
+`ACTIVE_SELECTION_PRIORITY`は`ACTIVE_FILE_PRIORITY`より大きくする。選択の本文はファイル項目へ重複連結せず、選択項目の`range`でファイル内位置を識別できるようにする。各項目の`contentHash`は最終的な本文から計算し、`estimatedTokens`は既存の推定方法で項目ごとに計算する。項目IDはURIと範囲を含む安定した構成にするが、OSパスをログへ出力する用途には使わない。現在の実装では、選択ごとの独立 `ContextItem` を返し、ファイル項目の前に並べることで選択を最優先にしている。
+
+選択項目のメタデータには`languageId`、主カーソル、未保存状態を付ける。これにより、後段が選択項目だけを採用した場合でも、モデルはコードの言語、編集位置、未保存ドキュメントであることを失わない。複数選択では各選択項目に同じ主カーソルを繰り返さず、メタデータの`cursor`は主選択項目だけに設定する。ファイル項目には常に主カーソルを設定する。
+
+### 4. 収集フロー
+
+1. `ContextCollector`が`turn`スコープのProviderとして呼び出す。
+2. Providerは開始時にAbortSignalを確認する。
+3. `ActiveEditorReader.read()`を一度だけ呼び出し、Snapshotをローカル変数へ固定する。
+4. Snapshotが`undefined`なら、空配列を正常結果として返す。これはNotebook・カスタムエディタ・検索ビューなど、アクティブなテキストエディタがない状態を含む。
+5. URI、言語ID、位置、各選択範囲を検証する。範囲は文書内にあり、開始位置が終了位置を越えないことを確認する。
+6. ファイル項目を一件作り、`TextEditor.selections`の順序で非空選択項目を作る。
+7. ContextCollectorの共通検証へ渡し、全項目が有効な場合だけ結果を公開する。不正項目が一つでもあればこのProviderの全結果を破棄する。
+8. ContextManagerは選択項目をファイル項目より先に採用し、予算超過時は既存の全体予算規則で調整する。
+
+Provider内で収集時刻をまたぐ非同期I/Oは行わない。AbortSignalの中断を検知した場合は項目を返さず、遅延した呼び出し元の結果を採用しない。Provider単位のタイムアウトや全体キャンセルの結果コードは既存のContextCollector契約に従う。
+
+### 5. 保存済み・Untitled・未保存変更の扱い
+
+| 状態 | URI | 本文の取得元 | 方針 |
+|---|---|---|---|
+| 保存済み・未変更 | 通常は`file:` | `TextDocument.getText()` | 現在のエディタ内容を収集 |
+| 保存済み・未保存変更あり | 通常は`file:` | `TextDocument.getText()` | ディスク内容ではなく編集中の内容を収集し、`isDirty: true`を付与 |
+| Untitled | `untitled:` | `TextDocument.getText()` | ファイルシステムアクセスをせず、URIと言語IDと本文を収集し、`isUntitled: true`を付与 |
+| テキストエディタなし | なし | なし | 空の正常結果。エラーやダミー項目は作らない |
+
+`untitled`のURIを`file` URIへ変換したり、保存先を推測したりしない。関連パスを持つUntitledであっても、現時点のURIを識別子として使用する。Untitled文書の本文・URI・言語IDはユーザーが明示的にモデルへ送る現在の編集対象に含まれるため、Providerは通常のファイルと同じContextItemへ変換するが、ログ・保存・Webviewへは投影しない。
+
+### 6. 優先順位、重複、モデル入力
+
+- 既存の全体優先順位では「明示添付 > 現在の選択範囲 > 現在のファイル」を維持する。
+- このProvider内では、選択項目をファイル項目より先に返すか、少なくとも`priority`で明確に上位とする。最終の採用順はContextManagerの優先順位規則を正本とする。
+- 同一選択範囲が別経路で再収集された場合の統合はProviderで行わず、URI・Range・内容Hashによる既存の重複排除へ委ねる。
+- ファイル項目のメタデータには言語ID、主カーソル、Untitled／Dirty状態を含め、モデル向け変換層はこれを言語指定、位置情報、編集状態として整形する。本文へ未検証のMarkdown、コードフェンス、命令文を自動付加しない。
+- 選択項目は「ユーザーが明示した本文」として扱うが、選択本文自体は信頼できない入力である。システム安全規則や権限判断をContextItemの内容で上書きさせない。
+
+### 7. セキュリティとデータ鮮度
+
+- URIは既存`ContextItem`の安全なURI検証を通す。資格情報を含むURI、制御文字、危険なスキームは拒否する。
+- 本文、URI、言語ID、選択範囲、カーソル位置は診断ログへ出さない。成功・失敗ログはProvider ID、状態、件数、経過時間だけに限定する。
+- ContextItemは今回のProviderでは永続化しない。保存が必要になった場合も、既存Storage規則と明示コンテキストの保存禁止対象を再確認する。
+- `documentVersion`を取得してSnapshotの内部整合性を検証できるようにする。ただし競合を自動解決せず、変更検知時の再収集またはRunキャンセルは上位のライフサイクル設計で決める。
+- Webviewから受信したパス、URI、範囲をアクティブエディタの根拠にしない。現在のエディタはExtension HostのVS Code APIからのみ取得する。
+
+### 8. テスト設計と完了条件
+
+外部Workspace、実ファイル、ネットワーク、実APIを使わず、Fake `ActiveEditorReader`と純粋なSnapshotを使う。最低限、次をテスト計画へ含める。
+
+- アクティブファイルのURI、全文、言語ID、主カーソル、文書全体Range、Dirty状態が一貫した項目へ変換されること
+- 非空の単一選択が`selection`項目として追加され、ファイル項目より高い優先度と正しいRange・本文・Hashを持つこと
+- 複数選択が順序を維持し、空選択は項目を作らず、主カーソルが正しく保持されること
+- 保存済みファイルと`untitled`ファイルでファイルシステムを参照せず、`isUntitled`とURIを区別できること
+- 未保存変更がディスク上の仮データではなくSnapshot本文へ反映され、`isDirty`が保持されること
+- アクティブなテキストエディタがない場合に正常な空結果となること
+- 不正なURI、言語ID、範囲、メタデータ、ContextItemがある場合、Provider結果全体を原子的に破棄すること
+- AbortSignalの事前中断・中断後に部分結果を公開しないこと
+- 同一Snapshotから生成した項目の本文HashとToken推定が再現可能であること
+- ログ、Outcome、永続化対象へ本文、URI全体、言語ID、生例外を漏らさないこと
+
+完了条件は、アクティブなテキストエディタの現在本文を、言語ID・主カーソル・URI・Untitled状態付きの`file` ContextItemとして取得でき、非空選択をそれより高い優先度の`selection` ContextItemとしてモデル入力へ変換できることである。保存前のUntitled本文でも同じ完了条件を満たす。実装後の検証コマンドは`pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`であり、このブランチでは実行済みである。
 
 ## 進捗
 
-- [x] 既存のContextItem契約、ContextManager境界、エラー・ログ・テスト規則を調査する
-- [x] ContextProvider共通インターフェース、ContextRequest、収集結果の契約を設計する
-- [x] 並列実行、Provider単位タイムアウト、親AbortSignal伝播、遅延結果破棄の方針を設計する
-- [x] Provider単位の失敗分離、結果検証、決定的な結果順序、機密情報非漏えいの方針を設計する
-- [x] `ContextProvider`共通型と`ContextCollector`を実装する
-- [x] 並列収集、タイムアウト、キャンセル、失敗分離のunit testを追加する
-- [x] Provider contract testのFake Provider基盤を追加する
+- [x] `.cursor/rules/project.mdc`、既存のブランチルール、`documents/design.md` §8、`documents/issues.md`の対象要求を確認する
+- [x] VS Codeのアクティブエディタ、TextDocument、Selection、UntitledのAPI境界を調査する
+- [x] Snapshot契約、ContextItemメタデータ、ファイル項目・選択項目の変換規則を設計する
+- [x] 優先順位、複数選択、空選択、未保存本文、キャンセル、データ鮮度の方針を設計する
+- [x] ContextItemのメタデータ契約を実装する
+- [x] ActiveEditorReaderとActiveEditorContextProviderを実装する
+- [x] Provider単体テストとContextCollector接続テストを追加する
+- [x] ContextManagerの優先順位、重複排除、Token予算、モデル向け変換を実装する
 - [x] `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`を実行する
-- [x] 完了条件「複数ソースからコンテキストを収集できる」をFake Providerで確認する
+- [x] 完了条件「現在の編集対象をモデルへ渡せる」を実装とテストで確認する
 
 ## 参考資料
 
-- `documents/issues.md` — Milestone 5「Context Provider基盤を実装する」の要求と完了条件
-- `documents/design.md` §8.1〜§8.6 — コンテキスト分類、共通項目、優先順位、予算、圧縮
-- `documents/design.md` §8.7 — Context Provider基盤の共通契約と収集ライフサイクル
-- `documents/design.md` §17〜§19 — ContextManager境界、エラー分類、テストとログの方針
-- `.cursor/rules/project.mdc` — `SYW-CONTEXT-001`〜`SYW-CONTEXT-007`、`SYW-ERR-001`、`SYW-SEC-004`、`SYW-TEST-001`〜`SYW-TEST-002`
-- `src/context/context-item.ts` — ContextItemのランタイム検証と既存の共通型
-- `src/providers/provider-adapter.ts` — AbortSignalとAsyncIterableの境界設計を確認する参照資料
+- `documents/issues.md` — Milestone 5「アクティブエディタと選択範囲を収集する」の要求と完了条件
+- `documents/design.md` §8.1〜§8.6 — コンテキスト分類、ContextItem、優先順位、Token予算、履歴圧縮
+- `documents/design.md` §8.7 — Context Providerの契約、キャンセル、結果検証、失敗分離
+- `.cursor/rules/project.mdc` — `SYW-CONTEXT-001`〜`SYW-CONTEXT-007`、`SYW-SEC-002`、`SYW-SEC-004`、`SYW-TEST-001`〜`SYW-TEST-002`
+- `src/context/context-item.ts` — 現行ContextItemの実行時検証、URI、Range、Hashの契約
+- `src/context/context-provider.ts`、`src/context/context-collector.ts` — 現行Context Provider共通契約と収集ライフサイクル
+- VS Code Extension API Reference — `window.activeTextEditor`、`TextEditor.selection(s)`、`TextDocument.getText()`、`languageId`、`isUntitled`、`isDirty`、`version`
+  - https://code.visualstudio.com/api/references/vscode-api
 
 ## 調査結果・設計まとめ
 
 ### 現状
 
-`ContextItem`共通型と実行時検証は実装済みだが、複数ソースを束ねるProvider契約と収集オーケストレーターは未実装である。`ContextManager`は将来、収集結果を優先順位付け・重複排除・Token予算へ渡す上位境界として残し、Provider基盤では項目の収集と安全な結果集約だけを行う。
+ContextItemとContext Provider基盤は既に存在する。既存ContextItemは本文、URI、Range、優先度、Token推定、Hash、`volatile`、`sensitive`を扱えるが、言語IDとカーソル位置を型付きで保持するフィールドはない。そのため、アクティブエディタContextを実装する前に、ContextItemの未知プロパティ拒否を壊さないメタデータ拡張が必要である。
+
+VS Codeの`window.activeTextEditor`はアクティブなテキストエディタがない場合に値を持たない。`TextEditor`は主選択を`selection`、全選択を`selections`で公開し、`TextDocument`は本文、`languageId`、URI、`isUntitled`、`isDirty`、`version`を提供する。Untitledや未保存変更を特別なファイルI/O経路に分ける必要はなく、エディタのインメモリ本文を読む方が現在の編集対象と一致する。
 
 ### 採用する設計判断
 
-1. Providerの公開メソッドは`collect(request, signal)`に固定し、キャンセル可能性を全Provider共通の必須契約にする。
-2. 収集は全対象Providerを並列に開始する。Providerの登録順を結果の並び順に使い、ネットワーク・I/O完了順によるプロンプト差異を作らない。
-3. タイムアウトはProvider単位とし、タイムアウトしたProviderだけを失敗扱いにする。タイムアウト後の遅延Promiseは観測対象から切り離すが、未処理の拒否を残さない。
-4. 親キャンセルは全体キャンセルとする。Provider単位の失敗と異なり、キャンセル後の部分結果を成功Bundleとして公開しない。
-5. Providerの返却結果は公開前に全件検証する。検証失敗時に一部だけ採用せず、そのProviderの結果を原子的に破棄する。
-6. 収集結果にはProviderごとの安全なOutcomeを含める。診断表示と観測性はOutcomeの有限なコード・件数・時間だけを使い、生例外を伝播させない。
-7. Context Provider基盤では重複排除や優先順位変更をしない。ContextItemの`priority`を保持したまま、後続のContextManager／Deduplicator／Budgeterへ委ねる。
+1. VS Code APIの読み取りを`ActiveEditorReader`へ隔離し、ProviderのテストはSnapshotだけで完結させる。
+2. 一回の収集でSnapshotを固定し、ファイル本文・選択本文・位置・言語の世代を混在させない。
+3. 選択は非空範囲ごとの独立ContextItemにし、ファイル項目より高い優先度を設定する。明示添付が選択より優先される既存の全体規則は維持する。
+4. UntitledはURIの変換や保存先推測をせず、`TextDocument.getText()`の内容を通常のファイルContextと同じ形式でモデルへ渡す。
+5. 言語ID、カーソル、Untitled／Dirty状態は本文へ埋め込まず、検証済みEditorContextMetadataとして保持する。
+6. Providerはモデル呼び出しやPrompt構築を行わず、ContextManager／モデル向け変換層がメタデータを含む入力へ変換する。
+7. ContextItemの不正は部分採用せず、Provider結果を原子的に破棄する。Abort後の結果は公開しない。
 
-### 実装前に固定するテスト観点
+### 実装開始前に固定する確認事項
 
-- 2つ以上のFake Providerが異なる完了時間でも、すべての項目が登録順で集約されること
-- 1つのProviderが例外、タイムアウト、壊れたContextItemを返しても、他Providerの正常項目が採用されること
-- ProviderごとにAbortSignalが渡され、タイムアウト時は対象ProviderだけがAbortされること
-- 親Signalの事前中断・実行中中断でProvider呼び出しと結果公開が止まり、遅延結果・遅延例外が混入しないこと
-- Provider ID重複、空または不正なID、対応外Scope、ContextItem ID重複を安全に拒否できること
-- Outcome、エラー、ログへContextItem本文、認証情報、ファイル内容、生例外本文が漏れないこと
+- ContextItemメタデータは `metadata.editor` として拡張し、既存の未知プロパティ拒否を維持する
+- 文書全文のサイズ上限とToken予算による切り詰めをProviderで行わず、ContextManagerへ委ねる境界を維持する
+- 複数選択を全件採用する上限と、大量選択時の安全な上限エラーをContextItem上限と整合させる
+- Snapshot作成後の`documentVersion`変化を、再収集・Runキャンセル・取得時点固定のどれで扱うかをAgent Runのライフサイクルと接続する
+- モデル向け出力でURIを表示する範囲と、Untitledのユーザー入力をどのラベルで表現するかをPrompt Module側で確定する
 
 ### 完了条件
 
-- 共通インターフェースを通じて複数のFake ProviderからContextItemを収集できる。
-- Providerごとのタイムアウト、キャンセル、例外、結果不正が、他Providerの結果を失わずに個別Outcomeへ変換される。
-- 収集結果の順序とOutcomeが決定的で、親キャンセル後の部分結果を成功扱いしない。
-- Provider基盤がContextItemの優先順位、重複排除、Token予算、Prompt、Storage、UIの責務を侵食しない。
+- アクティブなテキストエディタがあれば、現在の本文、言語ID、主カーソル、URI、未保存状態を一貫したContextとして収集できる。
+- 非空選択はファイル本文とは別に収集され、既存の優先順位規則に従ってファイルより先にモデルへ渡せる。
+- Untitledおよび未保存変更の本文がディスク内容に置換されず、モデル向けContextとして利用できる。
+- エディタがない場合、キャンセル時、不正な結果時に、誤ったダミー本文や部分的な成功Contextを公開しない。
+- `ContextItem.metadata.editor`、`ActiveEditorContextProvider`、`DefaultContextManager`の実装・テストが完了しており、現在の編集対象を検証済みモデル入力項目へ変換できる。

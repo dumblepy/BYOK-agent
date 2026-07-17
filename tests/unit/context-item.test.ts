@@ -77,6 +77,19 @@ describe("ContextItem", () => {
     }
   });
 
+  it("preserves typed editor metadata", () => {
+    const metadata = {
+      editor: {
+        languageId: "typescript",
+        cursor: { line: 2, character: 8 },
+        isUntitled: true,
+        isDirty: true,
+      },
+    };
+
+    expect(parseContextItem({ ...baseItem, metadata })).toMatchObject({ metadata });
+  });
+
   it("computes a lowercase SHA-256 hash from UTF-8 content", () => {
     expect(computeContextContentHash("日本語\n")).toMatch(/^[0-9a-f]{64}$/);
     expect(computeContextContentHash("same")).toBe(computeContextContentHash("same"));
@@ -113,6 +126,36 @@ describe("ContextItem", () => {
         },
       }),
     ).toThrow("non-negative");
+  });
+
+  it("rejects invalid metadata", () => {
+    expect(() =>
+      parseContextItem({
+        ...baseItem,
+        metadata: {
+          editor: {
+            languageId: "typescript",
+            cursor: { line: 0, character: 0 },
+            isUntitled: false,
+            isDirty: true,
+            extra: true,
+          },
+        },
+      }),
+    ).toThrow("unknown property");
+
+    expect(() =>
+      parseContextItem({
+        ...baseItem,
+        metadata: {
+          editor: {
+            languageId: "",
+            isUntitled: false,
+            isDirty: false,
+          },
+        },
+      }),
+    ).toThrow("safe identifier");
   });
 
   it("rejects unsafe or credential-bearing URIs", () => {

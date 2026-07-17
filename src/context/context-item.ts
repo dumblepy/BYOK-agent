@@ -21,6 +21,17 @@ export interface SerializedRange {
   readonly end: SerializedPosition;
 }
 
+export interface EditorContextMetadata {
+  readonly languageId: string;
+  readonly cursor?: SerializedPosition;
+  readonly isUntitled: boolean;
+  readonly isDirty: boolean;
+}
+
+export interface ContextItemMetadata {
+  readonly editor?: EditorContextMetadata;
+}
+
 export interface ContextItem {
   readonly id: string;
   readonly kind: ContextItemKind;
@@ -28,6 +39,7 @@ export interface ContextItem {
   readonly content: string;
   readonly uri?: string;
   readonly range?: SerializedRange;
+  readonly metadata?: ContextItemMetadata;
   readonly priority: number;
   readonly estimatedTokens: number;
   readonly contentHash: string;
@@ -42,6 +54,7 @@ const CONTEXT_ITEM_KEYS = new Set([
   "content",
   "uri",
   "range",
+  "metadata",
   "priority",
   "estimatedTokens",
   "contentHash",
@@ -94,6 +107,7 @@ export function parseContextItem(input: unknown): ContextItem {
   const content = requireString(input.content, "content");
   const uri = input.uri === undefined ? undefined : requireUri(input.uri);
   const range = input.range === undefined ? undefined : parseRange(input.range);
+  const metadata = input.metadata === undefined ? undefined : parseMetadata(input.metadata);
   const priority = requireFiniteNumber(input.priority, "priority");
   const estimatedTokens = requireFiniteNumber(input.estimatedTokens, "estimatedTokens");
   if (estimatedTokens < 0) {
@@ -116,6 +130,7 @@ export function parseContextItem(input: unknown): ContextItem {
     content,
     ...(uri === undefined ? {} : { uri }),
     ...(range === undefined ? {} : { range }),
+    ...(metadata === undefined ? {} : { metadata }),
     priority,
     estimatedTokens,
     contentHash,
@@ -147,6 +162,40 @@ function parseRange(input: unknown): SerializedRange {
     throw new ContextItemValidationError("range.start must not be after range.end");
   }
   return { start, end };
+}
+
+function parseMetadata(input: unknown): ContextItemMetadata {
+  if (!isRecord(input)) {
+    throw new ContextItemValidationError("metadata must be an object");
+  }
+  if (!hasOnlyKeys(input, ["editor"])) {
+    throw new ContextItemValidationError("metadata contains an unknown property");
+  }
+
+  const editor = input.editor === undefined ? undefined : parseEditorMetadata(input.editor);
+  return editor === undefined ? {} : { editor };
+}
+
+function parseEditorMetadata(input: unknown): EditorContextMetadata {
+  if (!isRecord(input)) {
+    throw new ContextItemValidationError("metadata.editor must be an object");
+  }
+  if (!hasOnlyKeys(input, ["languageId", "cursor", "isUntitled", "isDirty"])) {
+    throw new ContextItemValidationError("metadata.editor contains an unknown property");
+  }
+
+  const languageId = requireSafeIdentifier(input.languageId, "metadata.editor.languageId");
+  const cursor =
+    input.cursor === undefined ? undefined : parsePosition(input.cursor, "metadata.editor.cursor");
+  const isUntitled = requireBoolean(input.isUntitled, "metadata.editor.isUntitled");
+  const isDirty = requireBoolean(input.isDirty, "metadata.editor.isDirty");
+
+  return {
+    languageId,
+    ...(cursor === undefined ? {} : { cursor }),
+    isUntitled,
+    isDirty,
+  };
 }
 
 function parsePosition(input: unknown, field: string): SerializedPosition {
