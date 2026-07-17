@@ -1,0 +1,144 @@
+---
+description: 20-milestone-5-コンテキスト管理ブランチでContextItem共通型を設計・実装するときに読み込む
+alwaysApply: false
+---
+# Milestone 5: ContextItem共通型
+
+このブランチでは、静的・ターン単位・実行中のすべてのコンテキストを同じデータ契約で表現するため、`ContextItem`共通型を定義する。本ブランチの対象は共通型とその契約テストまでとし、Context Provider、収集処理、重複排除、予算計算、コンパクション、UI添付機能は後続Issueの対象とする。
+
+## 実装方針
+
+- `ContextItem`はExtension Host内で使うシリアライズ可能なデータDTOとする。VS Codeの`Uri`、`Range`、Editorなどの実行時オブジェクトや、Provider・Storage・UIのサービスへ直接依存させない。
+- 詳細設計`documents/design.md` §8.2の契約を正本とし、`kind`、`source`、`content`、`uri`、`range`、`priority`、`estimatedTokens`、`contentHash`、`volatile`、`sensitive`を共通項目として扱う。Issueに明記された項目だけでなく、出所と本文も共通形式に含める。
+- 型定義は`src/context/context-item.ts`に置く。既存のExtension側TypeScriptの命名・`readonly`・`interface`中心の方針に合わせ、公開プロパティは読み取り専用にする。
+- `ContextItem`は生成・収集・マスク・永続化を担当しない。型定義と、必要な範囲の純粋な契約検証だけを置き、Provider固有の判断を共通型へ持ち込まない。
+- `content`はコンテキスト本文そのものを表す。機密判定や送信前マスクを通過したことを`contentHash`やフラグだけで表現しない。`sensitive: true`の項目は、後続層で送信・ログ・永続化・Webview表示を禁止または明示的な安全処理の対象とする。
+- `volatile`と`sensitive`は独立した属性とする。両方`true`の項目を許可し、`volatile`はターン／実行ごとの再収集対象、`sensitive`は機密扱いを意味する。どちらも本文の内容を推測するためのフラグではない。
+- ハッシュは重複排除と整合性確認のための値であり、機密情報保護・認証・安全性の根拠にはしない。ハッシュから本文を復元できないことを前提にした設計や、ハッシュだけをログへ出して安全とみなす設計は禁止する。
+
+## データ契約
+
+```ts
+export type ContextItemKind =
+  | "instruction"
+  | "workspace"
+  | "file"
+  | "selection"
+  | "symbol"
+  | "diagnostic"
+  | "git"
+  | "tool-result"
+  | "conversation-summary";
+
+export interface SerializedPosition {
+  readonly line: number;
+  readonly character: number;
+}
+
+export interface SerializedRange {
+  readonly start: SerializedPosition;
+  readonly end: SerializedPosition;
+}
+
+export interface ContextItem {
+  readonly id: string;
+  readonly kind: ContextItemKind;
+  readonly source: string;
+  readonly content: string;
+  readonly uri?: string;
+  readonly range?: SerializedRange;
+  readonly priority: number;
+  readonly estimatedTokens: number;
+  readonly contentHash: string;
+  readonly volatile: boolean;
+  readonly sensitive: boolean;
+}
+```
+
+### 各フィールドの意味
+
+| フィールド | 契約 |
+|---|---|
+| `id` | 1つの収集結果内で項目を識別する不透明なID。本文、URI、秘密情報から推測可能な値を直接組み立てない。 |
+| `kind` | 設計書§8.2に定める9種の固定列挙。ProviderやUIの都合で自由文字列を追加しない。 |
+| `source` | 生成元を示す安定した識別子。表示文言、本文、APIキー、Authorization、生レスポンスを含めない。 |
+| `content` | モデルへ渡す候補となるテキスト本文。空文字は型上許可するが、採用可否はContext Manager側で判断する。 |
+| `uri` | ファイル等の出典を表すシリアライズ済みURI。未関連の項目では省略する。ローカルパスを代用せず、認証情報を含むURIを許可しない。 |
+| `range` | `uri`内の位置を表す範囲。VS Code互換の0始まりの行・文字位置、終端を含まない半開区間とする。全体ファイルを表す場合は省略可能とする。 |
+| `priority` | 採用競合時の数値優先度。有限な数値とし、値が大きいほど優先する。優先順位の意味付けと再配分はContext Manager側で行う。 |
+| `estimatedTokens` | `content`をモデルへ渡した場合の推定Token数。有限の0以上の数値とし、未計算を負数や`NaN`で表さない。推定値を実測Usageとして扱わない。 |
+| `contentHash` | `content`のUTF-8バイト列に対する小文字のSHA-256 hex（64文字）。本文を意味変更する正規化をハッシュ計算前に暗黙適用しない。 |
+| `volatile` | 現在の状態に依存し、ターンまたは実行単位で更新され得る項目であることを示す。キャッシュ・再利用・永続化の判断は利用側で行う。 |
+| `sensitive` | 本文または出典に機密性があり、通常のPrompt・ログ・Storage・Webviewへそのまま出してはならないことを示す。機密性のないことを示す値ではない。 |
+
+### `SerializedRange`の不変条件
+
+- `line`と`character`は0以上の安全な整数とする。負数、小数、`NaN`、`Infinity`、過大な値を許可しない。
+- `start`は`end`より後になってはならない。行が同じ場合は`start.character <= end.character`、行が異なる場合は`start.line < end.line`であることを要求する。
+- `start`と`end`の位置は同じでもよく、空の選択範囲を表現できるようにする。
+- VS Codeの実行時`Range`を型に持ち込まず、JSONへ安全に変換した値だけを`ContextItem`に格納する。
+
+### 正規化・検証境界
+
+- TypeScriptの型だけでは実行時入力を検証できないため、外部境界から復元する場合はContext層のランタイム検証を通す。未知の`kind`、未知フィールド、必須値欠落、範囲不整合、非有限数、ハッシュ形式不正は拒否する。
+- URIは文字列として保持するが、後続のPath Security規則に従って正規化・ワークスペース境界確認を行う。`file` URIとローカルパスを同一視せず、`..`脱出、認証情報、危険なスキームを許可しない。
+- `contentHash`は本文のUTF-8バイト列から明示的に計算する。改行、Unicode、末尾空白を勝手に変換してハッシュだけ一致させることは禁止する。重複排除で正規化本文を使う必要がある場合は、正規化後本文を別のContextItemとして扱うか、その規約を先に明記する。
+- `priority`と`estimatedTokens`は`number`で公開するが、生成時・入力時は有限値を検証する。`estimatedTokens`は整数を基本とし、小数を扱う場合はToken推定器の契約として別途固定する。
+- `id`と`source`は表示・Promptテンプレート・ファイルパスの断片として無検証で解釈しない。ログへ記録する場合も、本文・Secret・認証情報を含まない安全な識別子へ制限する。
+
+## 実装単位とテスト方針
+
+実装を開始する際は次の小さい単位で進める。
+
+1. `src/context/context-item.ts`に`ContextItemKind`、`SerializedPosition`、`SerializedRange`、`ContextItem`を追加する。
+2. `ContextItem`が既存の`src/context/tool-result-artifact.ts`やProvider型を再利用せず、単独でExtension側TypeScriptをコンパイルできることを確認する。
+3. 必要なランタイム検証を同じContext層の純粋関数として追加する場合は、返却値を型付きの新しいオブジェクトにし、入力オブジェクトを変更しない。検証が不要な範囲でサービスやI/Oを追加しない。
+4. `tests/unit/context-item.test.ts`で、全`kind`、必須・任意フィールド、`readonly`前提の型利用、Rangeの0始まり・半開区間、同位置の空Range、優先度、Token推定値、SHA-256形式、`sensitive`／`volatile`の全組合せを検証する。
+5. 不正入力を検証する場合は、未知種別、負数・非有限Token／優先度、Range逆転、負の位置、URI内認証情報、SHA-256以外のハッシュ、機密本文のログ漏えいが拒否または防止されることを検証する。
+6. 実装後に`pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`を実行する。実API、実ワークスペース、秘密情報、環境変数はテストに使用しない。
+
+本ブランチでは、型の追加に伴ってContext ProviderやContext Managerへ接続しない。Provider別の収集、明示添付、優先順位による選別、URI・Range・Hashによる重複排除、Token予算、コンパクションは、それぞれの後続Issueでこの契約を利用して実装する。
+
+## 進捗
+
+- [x] `documents/issues.md`、`documents/design.md` §8.1〜§8.4、既存のContext／Storage型を調査する
+- [x] ContextItemの共通フィールド、Range、Hash、機密性・揮発性の契約を設計する
+- [x] `src/context/context-item.ts`に共通型を実装する
+- [x] ContextItemの実行時検証方針を実装し、境界値・不正値をテストする
+- [x] すべての`ContextItemKind`と属性組合せのunit testを追加する
+- [x] `pnpm typecheck`、`pnpm lint`、`pnpm format:check`、`pnpm test`を実行する
+- [x] 完了条件「すべてのコンテキストを共通形式で扱える」を、後続Context Providerが利用できる型契約として確認する
+
+## 参考資料
+
+- `documents/issues.md` — Milestone 5「ContextItem共通型を定義する」の要求と完了条件
+- `documents/design.md` §3 — `src/context/`の配置
+- `documents/design.md` §8.1〜§8.4 — コンテキスト分類、ContextItem、採用優先順位、Token予算
+- `documents/design.md` §16〜§19 — セキュリティ、エラー分離、テスト方針
+- `.cursor/rules/project.mdc` — `SYW-CONTEXT-001`〜`SYW-CONTEXT-006`、`SYW-SEC-002`、`SYW-SEC-004`
+- `src/context/tool-result-artifact.ts` — 既存のContext関連処理と機密マスク境界の確認資料
+- `src/storage/artifact-store.ts` — SHA-256の表現とハッシュを整合性確認に使う既存実装
+
+## 調査結果・設計まとめ
+
+### 現状
+
+`src/context/`にはTool Resultの圧縮・アーティファクト化処理だけがあり、ファイル、選択範囲、診断、Git、指示、会話要約を横断する共通型はまだ存在しない。`documents/design.md` §3では`ContextItem.ts`が配置予定として示され、§8.2では9種類の`kind`と、出所・本文・位置・優先度・Token推定・Hash・機密性・揮発性を持つ契約が定義されている。
+
+### 採用する設計判断
+
+1. 設計書の`contentHash`という名前を維持する。Issueの「Hash」はこのフィールドを指し、別名の`hash`は追加しない。
+2. `uri`はシリアライズ済み文字列、`range`は独自の`SerializedRange`とする。VS Code型を共有しないことで、ContextItemをテスト、Prompt構築、将来のStorage境界で安全に受け渡せるようにする。
+3. Rangeは0始まり・半開区間とし、空範囲を許可する。位置の意味を1つに固定し、Providerごとの行番号解釈の差を共通型へ持ち込まない。
+4. `contentHash`はSHA-256 hexに固定する。ハッシュの目的は同じ本文の重複排除・整合性確認であり、`sensitive`判定や送信許可を置き換えない。
+5. 優先度は設計書との互換性のため`number`とする。優先順位の具体的な採用順は`ContextManager`が§8.3に従って決め、ContextItem自体は選別ロジックを持たない。
+6. `sensitive`と`volatile`は単純なbooleanのメタデータとし、意味上の組合せを制限しない。機密性・再収集性は異なる軸であり、片方からもう片方を推測しない。
+7. ContextItemは本文を含むため、StorageやWebviewへ無条件に渡せる公開DTOとはみなさない。将来のログ・永続化・IPCでは、本文を含まない安全な投影型を別途定義する。
+
+### 完了条件
+
+- 静的、ターン単位、実行中の各コンテキストを、`ContextItem`の同じ必須・任意フィールドで表現できる。
+- 9種のContextItem種別が共通の判別可能な`kind`として型付けされている。
+- URI、Range、Priority、Token推定値、Content Hash、`sensitive`、`volatile`の契約が明文化され、曖昧なProvider固有形式を共通型へ持ち込まない。
+- 機密項目を通常の送信・ログ・保存対象として誤って扱わないための境界が明確になっている。
+- ContextItemの型とunit testが既存のProvider、Storage、Webviewの責務を変更せずにコンパイル・実行できる。
