@@ -170,18 +170,100 @@ describe("AgentWebviewProvider", () => {
     const message = createUiToExtensionMessage("create-thread", {});
     view.emit(message);
     await vi.waitFor(async () => {
-      expect(await storage.list()).toHaveLength(2);
+      expect(await storage.list()).toHaveLength(1);
+      expect(view.sent).toContainEqual(expect.objectContaining({ type: "thread-snapshot" }));
     });
 
     const threads = await storage.list();
-    expect(threads).toHaveLength(2);
-    const createdThread = threads.find((thread) => thread.id !== "default");
+    expect(threads).toHaveLength(1);
+    const createdThread = threads[0];
     expect(createdThread).toBeDefined();
     expect(view.sent).toContainEqual(
       expect.objectContaining({
         type: "thread-snapshot",
         correlationId: message.messageId,
         payload: expect.objectContaining({ threadId: createdThread?.id, events: [] }),
+      }),
+    );
+
+    await storage.dispose();
+    await rm(rootPath, { recursive: true, force: true });
+  });
+
+  it("initializes the UI with a real persisted thread instead of a fixed default thread", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "byok-agent-webview-initial-"));
+    const storage = new DefaultStorageService({
+      globalStorageUri: {} as never,
+      rootPath,
+    });
+    await storage.initialize();
+    const provider = new AgentWebviewProvider({ extensionUri: { path: "/extension" } } as never, {
+      storage,
+    });
+    const view = createWebviewView();
+    provider.resolveWebviewView(view as never);
+
+    view.emit(
+      createUiToExtensionMessage("ui-ready", {
+        clientInstanceId: "00000000-0000-4000-8000-000000000002",
+        supportedProtocolVersions: ["1.0"],
+      }),
+    );
+    await vi.waitFor(async () => {
+      expect(await storage.list()).toHaveLength(1);
+    });
+
+    const [thread] = await storage.list();
+    expect(thread?.id).not.toBe("default");
+    expect(view.sent).toContainEqual(
+      expect.objectContaining({
+        type: "thread-snapshot",
+        payload: expect.objectContaining({ threadId: thread?.id }),
+      }),
+    );
+
+    await storage.dispose();
+    await rm(rootPath, { recursive: true, force: true });
+  });
+
+  it("archives a thread and switches away from the archived selection", async () => {
+    const rootPath = await mkdtemp(join(tmpdir(), "byok-agent-webview-archive-"));
+    const storage = new DefaultStorageService({
+      globalStorageUri: {} as never,
+      rootPath,
+    });
+    await storage.initialize();
+    const thread = await storage.create({ title: "アーカイブ対象" });
+    const provider = new AgentWebviewProvider({ extensionUri: { path: "/extension" } } as never, {
+      storage,
+    });
+    const view = createWebviewView();
+    provider.resolveWebviewView(view as never);
+
+    view.emit(
+      createUiToExtensionMessage("select-thread", {
+        threadId: thread.id,
+      }),
+    );
+    await flush();
+
+    view.emit(
+      createUiToExtensionMessage("archive-thread", {
+        threadId: thread.id,
+        expectedThreadRevision: thread.revision,
+      }),
+    );
+    await vi.waitFor(async () => {
+      expect((await storage.list()).some((candidate) => candidate.id === thread.id)).toBe(false);
+    });
+
+    const activeThreads = await storage.list();
+    const newThread = activeThreads[0];
+    expect(newThread).toBeDefined();
+    expect(view.sent).toContainEqual(
+      expect.objectContaining({
+        type: "thread-snapshot",
+        payload: expect.objectContaining({ threadId: newThread?.id, events: [] }),
       }),
     );
 

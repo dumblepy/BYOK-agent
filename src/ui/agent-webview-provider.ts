@@ -110,6 +110,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       getModelList: (threadId) => this.getModelList(threadId),
       getPermissionSummary: (threadId) => this.getPermissionSummary(threadId),
       getProviderCredentials: (providerId) => this.getProviderCredentials(providerId),
+      getInitialThreadId: () => this.getInitialThreadId(),
       getThreadList: () => this.getThreadList(),
       getThreadSnapshot: (threadId) => this.getThreadSnapshot(threadId),
       onMessage: async (message) => {
@@ -131,6 +132,7 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
       trustSubscription?.dispose();
       modelCatalogSubscription?.dispose();
       protocolSession.dispose();
+      this.activeThreadId = undefined;
     });
   }
 
@@ -174,6 +176,11 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
 
     if (message.type === "create-thread") {
       await this.handleCreateThread(message, protocolSession);
+      return;
+    }
+
+    if (message.type === "archive-thread") {
+      await this.handleArchiveThread(message, protocolSession);
       return;
     }
 
@@ -370,22 +377,88 @@ export class AgentWebviewProvider implements vscode.WebviewViewProvider {
     }
   }
 
+  private async handleArchiveThread(
+    message: Extract<UiToExtensionMessage, { type: "archive-thread" }>,
+    protocolSession: ExtensionWebviewProtocolSession,
+  ): Promise<void> {
+    if (!this.storage) {
+      await this.sendModelError(
+        protocolSession,
+        "THREAD_NOT_FOUND",
+        "スレッドをアーカイブできません。",
+        message.messageId,
+      );
+      return;
+    }
+
+    try {
+      await this.storage.archive(message.payload.threadId, message.payload.expectedThreadRevision);
+      if (this.activeThreadId === message.payload.threadId) {
+        const newThread = await this.storage.create();
+        this.activeThreadId = newThread.id;
+        await protocolSession.sendThreadList(message.messageId);
+        await protocolSession.sendThreadSnapshotForSelection(newThread.id, message.messageId);
+      } else {
+        await protocolSession.sendThreadList(message.messageId);
+      }
+    } catch (error) {
+      const conflict = error instanceof Error && error.name === "ThreadRevisionConflictError";
+      await this.sendModelError(
+        protocolSession,
+        conflict ? "THREAD_ARCHIVE_CONFLICT" : "THREAD_NOT_FOUND",
+        conflict
+          ? "スレッドが更新されています。最新の一覧から再試行してください。"
+          : "スレッドをアーカイブできませんでした。",
+        message.messageId,
+      );
+      await protocolSession.sendThreadList(message.messageId);
+    }
+  }
+
   private async getThreadList() {
-    if (!this.storage) return [];
-    await this.storage.getThreadModelState(DEFAULT_THREAD_ID);
+    const storage = this.storage;
+    if (!storage) return [];
+    const threads = await storage.list();
+    return Promise.all(
+      threads.map(async (thread) => {
+        let isNew = false;
+        try {
+          isNew = (await storage.read(thread.id)).events.length === 0;
+        } catch {
+          // Keep a recoverable thread visible when its event log cannot be inspected.
+        }
+        return {
+          id: thread.id,
+          title: thread.title,
+          revision: thread.revision,
+          updatedAt: thread.updatedAt,
+          archived: thread.archived,
+          isNew,
+        };
+      }),
+    );
+  }
+
+  private async getInitialThreadId(): Promise<string> {
+    if (this.activeThreadId !== undefined) return this.activeThreadId;
+    if (!this.storage) {
+      this.activeThreadId = DEFAULT_THREAD_ID;
+      return this.activeThreadId;
+    }
+
     const threads = await this.storage.list();
-    return threads.map((thread) => ({
-      id: thread.id,
-      title: thread.title,
-      revision: thread.revision,
-      updatedAt: thread.updatedAt,
-      archived: thread.archived,
-    }));
+    const initialThread = threads[0] ?? (await this.storage.create());
+    this.activeThreadId = initialThread.id;
+    return initialThread.id;
   }
 
   private async getThreadSnapshot(threadId: string) {
     if (!this.storage) {
       return { revision: 0, eventSequence: 0, events: [] as readonly ThreadEvent[] };
+    }
+    const thread = await this.storage.get(threadId);
+    if (!thread || thread.archived) {
+      throw new Error("The thread is not available");
     }
     const state = await this.storage.getThreadModelState(threadId);
     const result = await this.storage.read(threadId);

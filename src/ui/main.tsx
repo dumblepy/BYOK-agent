@@ -236,6 +236,20 @@ function App() {
     }
   };
 
+  const handleThreadArchive = (threadId: string, revision: number): void => {
+    try {
+      protocolClient.send("archive-thread", {
+        threadId,
+        expectedThreadRevision: revision,
+      });
+    } catch {
+      dispatchComposer({
+        type: "error",
+        message: "スレッドをアーカイブできませんでした。",
+      });
+    }
+  };
+
   const handleNewThread = (): void => {
     setIsThreadListOpen(false);
     try {
@@ -426,6 +440,7 @@ function App() {
         open={isThreadListOpen}
         onSelect={handleThreadSelect}
         onRename={handleThreadRename}
+        onArchive={handleThreadArchive}
       />
 
       <ThreadView messages={threadState.messages} isRestoring={!threadState.isHydrated} />

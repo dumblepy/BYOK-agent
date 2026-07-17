@@ -97,6 +97,7 @@ const agentErrorCodeSchema = z.enum([
   "PERMISSION_PROFILE_NOT_ALLOWED",
   "THREAD_NOT_FOUND",
   "THREAD_RENAME_CONFLICT",
+  "THREAD_ARCHIVE_CONFLICT",
   "THREAD_TITLE_INVALID",
 ]);
 
@@ -215,6 +216,7 @@ const threadSummarySchema = z
     revision: z.number().int().nonnegative(),
     updatedAt: timestampSchema,
     archived: z.boolean(),
+    isNew: z.boolean(),
   })
   .strict();
 
@@ -332,6 +334,15 @@ export const uiToExtensionMessageSchema = z.discriminatedUnion("type", [
   ),
   messageSchema("request-thread-list", z.object({}).strict()),
   messageSchema("create-thread", z.object({}).strict()),
+  messageSchema(
+    "archive-thread",
+    z
+      .object({
+        threadId: identifierSchema,
+        expectedThreadRevision: z.number().int().nonnegative(),
+      })
+      .strict(),
+  ),
   messageSchema(
     "select-thread",
     z

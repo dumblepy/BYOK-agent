@@ -126,6 +126,7 @@ select {
 
 .thread-list-item,
 .thread-rename-button,
+.thread-archive-button,
 .thread-rename-form button {
   color: inherit;
   background: transparent;
@@ -148,6 +149,7 @@ select {
 }
 
 .thread-rename-button,
+.thread-archive-button,
 .thread-rename-form button {
   flex: 0 0 auto;
   padding: 4px;
@@ -155,6 +157,8 @@ select {
 
 .thread-rename-button:hover,
 .thread-rename-button:focus,
+.thread-archive-button:hover,
+.thread-archive-button:focus,
 .thread-rename-form button:hover,
 .thread-rename-form button:focus {
   outline: 1px solid var(--vscode-focusBorder);

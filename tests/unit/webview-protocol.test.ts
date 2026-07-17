@@ -179,6 +179,7 @@ describe("Webview protocol schemas", () => {
           revision: 2,
           updatedAt: 10,
           archived: false,
+          isNew: false,
         },
       ],
       selectedThreadId: "thread-1",

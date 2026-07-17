@@ -9,6 +9,7 @@ export interface ThreadListProps {
   readonly open: boolean;
   readonly onSelect: (threadId: string) => void;
   readonly onRename: (threadId: string, title: string, revision: number) => void;
+  readonly onArchive: (threadId: string, revision: number) => void;
 }
 
 export function ThreadList({
@@ -17,6 +18,7 @@ export function ThreadList({
   open,
   onSelect,
   onRename,
+  onArchive,
 }: ThreadListProps): JSX.Element {
   const selected = threads.find((thread) => thread.id === selectedThreadId);
   const [editingId, setEditingId] = useState<string | undefined>();
@@ -56,11 +58,12 @@ export function ThreadList({
                 type="button"
                 class="thread-list-item"
                 aria-current={thread.id === selectedThreadId ? "page" : undefined}
+                onDblClick={() => startEditing(thread)}
                 onClick={() => onSelect(thread.id)}
               >
                 <span class="thread-list-title">{thread.title}</span>
               </button>
-              {thread.id === selectedThreadId && editingId === thread.id ? (
+              {editingId === thread.id ? (
                 <form
                   class="thread-rename-form"
                   onSubmit={(event) => {
@@ -85,16 +88,34 @@ export function ThreadList({
                     <i class="codicon codicon-close" aria-hidden="true" />
                   </button>
                 </form>
-              ) : thread.id === selectedThreadId ? (
-                <button
-                  type="button"
-                  class="thread-rename-button"
-                  aria-label="スレッドタイトルを編集"
-                  onClick={() => startEditing(thread)}
-                >
-                  <i class="codicon codicon-edit" aria-hidden="true" />
-                </button>
-              ) : null}
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    class="thread-rename-button"
+                    aria-label="スレッドタイトルを編集"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      startEditing(thread);
+                    }}
+                  >
+                    <i class="codicon codicon-edit" aria-hidden="true" />
+                  </button>
+                  {!thread.isNew ? (
+                    <button
+                      type="button"
+                      class="thread-archive-button"
+                      aria-label={`${thread.title}をアーカイブ`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onArchive(thread.id, thread.revision);
+                      }}
+                    >
+                      <i class="codicon codicon-trash" aria-hidden="true" />
+                    </button>
+                  ) : null}
+                </>
+              )}
             </li>
           ))}
         </ul>

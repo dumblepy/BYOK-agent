@@ -29,6 +29,7 @@ export interface ExtensionWebviewProtocolHandlers {
   readonly getProviderCredentials?: (
     providerId?: string,
   ) => readonly ProviderCredentialSummary[] | Promise<readonly ProviderCredentialSummary[]>;
+  readonly getInitialThreadId?: () => string | Promise<string>;
   readonly getThreadList?: () => readonly ThreadSummary[] | Promise<readonly ThreadSummary[]>;
   readonly getThreadSnapshot?: (threadId: string) =>
     | {
@@ -139,7 +140,7 @@ export class ExtensionWebviewProtocolSession {
     }
 
     if (message.type === "request-thread-snapshot") {
-      await this.sendThreadSnapshot(message.payload.threadId, message.messageId);
+      await this.sendThreadSnapshotSafely(message.payload.threadId, message.messageId);
       return;
     }
 
@@ -149,7 +150,7 @@ export class ExtensionWebviewProtocolSession {
     }
 
     if (message.type === "select-thread") {
-      await this.sendThreadSnapshot(message.payload.threadId, message.messageId);
+      await this.sendThreadSnapshotSafely(message.payload.threadId, message.messageId);
       return;
     }
 
@@ -206,8 +207,9 @@ export class ExtensionWebviewProtocolSession {
         { correlationId: message.messageId },
       ),
     );
+    const initialThreadId = (await this.handlers.getInitialThreadId?.()) ?? "default";
     await this.sendThreadList(message.messageId);
-    await this.sendThreadSnapshot("default", message.messageId);
+    await this.sendThreadSnapshot(initialThreadId, message.messageId);
   }
 
   public async sendThreadList(correlationId?: string): Promise<void> {
@@ -223,6 +225,25 @@ export class ExtensionWebviewProtocolSession {
 
   public sendThreadSnapshotForSelection(threadId: string, correlationId: string): Promise<void> {
     return this.sendThreadSnapshot(threadId, correlationId);
+  }
+
+  private async sendThreadSnapshotSafely(threadId: string, correlationId: string): Promise<void> {
+    try {
+      await this.sendThreadSnapshot(threadId, correlationId);
+    } catch {
+      await this.sendToUi(
+        createExtensionToUiMessage(
+          "error",
+          {
+            code: "THREAD_NOT_FOUND",
+            message: "このスレッドは利用できません。最新の一覧から選択してください。",
+            retryable: false,
+          },
+          { correlationId },
+        ),
+      );
+      await this.sendThreadList(correlationId);
+    }
   }
 
   private async sendThreadSnapshot(threadId: string, correlationId: string): Promise<void> {
